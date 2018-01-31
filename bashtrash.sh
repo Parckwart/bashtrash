@@ -3,7 +3,7 @@
 cat () {
 	local file_not_found=false
 	
-	if [ "$1" ]; then
+	if [ "$1" ] && [[ "$1" != '-' ]]; then
 		for i in $*; do
 			if [ -a "$i" ]; then
 				while read -srN 1 i; do
@@ -25,4 +25,8 @@ cat () {
 	else
 		return 0
 	fi
+}
+
+tail () {
+	echo
 }
