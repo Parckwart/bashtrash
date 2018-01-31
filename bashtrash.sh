@@ -6,15 +6,17 @@ cat () {
 	if [ "$1" ]; then
 		for i in $*; do
 			if [ -a "$i" ]; then
-				echo "$(<$i)"
+				while read -srN 1 i; do
+					echo -n "$i"
+				done < "$1"
 			else
 				echo "cat: $i: No such file or directory"
 				file_not_found=true
 			fi
 		done
 	else
-		while read line; do
-			echo "$line"
+		while read -srN 1 i; do
+			echo -n "$i"
 		done
 	fi
 	
