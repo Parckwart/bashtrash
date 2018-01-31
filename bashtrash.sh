@@ -30,3 +30,7 @@ cat () {
 tail () {
 	echo
 }
+
+whoami () {
+	echo "$USER"
+}
