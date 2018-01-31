@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-function cat {
+cat () {
 	local file_not_found=false
 	
 	if [ "$1" ]; then
