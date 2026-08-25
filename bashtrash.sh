@@ -6530,3 +6530,357 @@ diff () {
 	done
 	return "$status"
 }
+
+# ---------------------------------------------------------------------------
+# cal -- POSIX.1-2017: cal [[month] year]
+#
+# Dates before September 1752 are Julian, as every cal has it: that month
+# lost eleven days when the calendar changed.
+# ---------------------------------------------------------------------------
+
+_BT_CAL_MONTHS=(January February March April May June July
+		August September October November December)
+
+# Is $1 a leap year, on whichever calendar applies?
+_bt_cal_leap() {
+	if [ "$1" -gt 1752 ]; then
+		[ $(( $1 % 4 )) -eq 0 ] && { [ $(( $1 % 100 )) -ne 0 ] || [ $(( $1 % 400 )) -eq 0 ]; }
+		return $?
+	fi
+	[ $(( $1 % 4 )) -eq 0 ]
+	return $?
+}
+
+# Days in month $1 of year $2.
+_bt_cal_mdays() {
+	case $1 in
+	1|3|5|7|8|10|12)	_bt_days=31 ;;
+	4|6|9|11)		_bt_days=30 ;;
+	2)	if _bt_cal_leap "$2"; then _bt_days=29; else _bt_days=28; fi ;;
+	esac
+	# the eleven days that never happened
+	if [ "$2" -eq 1752 ] && [ "$1" -eq 9 ]; then
+		_bt_days=30
+	fi
+	return 0
+}
+
+# Day of week for year $1, month $2, day $3.  0 is Sunday.
+_bt_cal_dow() {
+	local y=$1 m=$2 d=$3 k j
+	if [ "$m" -lt 3 ]; then
+		m=$(( m + 12 ))
+		y=$(( y - 1 ))
+	fi
+	k=$(( y % 100 ))
+	j=$(( y / 100 ))
+	if [ "$1" -gt 1752 ] || { [ "$1" -eq 1752 ] && [ "$2" -gt 9 ]; } ||
+	   { [ "$1" -eq 1752 ] && [ "$2" -eq 9 ] && [ "$3" -ge 14 ]; }; then
+		# Gregorian
+		_bt_dow=$(( (d + (13 * (m + 1)) / 5 + k + k / 4 + j / 4 + 5 * j) % 7 ))
+	else
+		# Julian
+		_bt_dow=$(( (d + (13 * (m + 1)) / 5 + k + k / 4 + 5 - j + 700) % 7 ))
+	fi
+	# Zeller counts Saturday as zero; shift so Sunday is zero
+	_bt_dow=$(( (_bt_dow + 6) % 7 ))
+	return 0
+}
+
+# Build the lines of one month into the _bt_cal array (header, day names,
+# then up to six week rows), each padded to twenty columns.
+_bt_cal_month() {
+	local y=$1 m=$2 withyear=$3 title col d row line skip
+	local _bt_days _bt_dow
+	_bt_cal_mdays "$m" "$y"
+	_bt_cal_dow "$y" "$m" 1
+	if [ "$withyear" = 1 ]; then
+		title="${_BT_CAL_MONTHS[m-1]} $y"
+	else
+		title=${_BT_CAL_MONTHS[m-1]}
+	fi
+	skip=$(( (20 - ${#title}) / 2 ))
+	printf -v line '%*s%s' "$skip" '' "$title"
+	printf -v line '%-20s' "$line"
+	_bt_cal=("$line")
+	_bt_cal+=("Su Mo Tu We Th Fr Sa")
+	col=$_bt_dow
+	printf -v line '%*s' $(( col * 3 )) ''
+	d=1
+	while [ "$d" -le "$_bt_days" ]; do
+		printf -v line '%s%2d ' "$line" "$d"
+		col=$(( col + 1 ))
+		if [ "$col" -eq 7 ]; then
+			_bt_cal+=("${line% }")
+			line=
+			col=0
+		fi
+		# September 1752 jumps from the 2nd to the 14th
+		if [ "$y" -eq 1752 ] && [ "$m" -eq 9 ] && [ "$d" -eq 2 ]; then
+			d=13
+		fi
+		d=$(( d + 1 ))
+	done
+	[ -n "$line" ] && _bt_cal+=("${line% }")
+	while [ "${#_bt_cal[@]}" -lt 8 ]; do
+		_bt_cal+=("")
+	done
+	return 0
+}
+
+cal () {
+	local LC_ALL=C
+	local y m i j r line now
+	local -a _bt_cal=() c1=() c2=() c3=()
+
+	if [ "$#" -gt 2 ]; then
+		_bt_err "usage: cal [[month] year]"
+		return 1
+	fi
+	for i in "$@"; do
+		_bt_isnum "$i" || { _bt_err "cal: invalid argument: $i"; return 1; }
+	done
+	if [ "$#" -eq 0 ]; then
+		printf -v now '%(%Y %m)T' -1
+		set -- ${now}
+		m=$(( 10#$2 )); y=$(( 10#$1 ))
+	elif [ "$#" -eq 1 ]; then
+		y=$(( 10#$1 ))
+		m=0
+	else
+		m=$(( 10#$1 )); y=$(( 10#$2 ))
+	fi
+	if [ "$m" -ne 0 ] && { [ "$m" -lt 1 ] || [ "$m" -gt 12 ]; }; then
+		_bt_err "cal: $m is not a month number (1..12)"
+		return 1
+	fi
+	if [ "$y" -lt 1 ] || [ "$y" -gt 9999 ]; then
+		_bt_err "cal: year $y not in range 1..9999"
+		return 1
+	fi
+
+	if [ "$m" -ne 0 ]; then
+		_bt_cal_month "$y" "$m" 1
+		# The eight-line padding is only there to line up the columns
+		# of a whole year; a single month stops at its last week.
+		j=${#_bt_cal[@]}
+		while [ "$j" -gt 0 ] && [ -z "${_bt_cal[j-1]}" ]; do j=$(( j - 1 )); done
+		for (( i = 0; i < j; i++ )); do
+			line=${_bt_cal[i]}
+			printf '%s\n' "${line%"${line##*[![:space:]]}"}"
+		done
+		return 0
+	fi
+
+	# a whole year, three months to a row
+	printf -v line '%*s%d' $(( (64 - ${#y}) / 2 )) '' "$y"
+	printf '%s\n\n' "$line"
+	for (( r = 0; r < 4; r++ )); do
+		_bt_cal_month "$y" $(( r * 3 + 1 )) 0; c1=("${_bt_cal[@]}")
+		_bt_cal_month "$y" $(( r * 3 + 2 )) 0; c2=("${_bt_cal[@]}")
+		_bt_cal_month "$y" $(( r * 3 + 3 )) 0; c3=("${_bt_cal[@]}")
+		for (( i = 0; i < 8; i++ )); do
+			printf -v line '%-20s  %-20s  %-20s' "${c1[i]}" "${c2[i]}" "${c3[i]}"
+			printf '%s\n' "${line%"${line##*[![:space:]]}"}"
+		done
+		[ "$r" -lt 3 ] && printf '\n'
+	done
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# fuser -- POSIX.1-2017: fuser [-cfu] file...
+#
+# /proc is walked and each entry compared with -ef: stat() is not reachable,
+# so the device and inode cannot be read and compared directly.
+# ---------------------------------------------------------------------------
+
+# The owning uid of process $1, from /proc/PID/status.
+_bt_proc_uid() {
+	local line
+	_bt_puid=0
+	while IFS= read -r line; do
+		case $line in
+		Uid:*)	set -- $line
+			_bt_puid=$2
+			return 0 ;;
+		esac
+	done < /proc/"$1"/status 2>/dev/null
+	return 0
+}
+
+fuser () {
+	local LC_ALL=C
+	local arg opt file status=1 p pid l code i
+	local showuser=0 _bt_puid _bt_name _bt_uid _bt_gid
+	local -a pids=() codes=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				c|f)	;;	# accepted; /proc is walked either way
+				u)	showuser=1 ;;
+				*)	_bt_err "fuser: illegal option -- $opt"
+					_bt_err "usage: fuser [-cfu] file..."
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -eq 0 ]; then
+		_bt_err "usage: fuser [-cfu] file..."
+		return 1
+	fi
+
+	for file in "$@"; do
+		pids=() codes=()
+		for p in /proc/[0-9]*; do
+			pid=${p#/proc/}
+			code=
+			for l in cwd root exe; do
+				[ -e "$p/$l" ] || continue
+				if [ "$p/$l" -ef "$file" ] 2>/dev/null; then
+					case $l in
+					cwd)	code=${code}c ;;
+					root)	code=${code}r ;;
+					exe)	code=${code}e ;;
+					esac
+				fi
+			done
+			if [ -z "$code" ]; then
+				for l in "$p"/fd/*; do
+					[ -e "$l" ] || continue
+					if [ "$l" -ef "$file" ] 2>/dev/null; then
+						pids+=("$pid"); codes+=("")
+						code=done
+						break
+					fi
+				done
+				[ "$code" = done ] && continue
+			else
+				pids+=("$pid"); codes+=("$code")
+			fi
+		done
+		[ "${#pids[@]}" -gt 0 ] || continue
+		status=0
+		printf '%s:' "$file" >&2
+		for (( i = 0; i < ${#pids[@]}; i++ )); do
+			printf '%6d' "${pids[i]}"
+			if [ "$showuser" = 1 ]; then
+				_bt_proc_uid "${pids[i]}"
+				_bt_passwd "$_bt_puid" uid
+				printf '%s(%s)' "${codes[i]}" "${_bt_name:-$_bt_puid}" >&2
+			else
+				printf '%s' "${codes[i]}" >&2
+			fi
+		done
+		printf '\n' >&2
+	done
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# ipcs -- POSIX.1-2017: ipcs [-qms] [-a|-bcopt]
+#
+# Reads what the kernel publishes in /proc/sysvipc.  ipcrm is the other half
+# of this pair and is not here: removing an object needs a syscall.
+# ---------------------------------------------------------------------------
+
+# Owner name for uid $1, falling back to the number.
+_bt_ipcs_owner() {
+	local _bt_name _bt_uid _bt_gid
+	if _bt_passwd "$1" uid; then
+		_bt_owner=$_bt_name
+	else
+		_bt_owner=$1
+	fi
+	return 0
+}
+
+ipcs () {
+	local LC_ALL=C
+	local arg opt want= line first=1 fd
+	local key id perms rest owner _bt_owner
+	local -a f=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-*)	[ "$1" = - ] && break
+			arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				q)	want=${want}q ;;
+				m)	want=${want}m ;;
+				s)	want=${want}s ;;
+				a|b|c|o|p|t)	;;	# accepted; the default listing is what is produced
+				*)	_bt_err "ipcs: illegal option -- $opt"
+					_bt_err "usage: ipcs [-qms]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	[ -n "$want" ] || want=qms
+
+	case $want in
+	*q*)	printf '\n------ Message Queues --------\n'
+		printf '%-10s %-10s %-10s %-10s %-12s %-12s\n' key msqid owner perms used-bytes messages
+		if { exec {fd}</proc/sysvipc/msg; } 2>/dev/null; then
+			first=1
+			while IFS= read -r line <&"$fd"; do
+				if [ "$first" = 1 ]; then first=0; continue; fi
+				set -- $line
+				_bt_ipcs_owner "$8"
+				printf '0x%08x %-10s %-10s %-10s %-12s %-12s\n' \
+					$(( $1 & 0xFFFFFFFF )) "$2" "$_bt_owner" "$3" "$4" "$5"
+			done
+			exec {fd}<&-
+		fi ;;
+	esac
+	case $want in
+	*m*)	printf '\n------ Shared Memory Segments --------\n'
+		printf '%-10s %-10s %-10s %-10s %-10s %-10s %-12s\n' key shmid owner perms bytes nattch status
+		if { exec {fd}</proc/sysvipc/shm; } 2>/dev/null; then
+			first=1
+			while IFS= read -r line <&"$fd"; do
+				if [ "$first" = 1 ]; then first=0; continue; fi
+				set -- $line
+				_bt_ipcs_owner "$8"
+				# the status column is one wider in a row than in the header
+				printf '0x%08x %-10s %-10s %-10s %-10s %-10s %-13s\n' \
+					$(( $1 & 0xFFFFFFFF )) "$2" "$_bt_owner" "$3" "$4" "$7" ''
+			done
+			exec {fd}<&-
+		fi ;;
+	esac
+	case $want in
+	*s*)	printf '\n------ Semaphore Arrays --------\n'
+		printf '%-10s %-10s %-10s %-10s %-10s\n' key semid owner perms nsems
+		if { exec {fd}</proc/sysvipc/sem; } 2>/dev/null; then
+			first=1
+			while IFS= read -r line <&"$fd"; do
+				if [ "$first" = 1 ]; then first=0; continue; fi
+				set -- $line
+				_bt_ipcs_owner "$5"
+				printf '0x%08x %-10s %-10s %-10s %-10s\n' \
+					$(( $1 & 0xFFFFFFFF )) "$2" "$_bt_owner" "$3" "$4"
+			done
+			exec {fd}<&-
+		fi ;;
+	esac
+	printf '\n'
+	return 0
+}

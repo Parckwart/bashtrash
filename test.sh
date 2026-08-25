@@ -25,7 +25,7 @@ fi
 for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          fold head id nl od paste pathchk sleep sort split strings tabs \
          tail tee tr tsort tty uname unexpand uniq wc join csplit grep xargs \
-         nohup pr dd sed who logname diff; do
+         nohup pr dd sed who logname diff cal fuser ipcs; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -1075,6 +1075,84 @@ while [ "$i" -lt 40 ]; do
 		note_fail "diff property (case $i): distance $md vs $gd, rebuild $(cmp -s rebuilt r2 && echo ok || echo bad)"
 	fi
 done
+
+# --- cal, fuser, ipcs -----------------------------------------------------
+echo "### cal fuser ipcs"
+
+# There is no cal on this machine to compare against, so the arithmetic is
+# checked against bash's own strftime and the layout against known months.
+bad=0
+for y in 1970 1999 2000 2001 2024 2025 2026 2030; do
+	for mo in 1 2 3 6 9 12; do
+		for d in 1 15 28; do
+			ep=$(TZ=UTC0 "$R_DATE" -u -d "$y-$mo-$d 12:00:00" +%s 2>/dev/null) || continue
+			want=$(TZ=UTC0 printf '%(%w)T' "$ep")
+			got=$( . "$BT"; _bt_cal_dow "$y" "$mo" "$d"; echo "$_bt_dow" )
+			[ "$want" = "$got" ] || bad=$((bad + 1))
+		done
+	done
+done
+if [ "$bad" -eq 0 ]; then pass=$((pass + 1)); else note_fail "cal day-of-week wrong in $bad cases"; fi
+
+a=$( . "$BT"; cal 9 1752 )
+b='   September 1752
+Su Mo Tu We Th Fr Sa
+       1  2 14 15 16
+17 18 19 20 21 22 23
+24 25 26 27 28 29 30'
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "cal 9 1752 (the eleven missing days)"; fi
+a=$( . "$BT"; cal 2 2024 | tail -1 )
+if [ "$a" = "25 26 27 28 29" ]; then pass=$((pass + 1)); else note_fail "cal 2 2024 leap day: [$a]"; fi
+a=$( . "$BT"; cal 2 2025 | tail -1 )
+if [ "$a" = "23 24 25 26 27 28" ]; then pass=$((pass + 1)); else note_fail "cal 2 2025: [$a]"; fi
+a=$( . "$BT"; cal 2025 | wc -l )
+if [ "$a" = 37 ]; then pass=$((pass + 1)); else note_fail "cal year should be 37 lines, got $a"; fi
+a=$( . "$BT"; cal 2025 | sed -n 2p )
+if [ -z "$a" ]; then pass=$((pass + 1)); else note_fail "cal year: blank line after the heading"; fi
+( . "$BT"; cal 13 2025 ) > /dev/null 2>&1
+if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "cal should reject month 13"; fi
+( . "$BT"; cal 1 2 3 ) > /dev/null 2>&1
+if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "cal should reject three operands"; fi
+
+# fuser: the pid list depends on what is running, so a file is held open by
+# one known process and the two pid sets are compared.
+if command -v fuser > /dev/null 2>&1; then
+	printf 'x\n' > held.txt
+	sleep 30 < held.txt &
+	holder=$!
+	sleep 0.3
+	a=$( . "$BT"; fuser held.txt 2>/dev/null | tr -s ' ' '\n' | grep -v '^$' | sort -n | tr '\n' ' ' )
+	b=$( "$(real_of fuser)" held.txt 2>/dev/null | tr -s ' ' '\n' | grep -v '^$' | sort -n | tr '\n' ' ' )
+	if [ "$a" = "$b" ] && [ -n "$a" ]; then pass=$((pass + 1))
+	else note_fail "fuser pid set: [$a] vs [$b]"; fi
+	kill "$holder" 2>/dev/null
+	wait "$holder" 2>/dev/null
+	( . "$BT"; fuser /nonexistent ) > /dev/null 2>&1; a=$?
+	"$(real_of fuser)" /nonexistent > /dev/null 2>&1; b=$?
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "fuser exit on no holder ($a vs $b)"; fi
+fi
+
+# ipcs: compared against the real one, with objects present if they can be
+# created and with the tables empty otherwise.
+if command -v ipcs > /dev/null 2>&1; then
+	made=
+	if command -v ipcmk > /dev/null 2>&1; then
+		ipcmk -Q > /dev/null 2>&1 && made="$made q"
+		ipcmk -M 1024 > /dev/null 2>&1 && made="$made m"
+		ipcmk -S 4 > /dev/null 2>&1 && made="$made s"
+	fi
+	for o in "" -q -m -s -qm -qms; do
+		# shellcheck disable=SC2086
+		a=$( . "$BT"; ipcs $o 2>&1 )
+		# shellcheck disable=SC2086
+		b=$( "$(real_of ipcs)" $o 2>&1 )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "ipcs $o"; fi
+	done
+	for t in $made; do
+		id=$("$(real_of ipcs)" -$t 2>/dev/null | awk 'NR==4{print $2}')
+		[ -n "$id" ] && ipcrm -$t "$id" 2>/dev/null
+	done
+fi
 
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"
