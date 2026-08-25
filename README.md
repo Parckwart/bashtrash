@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-83 of the 160 utilities in POSIX.1-2017, as of now.
+84 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -93,6 +93,7 @@ Run the test suite with:
 | `locale` | `locale [-a\|-m]` · `locale [-ck] name...` |
 | `logname` | `logname` |
 | `m4` | `m4 [-s] [-D name[=value]]... [-U name]... [file...]` |
+| `mailx` | `mailx [-s subject] address...`<br>`mailx -e`<br>`mailx [-HiNn] [-F] [-u user]`<br>`mailx -f [-HiNn] [-F] [file]` |
 | `make` | `make [-eiknpqrSst] [-f makefile]... [macro=value]... [target_name...]` |
 | `man` | `man [-k] name...` |
 | `nl` | `nl [-p] [-b type] [-d delim] [-f type] [-h type] [-i incr] [-l num] [-n format] [-s sep] [-v start] [-w width] [file]` |
@@ -375,19 +376,19 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 83 |
+| implemented here | 84 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **52** |
-| reachable, not yet written | 3 |
+| reachable, not yet written | 2 |
 
 **The ceiling is 86 of 160**, or about 54% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 3 that remain are `localedef`, which compiles locales into a binary
-nobody has written down, `mailx`, which has to hand a message to a mailer,
-and `sh`, which would be a shell written in a shell -- and whose whole
-purpose, running a program, is the one thing this library will not do.
+The 2 that remain are `localedef`, which compiles locale definitions into a
+binary whose format nobody has written down -- it is glibc's own, and the
+only thing that reads it is glibc -- and `sh`, whose whole purpose, running a
+program, is the one thing this library will not do.
 
 ### Smaller deviations, all deliberate
 
@@ -435,6 +436,13 @@ purpose, running a program, is the one thing this library will not do.
   does and not what mawk does; a `printf` given fewer arguments than
   conversions treats the missing ones as empty, as the standard says, rather
   than stopping.
+* `mailx` has no mailer to hand a message to, so it delivers: a message for a
+  user on this machine is appended to their mailbox in the format every
+  mailbox has, and an address with a host in it is refused rather than
+  silently dropped. The reading side is all there -- the message states the
+  standard describes, the message lists, and the commands that move messages
+  about -- except for `!`, `shell`, `pipe`, `edit`, `visual` and `folders`,
+  each of which exists to run a program.
 * `man` reads the roff macros a manual page is written with -- headings,
   paragraphs, tagged lists, indents, fonts and the escapes -- and fills the
   text under them; it is not a roff, and a page that leans on the rest of

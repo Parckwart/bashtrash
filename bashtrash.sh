@@ -23628,3 +23628,845 @@ _bt_man_summary() {
 	_mn_summary="$nm($sect) - ${sum#*- }"
 	return 0
 }
+
+# ---------------------------------------------------------------------------
+# mailx -- POSIX.1-2017:
+#	mailx [-s subject] address...
+#	mailx -e
+#	mailx [-HiNn] [-F] [-u user]
+#	mailx -f [-HiNn] [-F] [file]
+#
+# A mailbox is a file of messages, each beginning with a line that starts
+# "From ", and that is the whole of the format.  Sending is delivery into the
+# recipient's mailbox: there is no mailer here to hand a message to, so an
+# address with a host in it has nowhere to go.
+# ---------------------------------------------------------------------------
+
+# The name of whoever is running this.
+_bt_mailx_whoami() {
+	if [ -n "${LOGNAME-}" ]; then
+		_mx_me=$LOGNAME
+	elif [ -n "${USER-}" ]; then
+		_mx_me=$USER
+	elif _bt_passwd "$UID" uid; then
+		_mx_me=$_bt_name
+	else
+		_mx_me=$UID
+	fi
+	return 0
+}
+
+# The mailbox of user $1.
+_bt_mailx_box() {
+	local u=$1 d
+	# MAIL names this user's own mailbox, wherever it is
+	if [ "$u" = "$_mx_me" ] && [ -n "${MAIL-}" ]; then
+		_mx_box=$MAIL
+		return 0
+	fi
+	for d in /var/mail /var/spool/mail; do
+		[ -d "$d" ] && { _mx_box=$d/$u; return 0; }
+	done
+	_mx_box=/var/mail/$u
+	return 0
+}
+
+# Read mailbox $1 into the message tables.
+_bt_mailx_load() {
+	local f=$1 fd line i n start
+	_mx_lines=()
+	_mx_start=() _mx_end=() _mx_state=() _mx_from=() _mx_date=() _mx_subj=()
+	_mx_env=()
+	_mx_n=0
+	if [ ! -f "$f" ]; then
+		return 0
+	fi
+	{ exec {fd}<"$f"; } 2>/dev/null || return 1
+	line=
+	while IFS= read -r line <&"$fd"; do
+		_mx_lines+=("$line")
+		line=
+	done
+	[ -n "$line" ] && _mx_lines+=("$line")
+	exec {fd}<&-
+	n=${#_mx_lines[@]}
+	start=-1
+	for (( i = 0; i < n; i++ )); do
+		case ${_mx_lines[i]} in
+		'From '*)
+			if [ "$start" -ge 0 ]; then
+				_mx_n=$(( _mx_n + 1 ))
+				_mx_start[_mx_n]=$start
+				_mx_end[_mx_n]=$(( i - 1 ))
+			fi
+			start=$i ;;
+		esac
+	done
+	if [ "$start" -ge 0 ]; then
+		_mx_n=$(( _mx_n + 1 ))
+		_mx_start[_mx_n]=$start
+		_mx_end[_mx_n]=$(( n - 1 ))
+	fi
+	for (( i = 1; i <= _mx_n; i++ )); do
+		_mx_state[i]=unread
+		_bt_mailx_fields "$i"
+	done
+	return 0
+}
+
+# The sender, date and subject of message $1.
+_bt_mailx_fields() {
+	local i=$1 j line envfrom rest
+	_mx_from[i]=
+	_mx_date[i]=
+	_mx_subj[i]=
+	envfrom=${_mx_lines[${_mx_start[i]}]}
+	envfrom=${envfrom#From }
+	_mx_from[i]=${envfrom%% *}
+	rest=${envfrom#* }
+	_mx_date[i]=$rest
+	_mx_env[i]=$rest
+	for (( j = _mx_start[i] + 1; j <= _mx_end[i]; j++ )); do
+		line=${_mx_lines[j]}
+		[ -z "$line" ] && break
+		case $line in
+		[Ss]ubject:*)	_mx_subj[i]=${line#*:}
+				_mx_subj[i]=${_mx_subj[i]# } ;;
+		[Ff]rom:*)	rest=${line#*:}
+				rest=${rest# }
+				case $rest in
+				*'<'*'>'*)	rest=${rest#*<}; rest=${rest%%>*} ;;
+				*' ('*)		rest=${rest%% (*} ;;
+				esac
+				_mx_from[i]=$rest ;;
+		[Dd]ate:*)	rest=${line#*:}
+				_mx_date[i]=${rest# } ;;
+		esac
+	done
+	return 0
+}
+
+# The line the header summary shows for message $1.
+_bt_mailx_summary() {
+	local i=$1 mark=' ' cur=' ' lines bytes j subj date
+	case ${_mx_state[i]} in
+	new)		mark=N ;;
+	unread)		mark=U ;;
+	deleted)	mark='*' ;;
+	preserved)	mark=P ;;
+	*)		mark=' ' ;;
+	esac
+	[ "$i" = "$_mx_cur" ] && cur='>'
+	lines=$(( _mx_end[i] - _mx_start[i] + 1 ))
+	bytes=0
+	for (( j = _mx_start[i]; j <= _mx_end[i]; j++ )); do
+		bytes=$(( bytes + ${#_mx_lines[j]} + 1 ))
+	done
+	# the day, month and time of it, which is what mailx shows
+	set -- ${_mx_env[i]}
+	if [ "$#" -ge 4 ]; then
+		date="$1 $2 $3 ${4:0:5}"
+	else
+		date=${_mx_date[i]}
+	fi
+	printf '%s%s%3d %-16s %-16.16s %3d/%-5d %s\n' "$cur" "$mark" "$i" \
+	       "${_mx_from[i]}" "$date" "$lines" "$bytes" "${_mx_subj[i]}"
+	return 0
+}
+
+# Work out which messages a list like "1-3 5 :n" means, into _mx_list.
+_bt_mailx_msglist() {
+	local spec out= i j lo hi word
+	# a * in a message list means every message, not every file
+	local -
+	set -f
+	out=
+	for word in $1; do
+		case $word in
+		'*')	for (( i = 1; i <= _mx_n; i++ )); do out="$out $i"; done ;;
+		'$')	[ "$_mx_n" -gt 0 ] && out="$out $_mx_n" ;;
+		'.')	out="$out $_mx_cur" ;;
+		'^')	out="$out 1" ;;
+		'+')	[ "$_mx_cur" -lt "$_mx_n" ] && out="$out $(( _mx_cur + 1 ))" ;;
+		'-')	[ "$_mx_cur" -gt 1 ] && out="$out $(( _mx_cur - 1 ))" ;;
+		:n)	for (( i = 1; i <= _mx_n; i++ )); do
+				[ "${_mx_state[i]}" = new ] && out="$out $i"
+			done ;;
+		:o)	for (( i = 1; i <= _mx_n; i++ )); do
+				[ "${_mx_state[i]}" != new ] && out="$out $i"
+			done ;;
+		:r)	for (( i = 1; i <= _mx_n; i++ )); do
+				[ "${_mx_state[i]}" = read ] && out="$out $i"
+			done ;;
+		:u)	for (( i = 1; i <= _mx_n; i++ )); do
+				case ${_mx_state[i]} in
+				unread|new)	out="$out $i" ;;
+				esac
+			done ;;
+		:d)	for (( i = 1; i <= _mx_n; i++ )); do
+				[ "${_mx_state[i]}" = deleted ] && out="$out $i"
+			done ;;
+		/*)	spec=${word#/}
+			for (( i = 1; i <= _mx_n; i++ )); do
+				case ${_mx_subj[i],,} in
+				*"${spec,,}"*)	out="$out $i" ;;
+				esac
+			done ;;
+		[0-9]*-[0-9]*)
+			lo=${word%%-*}
+			hi=${word#*-}
+			for (( i = lo; i <= hi; i++ )); do
+				[ "$i" -ge 1 ] && [ "$i" -le "$_mx_n" ] && out="$out $i"
+			done ;;
+		[0-9]*)	[ "$word" -ge 1 ] && [ "$word" -le "$_mx_n" ] && out="$out $word" ;;
+		*)	for (( i = 1; i <= _mx_n; i++ )); do
+				case ${_mx_from[i]} in
+				*"$word"*)	out="$out $i" ;;
+				esac
+			done ;;
+		esac
+	done
+	_mx_list=${out# }
+	return 0
+}
+
+# Write message $1 out: $2 says whether to show every header line.
+_bt_mailx_show() {
+	local i=$1 all=$2 j inhdr=1 line
+	for (( j = _mx_start[i]; j <= _mx_end[i]; j++ )); do
+		line=${_mx_lines[j]}
+		if [ "$j" = "${_mx_start[i]}" ] && [ "$all" != 1 ]; then
+			continue
+		fi
+		if [ "$inhdr" = 1 ]; then
+			[ -z "$line" ] && { inhdr=0; printf '\n'; continue; }
+			if [ "$all" != 1 ]; then
+				case ${line%%:*} in
+				[Ff]rom|[Tt]o|[Ss]ubject|[Dd]ate|[Cc]c|[Rr]eply-[Tt]o)
+					;;
+				*)	continue ;;
+				esac
+			fi
+			printf '%s\n' "$line"
+			continue
+		fi
+		printf '%s\n' "$line"
+	done
+	case ${_mx_state[i]} in
+	deleted)	;;
+	*)		_mx_state[i]=read ;;
+	esac
+	return 0
+}
+
+# Put message $1 at the end of file $2; $3 says whether to keep the headers.
+_bt_mailx_append() {
+	local i=$1 f=$2 hdr=$3 j fd inhdr=1 line
+	if ! { exec {fd}>>"$f"; } 2>/dev/null; then
+		_bt_err "mailx: cannot append to $f"
+		return 1
+	fi
+	for (( j = _mx_start[i]; j <= _mx_end[i]; j++ )); do
+		line=${_mx_lines[j]}
+		if [ "$hdr" = 0 ]; then
+			if [ "$inhdr" = 1 ]; then
+				[ -z "$line" ] && inhdr=0
+				continue
+			fi
+		fi
+		printf '%s\n' "$line" >&"$fd"
+	done
+	exec {fd}>&-
+	return 0
+}
+
+# Send a message: $1 the subject, the rest the addresses.  The body comes
+# from standard input.
+_bt_mailx_send() {
+	local subj=$1 body= line fd f a to= sep= now envdate esc
+	local -a addrs=()
+	shift
+	addrs=("$@")
+	for a in "${addrs[@]}"; do
+		to=$to$sep$a
+		sep=', '
+	done
+	# the message, with the escapes a user can type in front of a line
+	while IFS= read -r line; do
+		case $line in
+		'~'*)	esc=${line:1:1}
+			case $esc in
+			.)	break ;;
+			s)	subj=${line:3} ;;
+			S)	subj=${line:3} ;;
+			t)	for a in ${line:3}; do
+					addrs+=("$a")
+					to=$to', '$a
+				done ;;
+			c)	_mx_cc=${line:3} ;;
+			b)	_mx_bcc=${line:3} ;;
+			p)	printf '%s' "$body" ;;
+			q)	_bt_err "mailx: message not sent"
+				return 1 ;;
+			h)	_bt_err "mailx: no terminal to ask on" ;;
+			'~')	body=$body${line:1}$'\n' ;;
+			*)	_bt_err "mailx: unknown escape ~$esc" ;;
+			esac
+			continue ;;
+		esac
+		body=$body$line$'\n'
+	done
+	printf -v now '%(%a %b %e %H:%M:%S %Y)T' -1
+	printf -v envdate '%(%a, %d %b %Y %H:%M:%S %z)T' -1
+	for a in "${addrs[@]}"; do
+		case $a in
+		*@*)	_bt_err "mailx: $a: this mailx has no mailer to hand a message to"
+			_mx_status=1
+			continue ;;
+		esac
+		_bt_mailx_box "$a"
+		f=$_mx_box
+		if ! { exec {fd}>>"$f"; } 2>/dev/null; then
+			_bt_err "mailx: cannot deliver to $f"
+			_mx_status=1
+			continue
+		fi
+		{
+		printf 'From %s %s\n' "$_mx_me" "$now"
+		printf 'Date: %s\n' "$envdate"
+		printf 'From: %s\n' "$_mx_me"
+		printf 'To: %s\n' "$to"
+		[ -n "$_mx_cc" ] && printf 'Cc: %s\n' "$_mx_cc"
+		[ -n "$subj" ] && printf 'Subject: %s\n' "$subj"
+		printf '\n'
+		while IFS= read -r line; do
+			case $line in
+			'From '*)	printf '>%s\n' "$line" ;;
+			*)		printf '%s\n' "$line" ;;
+			esac
+		done <<< "${body%$'\n'}"
+		printf '\n'
+		} >&"$fd"
+		exec {fd}>&-
+	done
+	# -F, or the record variable, keeps a copy
+	f=
+	[ "$_mx_record" = 1 ] && f=${addrs[0]%%@*}
+	[ -n "${_mx_var[record]-}" ] && f=${_mx_var[record]}
+	if [ -n "$f" ]; then
+		{
+		printf 'From %s %s\n' "$_mx_me" "$now"
+		printf 'Date: %s\nFrom: %s\nTo: %s\n' "$envdate" "$_mx_me" "$to"
+		[ -n "$subj" ] && printf 'Subject: %s\n' "$subj"
+		printf '\n%s\n' "${body%$'\n'}"
+		} >> "$f" 2>/dev/null
+	fi
+	return 0
+}
+
+# Write the mailbox back out, keeping what should stay and moving what should
+# move.
+_bt_mailx_writeback() {
+	local i j fd tmp keep=0 mbox line
+	mbox=${MBOX:-$HOME/mbox}
+	[ "$_mx_readonly" = 1 ] && return 0
+	# messages that were read go to the mbox, unless this is already one
+	if [ "$_mx_system" = 1 ] && [ "${_mx_var[hold]+x}" = '' ]; then
+		for (( i = 1; i <= _mx_n; i++ )); do
+			[ "${_mx_state[i]}" = read ] || continue
+			_bt_mailx_append "$i" "$mbox" 1 || return 1
+			_mx_state[i]=moved
+		done
+	fi
+	if ! { exec {fd}>"$_mx_file"; } 2>/dev/null; then
+		_bt_err "mailx: cannot write $_mx_file"
+		return 1
+	fi
+	for (( i = 1; i <= _mx_n; i++ )); do
+		case ${_mx_state[i]} in
+		deleted|moved)	continue ;;
+		esac
+		for (( j = _mx_start[i]; j <= _mx_end[i]; j++ )); do
+			printf '%s\n' "${_mx_lines[j]}" >&"$fd"
+		done
+	done
+	exec {fd}>&-
+	return 0
+}
+
+# Does the word $1 stand for the command whose full name is $2 and whose
+# shortest form is $3 letters?
+_bt_mailx_is() {
+	local word=$1 full=$2 least=$3
+	[ "${#word}" -lt "$least" ] && return 1
+	[ "${#word}" -gt "${#full}" ] && return 1
+	[ "${full:0:${#word}}" = "$word" ] && return 0
+	return 1
+}
+
+# One command line in receive mode.  Returns 1 when it is time to stop.
+_bt_mailx_cmd() {
+	local line=$1 cmd args i m first last f n
+	local -
+	set -f
+	line=${line#"${line%%[![:space:]]*}"}
+	case $line in
+	'')	# a line with nothing on it moves to the next message
+		if [ "$_mx_cur" -lt "$_mx_n" ]; then
+			_mx_cur=$(( _mx_cur + 1 ))
+			_bt_mailx_show "$_mx_cur" 0
+		else
+			_bt_err 'At EOF'
+		fi
+		return 0 ;;
+	'#'*)	return 0 ;;
+	'='*)	printf '%d\n' "$_mx_cur"; return 0 ;;
+	'?'*)	_bt_mailx_help; return 0 ;;
+	'!'*|'|'*)
+		_bt_err 'mailx: this mailx cannot run a command'
+		return 0 ;;
+	esac
+	cmd=${line%%[	 ]*}
+	args=${line#"$cmd"}
+	args=${args#"${args%%[![:space:]]*}"}
+	case $cmd in
+	[0-9]*|'$'|'.'|'^'|'+'|'-'|'*'|:[nourd]|/*)
+		_bt_mailx_msglist "$cmd"
+		for i in $_mx_list; do
+			_mx_cur=$i
+			_bt_mailx_show "$i" 0
+		done
+		return 0 ;;
+	z|z+)	_mx_top=$(( _mx_top + ${_mx_var[screen]:-20} ))
+		[ "$_mx_top" -gt "$_mx_n" ] && _mx_top=$_mx_n
+		_bt_mailx_headers ''
+		return 0 ;;
+	z-)	_mx_top=$(( _mx_top - ${_mx_var[screen]:-20} ))
+		[ "$_mx_top" -lt 1 ] && _mx_top=1
+		_bt_mailx_headers ''
+		return 0 ;;
+	dp|dt)	_bt_mailx_msglist "${args:-.}"
+		for i in $_mx_list; do _mx_state[i]=deleted; done
+		if [ "$_mx_cur" -lt "$_mx_n" ]; then
+			_mx_cur=$(( _mx_cur + 1 ))
+			_bt_mailx_show "$_mx_cur" 0
+		fi
+		return 0 ;;
+	esac
+	if _bt_mailx_is "$cmd" headers 1; then
+		_bt_mailx_headers "$args"
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" help 1 || [ "$cmd" = '?' ]; then
+		_bt_mailx_help
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" print 1 || _bt_mailx_is "$cmd" type 1; then
+		_bt_mailx_msglist "${args:-.}"
+		for i in $_mx_list; do
+			_mx_cur=$i
+			_bt_mailx_show "$i" 0
+		done
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" Print 1 || _bt_mailx_is "$cmd" Type 1; then
+		_bt_mailx_msglist "${args:-.}"
+		for i in $_mx_list; do
+			_mx_cur=$i
+			_bt_mailx_show "$i" 1
+		done
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" next 1; then
+		if [ -n "$args" ]; then
+			_bt_mailx_msglist "$args"
+			set -- $_mx_list
+			[ "$#" -gt 0 ] && _mx_cur=$1
+		elif [ "$_mx_cur" -lt "$_mx_n" ]; then
+			_mx_cur=$(( _mx_cur + 1 ))
+		else
+			_bt_err 'At EOF'
+			return 0
+		fi
+		_bt_mailx_show "$_mx_cur" 0
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" delete 1; then
+		_bt_mailx_msglist "${args:-.}"
+		for i in $_mx_list; do _mx_state[i]=deleted; done
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" undelete 1; then
+		_bt_mailx_msglist "${args:-.}"
+		for i in $_mx_list; do
+			[ "${_mx_state[i]}" = deleted ] && _mx_state[i]=read
+		done
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" from 1; then
+		_bt_mailx_msglist "${args:-.}"
+		for i in $_mx_list; do _bt_mailx_summary "$i"; done
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" save 1 || _bt_mailx_is "$cmd" copy 1 ||
+	   _bt_mailx_is "$cmd" write 1; then
+		f=${args##* }
+		m=${args% *}
+		[ "$m" = "$args" ] && m=
+		if [ -z "$f" ] || [ "$f" = "$args" ] && [ -z "$m" ]; then
+			m=
+		fi
+		[ -z "$f" ] && { _bt_err 'mailx: no file to write to'; return 0; }
+		_bt_mailx_msglist "${m:-.}"
+		n=0
+		for i in $_mx_list; do
+			if _bt_mailx_is "$cmd" write 1; then
+				_bt_mailx_append "$i" "$f" 0 || return 0
+			else
+				_bt_mailx_append "$i" "$f" 1 || return 0
+			fi
+			n=$(( n + 1 ))
+			if _bt_mailx_is "$cmd" save 1; then
+				_mx_state[i]=deleted
+			else
+				_mx_state[i]=read
+			fi
+		done
+		printf '"%s" %d messages\n' "$f" "$n"
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" Save 1 || _bt_mailx_is "$cmd" Copy 1; then
+		_bt_mailx_msglist "${args:-.}"
+		for i in $_mx_list; do
+			f=${_mx_from[i]%%@*}
+			_bt_mailx_append "$i" "$f" 1 || return 0
+			if _bt_mailx_is "$cmd" Save 1; then
+				_mx_state[i]=deleted
+			else
+				_mx_state[i]=read
+			fi
+		done
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" mbox 2; then
+		_bt_mailx_msglist "${args:-.}"
+		for i in $_mx_list; do _mx_state[i]=read; done
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" hold 2 || _bt_mailx_is "$cmd" preserve 3; then
+		_bt_mailx_msglist "${args:-.}"
+		for i in $_mx_list; do _mx_state[i]=preserved; done
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" top 2; then
+		_bt_mailx_msglist "${args:-.}"
+		for i in $_mx_list; do
+			_mx_cur=$i
+			n=${_mx_var[toplines]:-5}
+			first=$(( _mx_start[i] ))
+			last=$(( _mx_end[i] ))
+			m=0
+			for (( f = first + 1; f <= last; f++ )); do
+				[ -z "${_mx_lines[f]}" ] && { m=1; continue; }
+				[ "$m" = 0 ] && continue
+				printf '%s\n' "${_mx_lines[f]}"
+				n=$(( n - 1 ))
+				[ "$n" -le 0 ] && break
+			done
+			_mx_state[i]=read
+		done
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" size 2; then
+		_bt_mailx_msglist "${args:-.}"
+		for i in $_mx_list; do
+			n=0
+			for (( f = _mx_start[i]; f <= _mx_end[i]; f++ )); do
+				n=$(( n + ${#_mx_lines[f]} + 1 ))
+			done
+			printf '%d: %d\n' "$i" "$n"
+		done
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" file 2 || _bt_mailx_is "$cmd" folder 4; then
+		if [ -z "$args" ]; then
+			printf '"%s": %d messages\n' "$_mx_file" "$_mx_n"
+			return 0
+		fi
+		_bt_mailx_writeback
+		_mx_file=$args
+		_mx_system=0
+		_bt_mailx_load "$_mx_file"
+		_mx_cur=1
+		printf '"%s": %d messages\n' "$_mx_file" "$_mx_n"
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" quit 1; then
+		_bt_mailx_writeback
+		return 1
+	fi
+	if _bt_mailx_is "$cmd" exit 2 || [ "$cmd" = x ] || [ "$cmd" = xit ]; then
+		return 1
+	fi
+	if _bt_mailx_is "$cmd" echo 2; then
+		printf '%s\n' "$args"
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" version 2; then
+		printf 'bashtrash mailx\n'
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" set 2; then
+		if [ -z "$args" ]; then
+			for i in "${!_mx_var[@]}"; do
+				printf '%s=%s\n' "$i" "${_mx_var[$i]}"
+			done
+			return 0
+		fi
+		for m in $args; do
+			case $m in
+			no*)	unset "_mx_var[${m#no}]" ;;
+			*=*)	_mx_var[${m%%=*}]=${m#*=} ;;
+			*)	_mx_var[$m]= ;;
+			esac
+		done
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" unset 3; then
+		for m in $args; do unset "_mx_var[$m]"; done
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" alias 1 || _bt_mailx_is "$cmd" group 1; then
+		if [ -z "$args" ]; then
+			for i in "${!_mx_alias[@]}"; do
+				printf '%s\t%s\n' "$i" "${_mx_alias[$i]}"
+			done
+			return 0
+		fi
+		m=${args%%[	 ]*}
+		f=${args#"$m"}
+		f=${f#"${f%%[![:space:]]*}"}
+		if [ -z "$f" ]; then
+			printf '%s\t%s\n' "$m" "${_mx_alias[$m]-}"
+		else
+			_mx_alias[$m]=$f
+		fi
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" unalias 3; then
+		for m in $args; do unset "_mx_alias[$m]"; done
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" alternates 3; then
+		if [ -z "$args" ]; then
+			printf '%s\n' "$_mx_alt"
+		else
+			_mx_alt=$args
+		fi
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" ignore 2 || _bt_mailx_is "$cmd" discard 2; then
+		for m in $args; do _mx_ignore="$_mx_ignore $m"; done
+		[ -z "$args" ] && printf '%s\n' "${_mx_ignore# }"
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" retain 3; then
+		for m in $args; do _mx_retain="$_mx_retain $m"; done
+		[ -z "$args" ] && printf '%s\n' "${_mx_retain# }"
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" list 1; then
+		_bt_mailx_help
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" touch 3; then
+		_bt_mailx_msglist "${args:-.}"
+		for i in $_mx_list; do _mx_state[i]=read; done
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" cd 2 || _bt_mailx_is "$cmd" chdir 2; then
+		cd "${args:-$HOME}" 2>/dev/null || _bt_err "mailx: cannot change to ${args:-$HOME}"
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" source 2; then
+		[ -f "$args" ] || { _bt_err "mailx: cannot open $args"; return 0; }
+		while IFS= read -r line; do
+			_bt_mailx_cmd "$line" || break
+		done < "$args"
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" mail 1; then
+		[ -z "$args" ] && { _bt_err 'mailx: no addressee'; return 0; }
+		_bt_mailx_send '' $args
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" reply 1 || _bt_mailx_is "$cmd" respond 4 ||
+	   _bt_mailx_is "$cmd" Reply 1 || _bt_mailx_is "$cmd" Followup 1 ||
+	   _bt_mailx_is "$cmd" followup 2; then
+		i=$_mx_cur
+		[ -n "$args" ] && { _bt_mailx_msglist "$args"; set -- $_mx_list; i=${1:-$_mx_cur}; }
+		[ "$i" -ge 1 ] || { _bt_err 'mailx: no message to reply to'; return 0; }
+		m=${_mx_subj[i]}
+		case $m in
+		[Rr]e:*)	;;
+		*)		m="Re: $m" ;;
+		esac
+		_bt_mailx_send "$m" "${_mx_from[i]}"
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" shell 2 || _bt_mailx_is "$cmd" pipe 2 ||
+	   _bt_mailx_is "$cmd" edit 1 || _bt_mailx_is "$cmd" visual 1 ||
+	   _bt_mailx_is "$cmd" folders 6; then
+		_bt_err "mailx: $cmd would have to run a program, which this mailx cannot do"
+		return 0
+	fi
+	if _bt_mailx_is "$cmd" if 2 || _bt_mailx_is "$cmd" else 2 ||
+	   _bt_mailx_is "$cmd" endif 3; then
+		return 0
+	fi
+	_bt_err "mailx: unknown command: $cmd"
+	return 0
+}
+
+# The header summary.
+_bt_mailx_headers() {
+	local args=$1 i n first
+	if [ -n "$args" ]; then
+		_bt_mailx_msglist "$args"
+		for i in $_mx_list; do _bt_mailx_summary "$i"; done
+		return 0
+	fi
+	n=${_mx_var[screen]:-20}
+	first=$_mx_top
+	[ "$first" -lt 1 ] && first=1
+	for (( i = first; i < first + n && i <= _mx_n; i++ )); do
+		_bt_mailx_summary "$i"
+	done
+	return 0
+}
+
+_bt_mailx_help() {
+	printf '%s\n' \
+	'headers        list the messages' \
+	'print [list]   write the messages out' \
+	'next           the next message' \
+	'delete [list]  mark for deletion' \
+	'undelete [list] take the mark off' \
+	'save [list] f  append the messages to a file' \
+	'write [list] f  append them without their headers' \
+	'reply [list]   answer a message' \
+	'mail addr      send a message' \
+	'file [f]       read another mailbox' \
+	'quit           save what was read and stop' \
+	'exit           stop, leaving the mailbox alone'
+	return 0
+}
+
+mailx () {
+	local LC_ALL=C
+	local arg opt subj= exist=0 usefile=0 hdronly=0 nosum=0 nostart=0
+	local user= file= line i n new=0
+	local _mx_me= _mx_box= _mx_file= _mx_n=0 _mx_cur=1 _mx_top=1
+	local _mx_status=0 _mx_record=0 _mx_system=1 _mx_readonly=0
+	local _mx_cc= _mx_bcc= _mx_alt= _mx_ignore= _mx_retain= _mx_list=
+	local -a _mx_lines=() _mx_start=() _mx_end=() _mx_state=() _mx_from=()
+	local -a _mx_date=() _mx_subj=() _mx_env=()
+	local -A _mx_var=() _mx_alias=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-s)	shift
+			[ "$#" = 0 ] && { _bt_err 'mailx: -s wants a subject'; return 1; }
+			subj=$1; shift ;;
+		-s*)	subj=${1#-s}; shift ;;
+		-u)	shift
+			[ "$#" = 0 ] && { _bt_err 'mailx: -u wants a user'; return 1; }
+			user=$1; shift ;;
+		-u*)	user=${1#-u}; shift ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				e)	exist=1 ;;
+				f)	usefile=1 ;;
+				F)	_mx_record=1 ;;
+				H)	hdronly=1 ;;
+				i)	;;
+				n)	nostart=1 ;;
+				N)	nosum=1 ;;
+				s)	if [ -n "$arg" ]; then subj=$arg; arg=
+					elif [ "$#" -gt 0 ]; then subj=$1; shift
+					else _bt_err 'mailx: -s wants a subject'; return 1; fi ;;
+				u)	if [ -n "$arg" ]; then user=$arg; arg=
+					elif [ "$#" -gt 0 ]; then user=$1; shift
+					else _bt_err 'mailx: -u wants a user'; return 1; fi ;;
+				*)	_bt_err "mailx: illegal option -- $opt"
+					_bt_err 'usage: mailx [-s subject] address...'
+					_bt_err '       mailx -e'
+					_bt_err '       mailx [-HiNn] [-F] [-u user]'
+					_bt_err '       mailx -f [-HiNn] [-F] [file]'
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	_bt_mailx_whoami
+
+	# sending
+	if [ "$#" -gt 0 ] && [ "$usefile" = 0 ] && [ "$exist" = 0 ]; then
+		_bt_mailx_send "$subj" "$@"
+		return "$_mx_status"
+	fi
+
+	if [ "$usefile" = 1 ]; then
+		if [ "$#" -gt 0 ]; then
+			_mx_file=$1
+		else
+			_mx_file=${MBOX:-$HOME/mbox}
+		fi
+		_mx_system=0
+	else
+		_bt_mailx_box "${user:-$_mx_me}"
+		_mx_file=${MAIL:-$_mx_box}
+		[ -n "$user" ] && _mx_file=$_mx_box
+	fi
+
+	_bt_mailx_load "$_mx_file" || {
+		_bt_err "mailx: cannot open $_mx_file"
+		return 1
+	}
+	if [ "$exist" = 1 ]; then
+		[ "$_mx_n" -gt 0 ] && return 0
+		return 1
+	fi
+	if [ "$_mx_n" = 0 ]; then
+		printf 'No mail for %s\n' "${user:-$_mx_me}"
+		return 0
+	fi
+	# what has not been seen before counts as new
+	for (( i = 1; i <= _mx_n; i++ )); do
+		_mx_state[i]=new
+	done
+	_mx_cur=1
+	if [ "$hdronly" = 1 ]; then
+		_bt_mailx_headers ''
+		return 0
+	fi
+	if [ "$nosum" = 0 ]; then
+		printf '"%s": %d message' "$_mx_file" "$_mx_n"
+		[ "$_mx_n" = 1 ] || printf 's'
+		printf '\n'
+		_bt_mailx_headers ''
+	fi
+	while IFS= read -r line; do
+		_bt_mailx_cmd "$line" || return "$_mx_status"
+	done
+	# the end of the input is the same as quit
+	_bt_mailx_writeback
+	return "$_mx_status"
+}

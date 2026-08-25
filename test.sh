@@ -28,7 +28,7 @@ for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          nohup pr dd sed who logname diff cal fuser ipcs patch tput \
          what uuencode uudecode write ps ed m4 iconv ar locale nm \
          admin delta get prs rmdel sact sccs unget val \
-         compress uncompress zcat bc make awk gencat ctags cflow cxref file lex yacc man; do
+         compress uncompress zcat bc make awk gencat ctags cflow cxref file lex yacc man mailx; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -3940,19 +3940,204 @@ else note_fail "man -k with nothing to find: [$a]"; fi
 
 cd .. || exit 1
 
+# --- mailx ------------------------------------------------------------------
+# A mailbox is a file of messages, each beginning with a line that starts
+# "From ", so sending and reading can both be checked by looking at the file.
+echo "### mailx"
+mkdir -p mxt
+cd mxt || exit 1
+MXHOME=$PWD
+
+mxsend() {	# mxsend subject body address
+	printf '%s\n' "$3" | ( MAIL=$MXHOME/box MBOX=$MXHOME/mbox HOME=$MXHOME
+		. "$BT"; mailx -s "$1" "$2" ) 2>&1
+}
+
+rm -f box mbox
+who=$( . "$BT"; id -un )
+mxsend 'the first' "$who" 'body of the first' > /dev/null
+mxsend 'the second' "$who" 'body of the second' > /dev/null
+
+# the mailbox holds two messages in the shape a mailbox has
+if [ "$( "$(real_of grep)" -c '^From ' box )" = 2 ]; then pass=$((pass + 1))
+else note_fail "mailx sent $( "$(real_of grep)" -c '^From ' box ) messages, not 2"; fi
+ok=1
+for want in "^From $who " '^Date: ' "^From: $who$" "^To: $who$" '^Subject: the first$' '^body of the first$'; do
+	"$(real_of grep)" -q "$want" box || { ok=0; note_fail "mailx: [$want] missing from the message"; }
+done
+[ "$ok" = 1 ] && pass=$((pass + 1))
+
+# a header summary, and the messages counted
+got=$( MAIL=$MXHOME/box MBOX=$MXHOME/mbox HOME=$MXHOME; . "$BT"; mailx -H 2>&1 )
+if [ "$( printf '%s\n' "$got" | "$(real_of wc)" -l )" = 2 ] &&
+   case $got in '>N  1 '*) true ;; *) false ;; esac; then
+	pass=$((pass + 1))
+else note_fail "mailx -H: [$got]"; fi
+
+# -e says whether there is anything to read
+a=$( MAIL=$MXHOME/box HOME=$MXHOME; . "$BT"; mailx -e; echo $? )
+b=$( MAIL=$MXHOME/nothing HOME=$MXHOME; . "$BT"; mailx -e; echo $? )
+if [ "$a" = 0 ] && [ "$b" = 1 ]; then pass=$((pass + 1))
+else note_fail "mailx -e said $a and $b"; fi
+got=$( MAIL=$MXHOME/nothing HOME=$MXHOME; . "$BT"; mailx 2>&1 < /dev/null )
+case $got in
+'No mail for '*)	pass=$((pass + 1)) ;;
+*)			note_fail "mailx with an empty mailbox: [$got]" ;;
+esac
+
+# reading: print a message, save one, write one without its headers
+rm -f saved written
+got=$( MAIL=$MXHOME/box MBOX=$MXHOME/mbox HOME=$MXHOME; . "$BT"
+	printf 'p 1\ns 1 saved\nw 2 written\nsize 2\n=\nx\n' | mailx -N 2>&1 )
+ok=1
+for want in '^Subject: the first$' '^body of the first$' '^"saved" 1 messages$' '^"written" 1 messages$' '^2: [0-9]*$'; do
+	printf '%s\n' "$got" | "$(real_of grep)" -q "$want" || { ok=0; note_fail "mailx reading: [$want] not in [$got]"; }
+done
+[ "$ok" = 1 ] && pass=$((pass + 1))
+if "$(real_of grep)" -q '^From ' saved && "$(real_of grep)" -q '^body of the first$' saved; then
+	pass=$((pass + 1))
+else note_fail "mailx save"; fi
+if ! "$(real_of grep)" -q '^From ' written && "$(real_of grep)" -q '^body of the second$' written; then
+	pass=$((pass + 1))
+else note_fail "mailx write should leave the headers out"; fi
+
+# exit leaves the mailbox alone; quit moves what was read to the mbox
+( MAIL=$MXHOME/box MBOX=$MXHOME/mbox HOME=$MXHOME; . "$BT"
+	printf 'p 1\nx\n' | mailx -N ) > /dev/null 2>&1
+if [ "$( "$(real_of grep)" -c '^From ' box )" = 2 ]; then pass=$((pass + 1))
+else note_fail "mailx exit should have left the mailbox alone"; fi
+rm -f mbox
+( MAIL=$MXHOME/box MBOX=$MXHOME/mbox HOME=$MXHOME; . "$BT"
+	printf 'p 1\nq\n' | mailx -N ) > /dev/null 2>&1
+if [ "$( "$(real_of grep)" -c '^From ' box )" = 1 ] &&
+   [ "$( "$(real_of grep)" -c '^From ' mbox )" = 1 ]; then
+	pass=$((pass + 1))
+else note_fail "mailx quit should move what was read to the mbox"; fi
+
+# delete and undelete
+rm -f box mbox
+mxsend 'one' "$who" 'first' > /dev/null
+mxsend 'two' "$who" 'second' > /dev/null
+mxsend 'three' "$who" 'third' > /dev/null
+( MAIL=$MXHOME/box MBOX=$MXHOME/mbox HOME=$MXHOME; . "$BT"
+	printf 'd 1 2\nu 2\nq\n' | mailx -N ) > /dev/null 2>&1
+if [ "$( "$(real_of grep)" -c '^From ' box )" = 1 ] &&
+   [ "$( "$(real_of grep)" -c '^From ' mbox )" = 1 ]; then
+	pass=$((pass + 1))
+else note_fail "mailx delete and undelete"; fi
+
+# -f reads another mailbox, and leaves it alone
+rm -f box mbox other
+mxsend 'kept' "$who" 'body' > /dev/null
+"$(real_of cp)" box other
+got=$( MAIL=$MXHOME/box MBOX=$MXHOME/mbox HOME=$MXHOME; . "$BT"
+	printf 'h\nq\n' | mailx -N -f other 2>&1 )
+case $got in
+*' 1 '*kept*)	pass=$((pass + 1)) ;;
+*)		note_fail "mailx -f: [$got]" ;;
+esac
+if [ "$( "$(real_of grep)" -c '^From ' other )" = 1 ]; then pass=$((pass + 1))
+else note_fail "mailx -f should have left the file alone"; fi
+
+# a message list of several sorts
+got=$( MAIL=$MXHOME/box MBOX=$MXHOME/mbox HOME=$MXHOME; . "$BT"
+	printf 'f *\nf $\nf /kept\nx\n' | mailx -N 2>&1 | "$(real_of wc)" -l )
+if [ "$got" = 3 ]; then pass=$((pass + 1))
+else note_fail "mailx message lists gave $got lines, not 3"; fi
+
+# an address with a host in it has nowhere to go
+a=$( printf 'x\n' | ( MAIL=$MXHOME/box HOME=$MXHOME; . "$BT"
+	mailx -s hi someone@example.com ) 2>&1; echo "rc=$?" )
+case $a in
+*'no mailer'*rc=1)	pass=$((pass + 1)) ;;
+*)			note_fail "mailx to a remote address: [$a]" ;;
+esac
+
+cd .. || exit 1
+
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"
+mkdir -p pure
+cat > pure/prog.l <<'PEOF'
+%{
+#include <stdio.h>
+%}
+%%
+[a-z]+	{ printf("W"); }
+.|\n	;
+%%
+PEOF
+cat > pure/gram.y <<'PEOF'
+%token NUM
+%%
+s	: NUM '\n'	{ }
+	;
+%%
+PEOF
+cat > pure/prog.c <<'PEOF'
+#define LIMIT 10
+typedef int count_t;
+int add(int a, int b)
+{
+	return a + b;
+}
+int main(void)
+{
+	return add(1, LIMIT);
+}
+PEOF
+cat > pure/page.1 <<'PEOF'
+.TH PURE 1 "2026" "bashtrash" "User Commands"
+.SH NAME
+pure \- a page to format
+.SH DESCRIPTION
+It is only a test.
+PEOF
+printf '$set 1\n1 hello\n' > pure/cat.msg
+printf 'a b c\n1 2 3\n' > pure/data
+printf 'all:\n\t@echo made\n' > pure/Makefile
+printf '0\tstring\ta\tstarts with an a\n' > pure/magic
+mkdir -p pure/manpath/man1
+cp pure/page.1 pure/manpath/man1/pure.1
 out=$(env -i PATH= "$BASH" --noprofile --norc -c '
 	. "$1" || exit 1
 	cd "$2" || exit 1
-	cat lines12 > /dev/null    || exit 1
-	cat -u binary > /dev/null  || exit 1
-	tail -n 3 lines12 > /dev/null || exit 1
-	tail -c 5 lines12 > /dev/null || exit 1
-	id > /dev/null             || exit 1
+	cat lines12 > /dev/null			|| exit 1
+	cat -u binary > /dev/null		|| exit 1
+	tail -n 3 lines12 > /dev/null		|| exit 1
+	tail -c 5 lines12 > /dev/null		|| exit 1
+	id > /dev/null				|| exit 1
+	cd pure					|| exit 1
+	export HOME=$PWD MAIL=$PWD/box MANPATH=$PWD/manpath
+	awk "{ s += \$2 } END { print s, NR }" data > /dev/null	|| exit 1
+	awk "BEGIN { printf \"%.4f\n\", sin(1) }" > /dev/null	|| exit 1
+	sed -n "1p" data > /dev/null		|| exit 1
+	grep -c b data > /dev/null		|| exit 1
+	sort -k2 data > /dev/null		|| exit 1
+	bc <<< "2^64" > /dev/null		|| exit 1
+	make -n > /dev/null			|| exit 1
+	lex -t prog.l > /dev/null		|| exit 1
+	yacc gram.y				|| exit 1
+	ctags -f tags prog.c			|| exit 1
+	cflow prog.c > /dev/null		|| exit 1
+	cxref prog.c > /dev/null		|| exit 1
+	file data prog.c > /dev/null		|| exit 1
+	file -M magic data > /dev/null		|| exit 1
+	gencat cat.cat cat.msg			|| exit 1
+	compress -c data > data.Z		|| exit 1
+	zcat data.Z > /dev/null			|| exit 1
+	uuencode data d < data > data.uu	|| exit 1
+	uudecode -o /dev/null data.uu		|| exit 1
+	od -An -tx1 data > /dev/null		|| exit 1
+	pr -h x data > /dev/null		|| exit 1
+	diff data data > /dev/null		|| exit 1
+	man pure > /dev/null			|| exit 1
+	printf "a message\n" | mailx -s hi "$(id -un)" || exit 1
+	mailx -H > /dev/null			|| exit 1
+	printf "q\n" | mailx -N > /dev/null	|| exit 1
 	echo ok' _ "$BT" "$work" 2>&1)
 if [ "$out" = ok ]; then
-	pass=$((pass + 1)); echo "all three run with an empty PATH"
+	pass=$((pass + 1)); echo "everything above runs with an empty PATH"
 else
 	note_fail "empty PATH: $out"
 fi
