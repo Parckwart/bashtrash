@@ -22858,3 +22858,773 @@ yacc () {
 	[ "$verbose" = 1 ] && _bt_yacc_describe "$prefix.output"
 	return 0
 }
+
+# ---------------------------------------------------------------------------
+# Reading a gzip file, which is what a manual page is kept in.  The format is
+# RFC 1951: a stream of blocks, each either stored, or coded with the fixed
+# Huffman code, or with a code the block carries with it, and each symbol
+# either a byte or a length and a distance saying to copy what came before.
+#
+# The Huffman codes are canonical, so a symbol can be read a bit at a time
+# without building a table: count how many codes there are of each length,
+# and at each length ask whether the code read so far falls in that range.
+# ---------------------------------------------------------------------------
+
+# The character for each byte, made once, so that a literal costs a lookup.
+_bt_chrtab() {
+	local i o
+	[ "${#_BT_CHRTAB[@]}" = 256 ] && return 0
+	_BT_CHRTAB=()
+	for (( i = 0; i < 256; i++ )); do
+		if [ "$i" = 0 ]; then
+			_BT_CHRTAB[i]=
+			continue
+		fi
+		printf -v o '%03o' "$i"
+		printf -v _BT_CHRTAB[i] "\\$o"
+	done
+	return 0
+}
+
+# Read $1 bits, smallest first.  Relies on its caller's locals.
+_bt_infl_bits() {
+	local want=$1 v=0 got=0
+	while [ "$got" -lt "$want" ]; do
+		if [ "$_in_bit" = 0 ]; then
+			_in_cur=${_bt_b[_in_pos]-0}
+			_in_pos=$(( _in_pos + 1 ))
+		fi
+		v=$(( v | (((_in_cur >> _in_bit) & 1) << got) ))
+		_in_bit=$(( (_in_bit + 1) & 7 ))
+		got=$(( got + 1 ))
+	done
+	_in_v=$v
+	return 0
+}
+
+# Read one symbol using the code whose counts are in the array named $1 and
+# whose symbols are in the array named $2.
+_bt_infl_sym() {
+	local -n _cnt=$1
+	local -n _sym=$2
+	local code=0 first=0 index=0 len count
+	for (( len = 1; len <= 15; len++ )); do
+		if [ "$_in_bit" = 0 ]; then
+			_in_cur=${_bt_b[_in_pos]-0}
+			_in_pos=$(( _in_pos + 1 ))
+		fi
+		code=$(( code | ((_in_cur >> _in_bit) & 1) ))
+		_in_bit=$(( (_in_bit + 1) & 7 ))
+		count=${_cnt[len]:-0}
+		if [ $(( code - first )) -lt "$count" ]; then
+			_in_v=${_sym[index + code - first]}
+			return 0
+		fi
+		index=$(( index + count ))
+		first=$(( (first + count) << 1 ))
+		code=$(( code << 1 ))
+	done
+	_in_v=-1
+	return 1
+}
+
+# Build the counts and the symbol order of a canonical code from the lengths
+# in the array named $1, into the arrays named $2 and $3.
+_bt_infl_build() {
+	local -n _len=$1
+	local -n _c=$2
+	local -n _s=$3
+	local i n=${#_len[@]} l
+	local -a offs=()
+	_c=()
+	for (( l = 0; l <= 15; l++ )); do _c[l]=0; done
+	for (( i = 0; i < n; i++ )); do
+		l=${_len[i]:-0}
+		_c[l]=$(( ${_c[l]} + 1 ))
+	done
+	_c[0]=0
+	offs[1]=0
+	for (( l = 1; l < 15; l++ )); do
+		offs[l+1]=$(( ${offs[l]} + ${_c[l]} ))
+	done
+	_s=()
+	for (( i = 0; i < n; i++ )); do
+		l=${_len[i]:-0}
+		[ "$l" = 0 ] && continue
+		_s[${offs[l]}]=$i
+		offs[l]=$(( ${offs[l]} + 1 ))
+	done
+	return 0
+}
+
+_BT_INFL_LBASE=(3 4 5 6 7 8 9 10 11 13 15 17 19 23 27 31 35 43 51 59 67 83 99 115 131 163 195 227 258)
+_BT_INFL_LEXT=(0 0 0 0 0 0 0 0 1 1 1 1 2 2 2 2 3 3 3 3 4 4 4 4 5 5 5 5 0)
+_BT_INFL_DBASE=(1 2 3 4 5 7 9 13 17 25 33 49 65 97 129 193 257 385 513 769 1025 1537 2049 3073 4097 6145 8193 12289 16385 24577)
+_BT_INFL_DEXT=(0 0 0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13)
+
+# Undo the deflate stream in _bt_b starting at _in_pos, into _bt_str.
+_bt_inflate() {
+	local final=0 type i n last sym len dist extra chunk
+	local -a lit=() dst=() lcnt=() lsym=() dcnt=() dsym=() lens=()
+	local -a clcnt=() clsym=() cl=()
+	local out=
+	_bt_chrtab
+	while [ "$final" = 0 ]; do
+		_bt_infl_bits 1
+		final=$_in_v
+		_bt_infl_bits 2
+		type=$_in_v
+		case $type in
+		0)	# stored: the rest of the byte is dropped
+			[ "$_in_bit" != 0 ] && { _in_bit=0; }
+			n=$(( ${_bt_b[_in_pos]} | (${_bt_b[_in_pos+1]} << 8) ))
+			_in_pos=$(( _in_pos + 4 ))
+			for (( i = 0; i < n; i++ )); do
+				out=$out${_BT_CHRTAB[${_bt_b[_in_pos]}]}
+				_in_pos=$(( _in_pos + 1 ))
+			done
+			continue ;;
+		1)	# the fixed code
+			lens=()
+			for (( i = 0; i < 144; i++ )); do lens[i]=8; done
+			for (( i = 144; i < 256; i++ )); do lens[i]=9; done
+			for (( i = 256; i < 280; i++ )); do lens[i]=7; done
+			for (( i = 280; i < 288; i++ )); do lens[i]=8; done
+			_bt_infl_build lens lcnt lsym
+			lens=()
+			for (( i = 0; i < 30; i++ )); do lens[i]=5; done
+			_bt_infl_build lens dcnt dsym ;;
+		2)	# the code the block carries with it
+			_bt_infl_bits 5; local hlit=$(( _in_v + 257 ))
+			_bt_infl_bits 5; local hdist=$(( _in_v + 1 ))
+			_bt_infl_bits 4; local hclen=$(( _in_v + 4 ))
+			local -a order=(16 17 18 0 8 7 9 6 10 5 11 4 12 3 13 2 14 1 15)
+			cl=()
+			for (( i = 0; i < 19; i++ )); do cl[i]=0; done
+			for (( i = 0; i < hclen; i++ )); do
+				_bt_infl_bits 3
+				cl[${order[i]}]=$_in_v
+			done
+			_bt_infl_build cl clcnt clsym
+			lens=()
+			i=0
+			while [ "$i" -lt $(( hlit + hdist )) ]; do
+				_bt_infl_sym clcnt clsym || return 1
+				sym=$_in_v
+				case $sym in
+				16)	_bt_infl_bits 2
+					n=$(( _in_v + 3 ))
+					last=${lens[i-1]:-0}
+					while [ "$n" -gt 0 ]; do
+						lens[i]=$last
+						i=$(( i + 1 ))
+						n=$(( n - 1 ))
+					done ;;
+				17)	_bt_infl_bits 3
+					n=$(( _in_v + 3 ))
+					while [ "$n" -gt 0 ]; do
+						lens[i]=0
+						i=$(( i + 1 ))
+						n=$(( n - 1 ))
+					done ;;
+				18)	_bt_infl_bits 7
+					n=$(( _in_v + 11 ))
+					while [ "$n" -gt 0 ]; do
+						lens[i]=0
+						i=$(( i + 1 ))
+						n=$(( n - 1 ))
+					done ;;
+				*)	lens[i]=$sym
+					i=$(( i + 1 )) ;;
+				esac
+			done
+			lit=("${lens[@]:0:hlit}")
+			dst=("${lens[@]:hlit:hdist}")
+			_bt_infl_build lit lcnt lsym
+			_bt_infl_build dst dcnt dsym ;;
+		*)	_bt_err "inflate: bad block type"
+			return 1 ;;
+		esac
+		while :; do
+			_bt_infl_sym lcnt lsym || return 1
+			sym=$_in_v
+			if [ "$sym" -lt 256 ]; then
+				out=$out${_BT_CHRTAB[sym]}
+				continue
+			fi
+			[ "$sym" = 256 ] && break
+			sym=$(( sym - 257 ))
+			extra=${_BT_INFL_LEXT[sym]}
+			len=${_BT_INFL_LBASE[sym]}
+			if [ "$extra" != 0 ]; then
+				_bt_infl_bits "$extra"
+				len=$(( len + _in_v ))
+			fi
+			_bt_infl_sym dcnt dsym || return 1
+			sym=$_in_v
+			extra=${_BT_INFL_DEXT[sym]}
+			dist=${_BT_INFL_DBASE[sym]}
+			if [ "$extra" != 0 ]; then
+				_bt_infl_bits "$extra"
+				dist=$(( dist + _in_v ))
+			fi
+			while [ "$len" -gt 0 ]; do
+				chunk=$dist
+				[ "$chunk" -gt "$len" ] && chunk=$len
+				out=$out${out: -dist:chunk}
+				len=$(( len - chunk ))
+			done
+		done
+	done
+	_bt_str=$out
+	return 0
+}
+
+# Read the gzip file $1, its contents into _bt_str.
+_bt_gunzip() {
+	local flg n i
+	local -a _bt_b=()
+	local _in_pos=0 _in_bit=0 _in_cur=0 _in_v=0
+	_bt_file_bytes "$1" || return 1
+	if [ "${_bt_b[0]}" != 31 ] || [ "${_bt_b[1]}" != 139 ]; then
+		_bt_err "gunzip: $1 is not a gzip file"
+		return 1
+	fi
+	if [ "${_bt_b[2]}" != 8 ]; then
+		_bt_err "gunzip: $1 is not deflated"
+		return 1
+	fi
+	flg=${_bt_b[3]}
+	_in_pos=10
+	if [ $(( flg & 4 )) != 0 ]; then
+		n=$(( ${_bt_b[_in_pos]} | (${_bt_b[_in_pos+1]} << 8) ))
+		_in_pos=$(( _in_pos + 2 + n ))
+	fi
+	if [ $(( flg & 8 )) != 0 ]; then
+		while [ "${_bt_b[_in_pos]}" != 0 ]; do _in_pos=$(( _in_pos + 1 )); done
+		_in_pos=$(( _in_pos + 1 ))
+	fi
+	if [ $(( flg & 16 )) != 0 ]; then
+		while [ "${_bt_b[_in_pos]}" != 0 ]; do _in_pos=$(( _in_pos + 1 )); done
+		_in_pos=$(( _in_pos + 1 ))
+	fi
+	[ $(( flg & 2 )) != 0 ] && _in_pos=$(( _in_pos + 2 ))
+	_bt_inflate
+	return $?
+}
+
+# ---------------------------------------------------------------------------
+# man -- POSIX.1-2017:  man [-k] name...
+#
+# The pages are roff source with the man macros in them, and they are usually
+# kept gzipped, so this reads gzip as well.  What the output looks like is not
+# something the standard says anything about; what is here is the shape a
+# manual page has always had: headings at the margin, text filled and indented
+# under them.
+# ---------------------------------------------------------------------------
+
+# The escapes roff uses, in $1, into _bt_str.
+_bt_man_esc() {
+	local s=$1 n=${#1} i=0 out= c d
+	while [ "$i" -lt "$n" ]; do
+		c=${s:i:1}
+		if [ "$c" != '\' ]; then
+			out=$out$c
+			i=$(( i + 1 ))
+			continue
+		fi
+		i=$(( i + 1 ))
+		d=${s:i:1}
+		case $d in
+		'-')	out=$out'-'; i=$(( i + 1 )) ;;
+		'e')	out=$out'\'; i=$(( i + 1 )) ;;
+		' ')	out=$out' '; i=$(( i + 1 )) ;;
+		'&'|'%'|'c'|'{'|'}'|'!')	i=$(( i + 1 )) ;;
+		'f')	i=$(( i + 1 ))
+			case ${s:i:1} in
+			'(')	i=$(( i + 3 )) ;;
+			'[')	while [ "$i" -lt "$n" ] && [ "${s:i:1}" != ']' ]; do i=$(( i + 1 )); done
+				i=$(( i + 1 )) ;;
+			*)	i=$(( i + 1 )) ;;
+			esac ;;
+		's')	i=$(( i + 1 ))
+			case ${s:i:1} in
+			[-+])	i=$(( i + 1 )) ;;
+			esac
+			while [ "$i" -lt "$n" ]; do
+				case ${s:i:1} in
+				[0-9])	i=$(( i + 1 )) ;;
+				*)	break ;;
+				esac
+			done ;;
+		'(')	case ${s:i+1:2} in
+			em)	out=$out'--' ;;
+			en)	out=$out'-' ;;
+			aq)	out=$out"'" ;;
+			dq)	out=$out'"' ;;
+			bu)	out=$out'*' ;;
+			hy)	out=$out'-' ;;
+			ti)	out=$out'~' ;;
+			co)	out=$out'(C)' ;;
+			rg)	out=$out'(R)' ;;
+			lq)	out=$out'"' ;;
+			rq)	out=$out'"' ;;
+			ga)	out=$out'`' ;;
+			ha)	out=$out'^' ;;
+			*)	out=$out${s:i+1:2} ;;
+			esac
+			i=$(( i + 3 )) ;;
+		'*')	i=$(( i + 1 ))
+			case ${s:i:1} in
+			'(')	case ${s:i+1:2} in
+				lq|rq)	out=$out'"' ;;
+				esac
+				i=$(( i + 3 )) ;;
+			'[')	while [ "$i" -lt "$n" ] && [ "${s:i:1}" != ']' ]; do i=$(( i + 1 )); done
+				i=$(( i + 1 )) ;;
+			*)	i=$(( i + 1 )) ;;
+			esac ;;
+		'"')	break ;;
+		'')	out=$out'\' ;;
+		*)	out=$out$d; i=$(( i + 1 )) ;;
+		esac
+	done
+	_bt_str=$out
+	return 0
+}
+
+# Split a macro line into its arguments, quotes and all, into the array _mn_a.
+_bt_man_args() {
+	local s=$1 n=${#1} i=0 c arg
+	_mn_a=()
+	while [ "$i" -lt "$n" ]; do
+		case ${s:i:1} in
+		' '|$'\t')	i=$(( i + 1 )); continue ;;
+		esac
+		if [ "${s:i:1}" = '"' ]; then
+			i=$(( i + 1 ))
+			arg=
+			while [ "$i" -lt "$n" ]; do
+				c=${s:i:1}
+				if [ "$c" = '"' ]; then
+					if [ "${s:i+1:1}" = '"' ]; then
+						arg=$arg'"'
+						i=$(( i + 2 ))
+						continue
+					fi
+					i=$(( i + 1 ))
+					break
+				fi
+				arg=$arg$c
+				i=$(( i + 1 ))
+			done
+			_mn_a+=("$arg")
+			continue
+		fi
+		arg=
+		while [ "$i" -lt "$n" ]; do
+			c=${s:i:1}
+			case $c in
+			' '|$'\t')	break ;;
+			esac
+			arg=$arg$c
+			i=$(( i + 1 ))
+		done
+		_mn_a+=("$arg")
+	done
+	return 0
+}
+
+# Add $1 to the line being filled, breaking it when it is full.
+_bt_man_word() {
+	local w=$1 pad= i
+	if [ "$_mn_fill" = 0 ]; then
+		return 0
+	fi
+	if [ -z "$_mn_line" ]; then
+		for (( i = 0; i < _mn_ind; i++ )); do pad=$pad' '; done
+		_mn_line=$pad$w
+		return 0
+	fi
+	if [ $(( ${#_mn_line} + 1 + ${#w} )) -gt "$_mn_width" ]; then
+		printf '%s\n' "$_mn_line"
+		pad=
+		for (( i = 0; i < _mn_ind; i++ )); do pad=$pad' '; done
+		_mn_line=$pad$w
+		return 0
+	fi
+	_mn_line=$_mn_line' '$w
+	return 0
+}
+
+# Finish the line being filled.
+_bt_man_flush() {
+	[ -n "$_mn_line" ] && printf '%s\n' "$_mn_line"
+	_mn_line=
+	return 0
+}
+
+# A blank line, but never two in a row.
+_bt_man_blank() {
+	_bt_man_flush
+	[ "$_mn_blank" = 1 ] && return 0
+	printf '\n'
+	_mn_blank=1
+	return 0
+}
+
+# Write out the text $1 as a line of its own at the current indent.
+_bt_man_out() {
+	local pad= i
+	for (( i = 0; i < _mn_ind; i++ )); do pad=$pad' '; done
+	printf '%s%s\n' "$pad" "$1"
+	_mn_blank=0
+	return 0
+}
+
+# Format the page held in _mn_lines.
+_bt_man_format() {
+	local n=${#_mn_lines[@]} i=0 line mac rest w j tagline=0 tag
+	local -a stack=()
+	_mn_ind=$_mn_base
+	_mn_line=
+	_mn_fill=1
+	_mn_blank=1
+	for (( i = 0; i < n; i++ )); do
+		line=${_mn_lines[i]}
+		case $line in
+		'.\"'*|"'\\\""*|'.\\"'*)	continue ;;
+		'')	_bt_man_blank; continue ;;
+		esac
+		case $line in
+		'.'*|"'"*)
+			mac=${line#?}
+			rest=${mac#*[	 ]}
+			[ "$rest" = "$mac" ] && rest=
+			mac=${mac%%[	 ]*}
+			_bt_man_macro "$mac" "$rest"
+			continue ;;
+		esac
+		_bt_man_esc "$line"
+		line=$_bt_str
+		if [ "${_mn_tp:-0}" = 1 ]; then
+			# the line after .TP is the tag, and what follows it
+			# is indented under it
+			_mn_tp=0
+			_bt_man_flush
+			_bt_man_out "$line"
+			_mn_ind=$(( _mn_base + 4 ))
+			continue
+		fi
+		if [ "$_mn_fill" = 0 ]; then
+			_bt_man_out "$line"
+			continue
+		fi
+		case $line in
+		[' 	']*)	_bt_man_flush
+				_bt_man_out "${line#"${line%%[![:space:]]*}"}"
+				continue ;;
+		esac
+		for w in $line; do
+			_bt_man_word "$w"
+		done
+		_mn_blank=0
+	done
+	_bt_man_flush
+	return 0
+}
+
+# One macro: $1 its name, $2 the rest of the line.
+_bt_man_macro() {
+	local mac=$1 rest=$2 i out= sep= n
+	local -a _mn_a=()
+	case $mac in
+	TH)	_bt_man_args "$rest"
+		_bt_man_esc "${_mn_a[0]-}"
+		_mn_title=$_bt_str
+		_mn_sect=${_mn_a[1]-}
+		_mn_extra=${_mn_a[4]-${_mn_a[3]-}}
+		out="$_mn_title($_mn_sect)"
+		n=$(( _mn_width - 2 * ${#out} ))
+		[ "$n" -lt 1 ] && n=1
+		printf -v sep '%*s' "$n" ''
+		printf '%s%s%s\n\n' "$out" "$sep" "$out"
+		_mn_blank=1
+		return 0 ;;
+	SH)	_bt_man_flush
+		_bt_man_args "$rest"
+		out=
+		for i in "${!_mn_a[@]}"; do
+			_bt_man_esc "${_mn_a[i]}"
+			out=${out:+$out }$_bt_str
+		done
+		[ "$_mn_blank" = 0 ] && printf '\n'
+		printf '%s\n' "$out"
+		_mn_ind=$_mn_base
+		_mn_blank=1
+		return 0 ;;
+	SS)	_bt_man_flush
+		_bt_man_args "$rest"
+		out=
+		for i in "${!_mn_a[@]}"; do
+			_bt_man_esc "${_mn_a[i]}"
+			out=${out:+$out }$_bt_str
+		done
+		[ "$_mn_blank" = 0 ] && printf '\n'
+		printf '   %s\n' "$out"
+		_mn_ind=$_mn_base
+		_mn_blank=1
+		return 0 ;;
+	PP|P|LP)	_bt_man_blank
+		_mn_ind=$_mn_base
+		return 0 ;;
+	TP)	_bt_man_flush
+		_mn_ind=$_mn_base
+		_mn_tp=1
+		return 0 ;;
+	IP)	_bt_man_flush
+		_bt_man_args "$rest"
+		if [ -n "${_mn_a[0]-}" ]; then
+			_bt_man_esc "${_mn_a[0]}"
+			_bt_man_out "$_bt_str"
+		else
+			_bt_man_blank
+		fi
+		_mn_ind=$(( _mn_base + 4 ))
+		return 0 ;;
+	RS)	_bt_man_flush
+		_mn_base=$(( _mn_base + 4 ))
+		_mn_ind=$_mn_base
+		return 0 ;;
+	RE)	_bt_man_flush
+		_mn_base=$(( _mn_base - 4 ))
+		[ "$_mn_base" -lt 0 ] && _mn_base=0
+		_mn_ind=$_mn_base
+		return 0 ;;
+	br)	_bt_man_flush; return 0 ;;
+	sp)	_bt_man_blank; return 0 ;;
+	nf)	_bt_man_flush; _mn_fill=0; return 0 ;;
+	fi)	_mn_fill=1; return 0 ;;
+	B|I|SM|SB)
+		_bt_man_args "$rest"
+		out=
+		for i in "${!_mn_a[@]}"; do
+			_bt_man_esc "${_mn_a[i]}"
+			out=${out:+$out }$_bt_str
+		done
+		_bt_man_emit "$out"
+		return 0 ;;
+	BI|IB|BR|RB|IR|RI)
+		_bt_man_args "$rest"
+		out=
+		for i in "${!_mn_a[@]}"; do
+			_bt_man_esc "${_mn_a[i]}"
+			out=$out$_bt_str
+		done
+		_bt_man_emit "$out"
+		return 0 ;;
+	esac
+	# anything else is one of the many macros a page can do without
+	return 0
+}
+
+# Put $1 where the text is going, as a tag if one was asked for.
+_bt_man_emit() {
+	local w
+	if [ "${_mn_tp:-0}" = 1 ]; then
+		_mn_tp=0
+		_bt_man_flush
+		_bt_man_out "$1"
+		_mn_ind=$(( _mn_base + 4 ))
+		return 0
+	fi
+	if [ "$_mn_fill" = 0 ]; then
+		_bt_man_out "$1"
+		return 0
+	fi
+	for w in $1; do
+		_bt_man_word "$w"
+	done
+	_mn_blank=0
+	return 0
+}
+
+# Read the page $1 into _mn_lines, undoing gzip if that is what it is.
+_bt_man_read() {
+	local f=$1 fd line
+	_mn_lines=()
+	case $f in
+	*.gz)	local _bt_str=
+		_bt_gunzip "$f" || return 1
+		while IFS= read -r line; do
+			_mn_lines+=("$line")
+		done <<< "$_bt_str"
+		return 0 ;;
+	esac
+	{ exec {fd}<"$f"; } 2>/dev/null || return 1
+	line=
+	while IFS= read -r line <&"$fd"; do
+		_mn_lines+=("$line")
+		line=
+	done
+	[ -n "$line" ] && _mn_lines+=("$line")
+	exec {fd}<&-
+	return 0
+}
+
+# Where the pages are.
+_bt_man_path() {
+	local p
+	if [ -n "${MANPATH-}" ]; then
+		_mn_path=$MANPATH
+		return 0
+	fi
+	_mn_path=
+	for p in /usr/local/share/man /usr/local/man /usr/share/man /usr/man; do
+		[ -d "$p" ] && _mn_path=${_mn_path:+$_mn_path:}$p
+	done
+	return 0
+}
+
+# Find the page for $1, its name into _mn_found.
+_bt_man_find() {
+	local name=$1 dir sec f old
+	_mn_found=
+	old=$IFS
+	IFS=:
+	set -- $_mn_path
+	IFS=$old
+	for dir in "$@"; do
+		for sec in 1 n l 8 3 2 5 4 9 6 7; do
+			for f in "$dir/man$sec/$name.$sec"*; do
+				[ -f "$f" ] || continue
+				_mn_found=$f
+				return 0
+			done
+		done
+	done
+	return 1
+}
+
+man () {
+	local LC_ALL=C
+	local arg opt keyword=0 name status=0 dir sec f line summary hit old
+	local _mn_path= _mn_found= _mn_title= _mn_sect= _mn_extra=
+	local _mn_ind=0 _mn_base=7 _mn_line= _mn_fill=1 _mn_blank=1 _mn_tp=0
+	local _mn_width=${COLUMNS:-80}
+	local _bt_str= _bt_c=
+	local -a _mn_lines=() _mn_a=()
+
+	[ "$_mn_width" -lt 40 ] && _mn_width=80
+	_mn_width=$(( _mn_width - 1 ))
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				k)	keyword=1 ;;
+				*)	_bt_err "man: illegal option -- $opt"
+					_bt_err "usage: man [-k] name..."
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" = 0 ]; then
+		_bt_err "usage: man [-k] name..."
+		return 1
+	fi
+	_bt_man_path
+
+	if [ "$keyword" = 1 ]; then
+		local -a dirs=() words=("$@")
+		local -A hits=()
+		old=$IFS
+		IFS=:
+		dirs=($_mn_path)
+		IFS=$old
+		for dir in ${dirs[@]+"${dirs[@]}"}; do
+			for sec in 1 2 3 4 5 6 7 8 9 n l; do
+				[ -d "$dir/man$sec" ] || continue
+				for f in "$dir/man$sec"/*; do
+					[ -f "$f" ] || continue
+					_bt_man_summary "$f" || continue
+					for name in "${words[@]}"; do
+						case ${_mn_summary,,} in
+						*"${name,,}"*)
+							printf '%s\n' "$_mn_summary"
+							hits[$name]=1
+							break ;;
+						esac
+					done
+				done
+			done
+		done
+		for name in "${words[@]}"; do
+			if [ -z "${hits[$name]+x}" ]; then
+				_bt_err "man: nothing appropriate for $name"
+				status=1
+			fi
+		done
+		return "$status"
+	fi
+
+	for name in "$@"; do
+		if ! _bt_man_find "$name"; then
+			_bt_err "man: no manual entry for $name"
+			status=1
+			continue
+		fi
+		if ! _bt_man_read "$_mn_found"; then
+			_bt_err "man: cannot read $_mn_found"
+			status=1
+			continue
+		fi
+		_mn_base=7
+		_bt_man_format
+	done
+	return "$status"
+}
+
+# The one line summary of the page $1, into _mn_summary.
+_bt_man_summary() {
+	local f=$1 i n line nm= sum= sect=
+	_bt_man_read "$f" || return 1
+	n=${#_mn_lines[@]}
+	for (( i = 0; i < n; i++ )); do
+		line=${_mn_lines[i]}
+		case $line in
+		'.TH'*)	_bt_man_args "${line#.TH}"
+			nm=${_mn_a[0]-}
+			sect=${_mn_a[1]-} ;;
+		'.SH'*)	case ${line#.SH} in
+			*NAME*|*name*)
+				i=$(( i + 1 ))
+				sum=
+				while [ "$i" -lt "$n" ]; do
+					line=${_mn_lines[i]}
+					case $line in
+					'.SH'*)	break ;;
+					'.\"'*|'')	i=$(( i + 1 )); continue ;;
+					'.'*)	line=${line#.[A-Za-z][A-Za-z]}
+						line=${line#.[A-Za-z]} ;;
+					esac
+					_bt_man_esc "$line"
+					sum=${sum:+$sum }$_bt_str
+					i=$(( i + 1 ))
+				done
+				break ;;
+			esac ;;
+		esac
+	done
+	[ -z "$sum" ] && return 1
+	sum=${sum#"${sum%%[![:space:]]*}"}
+	_mn_summary="$nm($sect) - ${sum#*- }"
+	return 0
+}

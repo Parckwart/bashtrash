@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-82 of the 160 utilities in POSIX.1-2017, as of now.
+83 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -94,6 +94,7 @@ Run the test suite with:
 | `logname` | `logname` |
 | `m4` | `m4 [-s] [-D name[=value]]... [-U name]... [file...]` |
 | `make` | `make [-eiknpqrSst] [-f makefile]... [macro=value]... [target_name...]` |
+| `man` | `man [-k] name...` |
 | `nl` | `nl [-p] [-b type] [-d delim] [-f type] [-h type] [-i incr] [-l num] [-n format] [-s sep] [-v start] [-w width] [file]` |
 | `nm` | `nm [-APv] [-efox] [-g\|-u] [-t format] file...` |
 | `nohup` | `nohup utility [argument...]` |
@@ -233,6 +234,18 @@ declaration. Braces inside strings and comments are counted by nobody, and
 the tag `main` is written out as `M` and the file's name, as the standard
 asks.
 
+**`man` had to learn to read gzip**, since that is how every page on a
+modern system is kept. Deflate is a stream of blocks, each either stored or
+coded with a Huffman code, and each symbol either a byte or a length and a
+distance saying to copy what came before. The codes are canonical, so a
+symbol can be read a bit at a time without building a table: count how many
+codes there are of each length, and at each length ask whether the code read
+so far falls in that range. Every manual page on this machine comes back
+byte for byte the same as `zcat` gives, and a page of ordinary size takes
+about half a second. Then the roff macros are read and the text filled and
+indented under its headings, which is what a manual page has always looked
+like.
+
 **`yacc` works out the lookaheads the hard way.** The LR(0) machine of item
 sets comes first; what makes it LALR(1) is knowing which token can follow each
 item, and that is settled in the two steps the textbooks give: a closure with
@@ -362,19 +375,19 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 82 |
+| implemented here | 83 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **52** |
-| reachable, not yet written | 4 |
+| reachable, not yet written | 3 |
 
 **The ceiling is 86 of 160**, or about 54% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 4 that remain are `localedef`, which compiles locales into a binary
+The 3 that remain are `localedef`, which compiles locales into a binary
 nobody has written down, `mailx`, which has to hand a message to a mailer,
-`man`, which has to find and set pages nobody here has, and `sh`, which would
-be a shell written in a shell.
+and `sh`, which would be a shell written in a shell -- and whose whole
+purpose, running a program, is the one thing this library will not do.
 
 ### Smaller deviations, all deliberate
 
@@ -422,6 +435,13 @@ be a shell written in a shell.
   does and not what mawk does; a `printf` given fewer arguments than
   conversions treats the missing ones as empty, as the standard says, rather
   than stopping.
+* `man` reads the roff macros a manual page is written with -- headings,
+  paragraphs, tagged lists, indents, fonts and the escapes -- and fills the
+  text under them; it is not a roff, and a page that leans on the rest of
+  roff's language will come out plainer than it was meant to. `-k` has no
+  index to consult, so it reads every page it can find, which is slow but
+  right. The gzip reader behind it holds the page in a shell variable, so a
+  file with a NUL byte in it is beyond it -- which no manual page is.
 * `yacc` writes the tables out in full -- a row for every state and a column
   for every token -- where the real yacc packs them into overlapping arrays.
   The parser it writes is the same parser; the file is just bigger. There is

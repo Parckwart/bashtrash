@@ -28,7 +28,7 @@ for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          nohup pr dd sed who logname diff cal fuser ipcs patch tput \
          what uuencode uudecode write ps ed m4 iconv ar locale nm \
          admin delta get prs rmdel sact sccs unget val \
-         compress uncompress zcat bc make awk gencat ctags cflow cxref file lex yacc; do
+         compress uncompress zcat bc make awk gencat ctags cflow cxref file lex yacc man; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -3806,6 +3806,139 @@ GEOF
 
 	cd .. || exit 1
 fi
+
+# --- man --------------------------------------------------------------------
+# The pages are roff with the man macros in them and are usually kept gzipped,
+# so this exercises the gzip reader as well: the same page, plain and packed,
+# has to come out the same.  What a formatted page looks like is not something
+# the standard says anything about, so what is checked is that everything in
+# the page reaches the output in the right shape.
+echo "### man"
+mkdir -p mnt/man1 mnt/man8
+cd mnt || exit 1
+
+cat > man1/frobnicate.1 <<'MEOF'
+.TH FROBNICATE 1 "2026-08-25" "bashtrash" "User Commands"
+.SH NAME
+frobnicate \- twist a widget until it clicks
+.SH SYNOPSIS
+.B frobnicate
+[\fB\-v\fR] \fIwidget\fR...
+.SH DESCRIPTION
+The
+.B frobnicate
+utility twists each
+.I widget
+until it clicks. If a widget will not click, it is left alone.
+.TP
+.B \-v
+Say what is being twisted.
+.SH EXIT STATUS
+.TP
+0
+All widgets clicked.
+.TP
+>0
+An error occurred.
+.SH SEE ALSO
+.BR widget (1)
+MEOF
+cat > man8/widget.8 <<'MEOF'
+.TH WIDGET 8 "2026-08-25" "bashtrash" "System Manager's Manual"
+.SH NAME
+widget \- make a widget out of nothing
+.SH DESCRIPTION
+Makes a widget.
+MEOF
+
+got=$( MANPATH=$PWD; export MANPATH; . "$BT"; man frobnicate 2>&1 )
+ok=1
+case $got in
+"FROBNICATE(1)"*)	;;
+*)	ok=0 ;;
+esac
+for want in 'frobnicate - twist a widget until it clicks' \
+            'frobnicate [-v] widget...' \
+            'utility twists each widget until it clicks' \
+            'All widgets clicked.' \
+            'widget(1)'; do
+	case $got in
+	*"$want"*)	;;
+	*)		ok=0; note_fail "man: [$want] missing from the page" ;;
+	esac
+done
+for want in NAME SYNOPSIS DESCRIPTION 'EXIT STATUS' 'SEE ALSO'; do
+	case $got in
+	*$'\n'"$want"$'\n'*)	;;
+	*)			ok=0; note_fail "man: the heading $want is not at the margin" ;;
+	esac
+done
+[ "$ok" = 1 ] && pass=$((pass + 1))
+
+# the tag of a .TP stands on its own line, and what follows is indented
+case $got in
+*$'\n       -v\n           Say what is being twisted.'*)	pass=$((pass + 1)) ;;
+*)	note_fail "man: .TP did not lay out its tag" ;;
+esac
+
+# nothing runs past the width
+if [ "$( printf '%s\n' "$got" | "$(real_of awk)" '{ if (length($0) > n) n = length($0) } END { print n }' )" -le 80 ]; then
+	pass=$((pass + 1))
+else note_fail "man wrote a line wider than the terminal"; fi
+
+# the same page gzipped has to come out the same
+"$(real_of gzip)" -kf man1/frobnicate.1
+rm -f man1/frobnicate.1
+got2=$( MANPATH=$PWD; export MANPATH; . "$BT"; man frobnicate 2>&1 )
+if [ "$got2" = "$got" ]; then pass=$((pass + 1))
+else note_fail "man on a gzipped page: [$got2]"; fi
+"$(real_of gunzip)" -f man1/frobnicate.1.gz
+
+# the gzip reader against the real thing, on files of several sorts
+gzchk() {	# gzchk file
+	local f=$1 a b
+	"$(real_of gzip)" -kf "$f"
+	a=$( . "$BT"; _bt_str=; _bt_gunzip "$f.gz" && printf '%s' "$_bt_str" | "$(real_of md5sum)" )
+	b=$( "$(real_of zcat)" "$f.gz" | "$(real_of md5sum)" )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1))
+	else note_fail "gunzip $f"; fi
+	rm -f "$f.gz"
+}
+printf 'hello hello hello world\n' > gz1
+"$(real_of seq)" 1 2000 > gz2
+"$(real_of head)" -c 4000 /dev/urandom | "$(real_of tr)" -d '\000' > gz3
+"$(real_of head)" -c 3000 /dev/urandom | "$(real_of base64)" > gz4
+printf '' > gz5
+gzchk gz1
+gzchk gz2
+gzchk gz3
+gzchk gz4
+gzchk gz5
+
+# a page in another section, and one that is not there at all
+got=$( MANPATH=$PWD; export MANPATH; . "$BT"; man widget 2>&1 )
+case $got in
+"WIDGET(8)"*)	pass=$((pass + 1)) ;;
+*)		note_fail "man on a page in section 8: [$got]" ;;
+esac
+a=$( MANPATH=$PWD; export MANPATH; . "$BT"; man nosuchpage 2>/dev/null; echo "rc=$?" )
+if [ "$a" = "rc=1" ]; then pass=$((pass + 1))
+else note_fail "man on a page that is not there: [$a]"; fi
+
+# -k looks through the summaries
+got=$( MANPATH=$PWD; export MANPATH; . "$BT"; man -k twist 2>&1 )
+case $got in
+*'FROBNICATE(1) - twist a widget until it clicks'*)	pass=$((pass + 1)) ;;
+*)	note_fail "man -k: [$got]" ;;
+esac
+got=$( MANPATH=$PWD; export MANPATH; . "$BT"; man -k widget 2>&1 | "$(real_of wc)" -l )
+if [ "$got" = 2 ]; then pass=$((pass + 1))
+else note_fail "man -k widget found $got pages, not 2"; fi
+a=$( MANPATH=$PWD; export MANPATH; . "$BT"; man -k nothinglikethis 2>/dev/null; echo "rc=$?" )
+if [ "$a" = "rc=1" ]; then pass=$((pass + 1))
+else note_fail "man -k with nothing to find: [$a]"; fi
+
+cd .. || exit 1
 
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"
