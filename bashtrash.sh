@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# bashtrash -- POSIX cat(1), tail(1) and whoami(1) written entirely in bash.
+# bashtrash -- POSIX cat(1), tail(1) and id(1) written entirely in bash.
 #
 # Nothing in here forks or execs an external program: every operation is a
 # shell builtin, so these keep working in a shell with an empty $PATH.
@@ -8,9 +8,10 @@
 #
 #	. bashtrash.sh
 #
-# Conformance target: POSIX.1-2017 (IEEE Std 1003.1-2017) for cat and tail.
-# whoami is not a POSIX utility -- the standard spells it "id -un" -- so it
-# follows historical BSD/GNU behaviour instead.
+# Conformance target: POSIX.1-2017 (IEEE Std 1003.1-2017).  Identifiers
+# that bash does not expose (the effective group, the supplementary list)
+# come from /proc/self/status, and names from /etc/passwd and /etc/group,
+# all of them read with the read builtin.
 #
 # A bash variable cannot hold a NUL byte, so input is read as NUL delimited
 # blocks: every block is NUL free and therefore storable, and the NULs that
@@ -494,38 +495,276 @@ tail () {
 	return 0
 }
 
-# ---------------------------------------------------------------------------
-# whoami -- print the name of the effective user.  Not a POSIX utility; the
-# standard equivalent is "id -un".
-# ---------------------------------------------------------------------------
-whoami () {
-	local name pw uid rest fd found=0
 
-	if [ "$#" -gt 0 ]; then
-		_bt_err "whoami: extra operand: $1"
-		_bt_err "usage: whoami"
-		return 1
-	fi
+# ---------------------------------------------------------------------------
+# id -- POSIX.1-2017:
+#	id [user]
+#	id -G [-n] [user]
+#	id -g [-nr] [user]
+#	id -u [-nr] [user]
+# ---------------------------------------------------------------------------
 
-	# $EUID, not $USER: $USER is inherited and writable, and says nothing
-	# about who the process is actually running as.
-	if { exec {fd}</etc/passwd; } 2>/dev/null; then
-		# The trailing test catches a final entry with no newline.
-		while IFS=: read -r name pw uid rest <&"$fd" || [ -n "$name" ]; do
-			if [ "$uid" = "$EUID" ]; then
-				found=1
-				break
-			fi
+# Overridable so the tests can point the lookups at fixture files.
+_BT_PASSWD=/etc/passwd
+_BT_GROUP=/etc/group
+
+_bt_usage_id() {
+	_bt_err "usage: id [user]"
+	_bt_err "       id -G [-n] [user]"
+	_bt_err "       id -g [-nr] [user]"
+	_bt_err "       id -u [-nr] [user]"
+}
+
+# Look up a passwd entry: $1 is the value to match, $2 is "name" to match it
+# against the login name or "uid" against the user ID.  Sets _bt_name,
+# _bt_uid and _bt_gid; returns non-zero when there is no such entry.
+_bt_passwd() {
+	local want=$1 key=$2 name pw uid gid rest fd
+	_bt_name= _bt_uid= _bt_gid=
+	{ exec {fd}<"$_BT_PASSWD"; } 2>/dev/null || return 1
+	# The trailing test catches a final entry with no newline.
+	while IFS=: read -r name pw uid gid rest <&"$fd" || [ -n "$name" ]; do
+		case $key in
+		name)	[ "$name" = "$want" ] || continue ;;
+		*)	[ "$uid" = "$want" ] || continue ;;
+		esac
+		_bt_name=$name _bt_uid=$uid _bt_gid=$gid
+		exec {fd}<&-
+		return 0
+	done
+	exec {fd}<&-
+	return 1
+}
+
+# Group name for group ID $1.  Sets _bt_grname, left empty when the ID maps
+# to no group.
+_bt_group_name() {
+	local name pw gid rest fd
+	_bt_grname=
+	{ exec {fd}<"$_BT_GROUP"; } 2>/dev/null || return 1
+	while IFS=: read -r name pw gid rest <&"$fd" || [ -n "$name" ]; do
+		[ "$gid" = "$1" ] || continue
+		_bt_grname=$name
+		exec {fd}<&-
+		return 0
+	done
+	exec {fd}<&-
+	return 1
+}
+
+# Every group user $1 belongs to: the primary group $2 first, then each group
+# whose member list names the user.  Sets the _bt_gids array.
+_bt_user_groups() {
+	local user=$1 primary=$2 name pw gid members fd
+	_bt_gids=("$primary")
+	{ exec {fd}<"$_BT_GROUP"; } 2>/dev/null || return 0
+	while IFS=: read -r name pw gid members <&"$fd" || [ -n "$name" ]; do
+		[ "$gid" = "$primary" ] && continue
+		case ,$members, in
+		*,"$user",*)	_bt_gids+=("$gid") ;;
+		esac
+	done
+	exec {fd}<&-
+	return 0
+}
+
+# Real and effective IDs of this process, plus its supplementary groups.
+# Linux publishes all of them in /proc/self/status; bash on its own exposes
+# only $UID, $EUID and $GROUPS, which is the fallback.
+_bt_self_ids() {
+	local IFS=$' \t\n' key rest fd
+	_bt_ruid=$UID _bt_euid=$EUID _bt_rgid= _bt_egid=
+	_bt_supp=()
+	if { exec {fd}</proc/self/status; } 2>/dev/null; then
+		while read -r key rest <&"$fd" || [ -n "$key" ]; do
+			case $key in
+			Uid:)		set -- $rest; _bt_ruid=$1 _bt_euid=$2 ;;
+			Gid:)		set -- $rest; _bt_rgid=$1 _bt_egid=$2 ;;
+			Groups:)	set -- $rest; _bt_supp=("$@") ;;
+			esac
 		done
 		exec {fd}<&-
 	fi
+	[ -n "$_bt_rgid" ] || _bt_rgid=${GROUPS[0]-}
+	[ -n "$_bt_egid" ] || _bt_egid=${GROUPS[0]-}
+	return 0
+}
 
-	if [ "$found" = 1 ]; then
-		printf '%s\n' "$name"
-		return 0
+# Append $1 to the _bt_gids array unless it is already there.
+_bt_add_gid() {
+	[ -n "$1" ] || return 0
+	case " ${_bt_gids[*]-} " in
+	*" $1 "*)	return 0 ;;
+	esac
+	_bt_gids+=("$1")
+	return 0
+}
+
+id () {
+	local opt arg want= names=0 real=0 user= have_user=0
+	local wid g i sep rc
+	local _bt_name _bt_uid _bt_gid _bt_grname
+	local _bt_ruid _bt_euid _bt_rgid _bt_egid
+	local -a _bt_gids=() _bt_ggids=() _bt_supp=()
+	local IFS=$' \t\n'
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				G|g|u)	if [ -n "$want" ] && [ "$want" != "$opt" ]; then
+						_bt_err 'id: cannot print "only" of more than one choice'
+						_bt_usage_id
+						return 1
+					fi
+					want=$opt ;;
+				n)	names=1 ;;
+				r)	real=1 ;;
+				a)	;;	# historical no-op, ignored as elsewhere
+				*)	_bt_err "id: illegal option -- $opt"
+					_bt_usage_id
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	# POSIX gives id a single optional operand.
+	if [ "$#" -gt 1 ]; then
+		_bt_err "id: extra operand: $2"
+		_bt_usage_id
+		return 1
 	fi
-	# Users served only by NSS (LDAP, SSSD) are out of reach without
-	# calling getent, which would mean an external program.
-	_bt_err "whoami: cannot find name for user ID $EUID"
-	return 1
+	if [ "$#" -eq 1 ]; then
+		user=$1
+		have_user=1
+	fi
+
+	# "-n ... shall be used only with -G, -g or -u", and likewise -r.
+	if [ -z "$want" ] && { [ "$names" = 1 ] || [ "$real" = 1 ]; }; then
+		_bt_err "id: cannot print only names or real IDs in default format"
+		_bt_usage_id
+		return 1
+	fi
+
+	if [ "$have_user" = 1 ]; then
+		# A login name, or failing that a user ID, as history requires.
+		if ! _bt_passwd "$user" name; then
+			case $user in
+			''|*[!0-9]*)	;;
+			*)		_bt_passwd "$user" uid ;;
+			esac
+		fi
+		if [ -z "$_bt_uid" ]; then
+			_bt_err "id: '$user': no such user"
+			return 1
+		fi
+		# Named users have no real/effective distinction to report.
+		_bt_ruid=$_bt_uid _bt_euid=$_bt_uid
+		_bt_rgid=$_bt_gid _bt_egid=$_bt_gid
+		_bt_user_groups "$_bt_name" "$_bt_gid"
+		_bt_ggids=(${_bt_gids[@]+"${_bt_gids[@]}"})
+	else
+		_bt_self_ids
+		# The two lists genuinely differ.  -G asks for the
+		# effective, real and supplementary IDs alike...
+		_bt_gids=()
+		_bt_add_gid "$_bt_rgid"
+		_bt_add_gid "$_bt_egid"
+		for g in ${_bt_supp[@]+"${_bt_supp[@]}"}; do
+			_bt_add_gid "$g"
+		done
+		_bt_ggids=(${_bt_gids[@]+"${_bt_gids[@]}"})
+		# ...while the default format reports the supplementary
+		# affiliations, with the effective group prepended when
+		# it is not already among them.  The real group is not
+		# part of that list.
+		_bt_gids=()
+		for g in ${_bt_supp[@]+"${_bt_supp[@]}"}; do
+			_bt_add_gid "$g"
+		done
+		case " ${_bt_gids[*]-} " in
+		*" $_bt_egid "*)	;;
+		*)	_bt_gids=("$_bt_egid" ${_bt_gids[@]+"${_bt_gids[@]}"}) ;;
+		esac
+	fi
+
+	case $want in
+	u)	if [ "$real" = 1 ]; then wid=$_bt_ruid; else wid=$_bt_euid; fi
+		if [ "$names" = 1 ] && ! _bt_passwd "$wid" uid; then
+			# No name for the ID: report the number instead, and
+			# still exit non-zero, as every other id does.
+			_bt_err "id: cannot find name for user ID $wid"
+			printf '%u\n' "$wid"
+			return 1
+		fi
+		if [ "$names" = 1 ]; then
+			printf '%s\n' "$_bt_name"
+		else
+			printf '%u\n' "$wid"
+		fi
+		return 0 ;;
+	g)	if [ "$real" = 1 ]; then wid=$_bt_rgid; else wid=$_bt_egid; fi
+		if [ "$names" = 1 ] && ! _bt_group_name "$wid"; then
+			_bt_err "id: cannot find name for group ID $wid"
+			printf '%u\n' "$wid"
+			return 1
+		fi
+		if [ "$names" = 1 ]; then
+			printf '%s\n' "$_bt_grname"
+		else
+			printf '%u\n' "$wid"
+		fi
+		return 0 ;;
+	G)	# "%u", then " %u" for each further affiliation.
+		sep=
+		rc=0
+		for g in ${_bt_ggids[@]+"${_bt_ggids[@]}"}; do
+			if [ "$names" != 1 ]; then
+				printf '%s%u' "$sep" "$g"
+			elif _bt_group_name "$g"; then
+				printf '%s%s' "$sep" "$_bt_grname"
+			else
+				_bt_err "id: cannot find name for group ID $g"
+				printf '%s%u' "$sep" "$g"
+				rc=1
+			fi
+			sep=' '
+		done
+		printf '\n'
+		return "$rc" ;;
+	esac
+
+	# Default format: uid, gid, then euid and egid only when they differ
+	# from the real ones, then the group affiliations.
+	printf 'uid=%u' "$_bt_ruid"
+	_bt_passwd "$_bt_ruid" uid && printf '(%s)' "$_bt_name"
+	printf ' gid=%u' "$_bt_rgid"
+	_bt_group_name "$_bt_rgid" && printf '(%s)' "$_bt_grname"
+	if [ "$_bt_euid" != "$_bt_ruid" ]; then
+		printf ' euid=%u' "$_bt_euid"
+		_bt_passwd "$_bt_euid" uid && printf '(%s)' "$_bt_name"
+	fi
+	if [ "$_bt_egid" != "$_bt_rgid" ]; then
+		printf ' egid=%u' "$_bt_egid"
+		_bt_group_name "$_bt_egid" && printf '(%s)' "$_bt_grname"
+	fi
+	if [ "${#_bt_gids[@]}" -gt 0 ]; then
+		printf ' groups='
+		sep=
+		for g in "${_bt_gids[@]}"; do
+			printf '%s%u' "$sep" "$g"
+			_bt_group_name "$g" && printf '(%s)' "$_bt_grname"
+			sep=,
+		done
+	fi
+	printf '\n'
+	return 0
 }

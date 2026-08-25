@@ -23,9 +23,12 @@ pass=0 fail=0 failed=()
 
 real_of() { case $1 in cat) printf '%s' "$R_CAT" ;; tail) printf '%s' "$R_TAIL" ;; esac; }
 
+note_fail() { # MESSAGE
+	fail=$((fail + 1)); failed+=("$1"); echo "FAIL: $1"
+}
+
 report() { # NAME
-	fail=$((fail + 1)); failed+=("$1")
-	echo "FAIL: $1"
+	note_fail "$1"
 	echo "   bashtrash: $(od -An -c bt.out | head -2 | tr -s ' ')"
 	echo "   coreutils: $(od -An -c re.out | head -2 | tr -s ' ')"
 }
@@ -144,6 +147,62 @@ for f in fz/*; do
 	done
 done
 
+# --- id -------------------------------------------------------------------
+echo "### id"
+R_ID=$(command -v id) || exit 1
+
+chkid() { # ARGS...
+	( . "$BT"; id "$@" ) >bt.out 2>bt.err </dev/null; local a=$?
+	"$R_ID" "$@" >re.out 2>re.err </dev/null; local b=$?
+	if cmp -s bt.out re.out && [ "$a" = "$b" ]; then pass=$((pass + 1))
+	else report "id $* (exit $a vs $b)"; fi
+}
+
+# Every option form, against the calling process.
+for o in "" -u -g -G -un -gn -Gn -ur -gr -Gr -unr -gnr -nu -a; do
+	if [ -z "$o" ]; then chkid; else chkid $o; fi
+done
+
+# Every user this machine knows, so whatever mix of primary, supplementary
+# and unmapped groups it happens to have all gets covered.
+users=$(while IFS=: read -r n _ || [ -n "$n" ]; do printf '%s\n' "$n"; done < /etc/passwd)
+for u in $users; do
+	for o in "" -u -g -G -un -gn -Gn -ur -gr; do
+		if [ -z "$o" ]; then chkid "$u"; else chkid $o "$u"; fi
+	done
+done
+chkid 0				# numeric operand, taken as a user ID
+chkid nosuchuser
+chkid -- root
+for bad in -n -r -nr -x; do chkid $bad; done
+chkid -u -g
+chkid -G -u
+
+# Real and effective IDs that differ cannot be reached any other way.
+if [ "$("$R_ID" -u)" = 0 ] && command -v setpriv > /dev/null 2>&1; then
+	n=0
+	for spec in "--ruid 60001 --euid 60002 --rgid 60003 --egid 60004 --groups 60004,60005" \
+	            "--ruid 60001 --euid 60001 --rgid 60003 --egid 60003 --groups 60004,60005" \
+	            "--ruid 60001 --euid 60001 --rgid 60003 --egid 60003 --clear-groups"; do
+		n=$((n + 1))
+		# shellcheck disable=SC2086
+		out=$(setpriv $spec "$BASH" --noprofile --norc -p -c '
+			cd / || exit 1
+			bt=$1 real=$2 bad=0
+			for o in "" -u -g -G -un -gn -Gn -ur -gr -Gr -unr -gnr; do
+				a=$( . "$bt"; id $o 2>/dev/null ); ra=$?
+				b=$( "$real" $o 2>/dev/null ); rb=$?
+				if [ "$a" != "$b" ] || [ "$ra" != "$rb" ]; then
+					bad=1
+					echo "id $o: [$a]($ra) vs [$b]($rb)"
+				fi
+			done
+			[ "$bad" = 0 ] && echo ok' _ "$BT" "$R_ID" 2>&1)
+		if [ "$out" = ok ]; then pass=$((pass + 1))
+		else note_fail "setpriv context $n: $out"; fi
+	done
+fi
+
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"
 out=$(env -i PATH= "$BASH" --noprofile --norc -c '
@@ -153,12 +212,12 @@ out=$(env -i PATH= "$BASH" --noprofile --norc -c '
 	cat -u binary > /dev/null  || exit 1
 	tail -n 3 lines12 > /dev/null || exit 1
 	tail -c 5 lines12 > /dev/null || exit 1
-	whoami > /dev/null         || exit 1
+	id > /dev/null             || exit 1
 	echo ok' _ "$BT" "$work" 2>&1)
 if [ "$out" = ok ]; then
 	pass=$((pass + 1)); echo "all three run with an empty PATH"
 else
-	report "empty PATH: $out"
+	note_fail "empty PATH: $out"
 fi
 
 echo
