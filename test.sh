@@ -24,7 +24,7 @@ if ! ( . "$BT" ) 2>/dev/null; then
 fi
 for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          fold head id nl od paste pathchk sleep sort split strings tabs \
-         tail tee tr tsort tty uname unexpand uniq wc; do
+         tail tee tr tsort tty uname unexpand uniq wc join csplit; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -702,6 +702,73 @@ if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "sort -c on sorted i
 ( . "$BT"; sort -o m.out so1 ) 2>/dev/null
 "$(real_of sort)" -o g.out so1
 if cmp -s m.out g.out; then pass=$((pass + 1)); else note_fail "sort -o"; fi
+
+# --- join, csplit ---------------------------------------------------------
+echo "### join csplit"
+printf 'a 1\nb 2\nc 3\ne 5\n' > j1
+printf 'a x\nb y\nd w\ne z\n' > j2
+printf 'a:1\nb:2\n' > j3
+printf 'a:x\nb:y\n' > j4
+printf '1 a\n2 b\n' > j5
+printf 'x a\ny b\n' > j6
+printf 'a 1\na 2\nb 3\n' > jd1
+printf 'a x\na y\nb z\n' > jd2
+chk "join"            join j1 j2
+chk "join -a1"        join -a1 j1 j2
+chk "join -a2"        join -a2 j1 j2
+chk "join -a1 -a2"    join -a1 -a2 j1 j2
+chk "join -v1"        join -v1 j1 j2
+chk "join -v2"        join -v2 j1 j2
+chk "join -e -o"      join -e X -a1 -o 0,1.2,2.2 j1 j2
+chk "join -o 0,1.2"   join -o 0,1.2 j1 j2
+chk "join -o rev"     join -o 2.2,1.2,0 j1 j2
+chk "join -t:"        join -t: j3 j4
+chk "join -1 -2"      join -1 2 -2 2 j5 j6
+chk "join dups"       join jd1 jd2
+chk "join dups -a1"   join -a1 jd1 jd2
+chk "join empty l"    join empty j2
+chk "join empty r"    join j1 empty
+chk "join both empty" join empty empty
+chk "join missing"    join j1 no-such-file
+
+seq 1 20 > csin
+# csplit writes files, so each run gets its own directory.  On an error the
+# real csplit removes what it made and this one cannot, so the tree is only
+# compared when both runs succeeded.
+csplitchk() {
+	rm -rf cs1 cs2
+	mkdir -p cs1 cs2
+	( cd cs1 && . "$BT" && csplit "$@" ) > cs1/out 2> /dev/null; local a=$?
+	( cd cs2 && "$(real_of csplit)" "$@" ) > cs2/out 2> /dev/null; local b=$?
+	if ! cmp -s cs1/out cs2/out || [ "$a" != "$b" ]; then
+		note_fail "csplit $* ($a vs $b)"
+		return
+	fi
+	if [ "$a" = 0 ] && ! diff -r -x out cs1 cs2 > /dev/null 2>&1; then
+		note_fail "csplit $* (files differ)"
+		return
+	fi
+	pass=$((pass + 1))
+}
+csplitchk ../csin 5 10
+csplitchk ../csin 5
+csplitchk -s ../csin 5
+csplitchk -f part ../csin 5
+csplitchk -n 3 ../csin 5
+csplitchk -f p -n 4 ../csin 3 7
+csplitchk ../csin '/1[0-9]/'
+csplitchk -s ../csin '/15/'
+csplitchk ../csin '/5/' '/15/'
+csplitchk ../csin 3 '{2}'
+csplitchk ../csin 2 '{3}'
+csplitchk ../csin '/2/' '{3}'
+csplitchk ../csin '/2/' '{1}'
+csplitchk ../csin '%5%' '/10/'
+csplitchk ../csin '/5/+2'
+csplitchk ../csin '/5/-1'
+csplitchk ../csin 100
+csplitchk ../csin '/nomatch/'
+csplitchk ../csin 5 100
 
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"

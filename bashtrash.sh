@@ -4481,3 +4481,404 @@ _bt_sort_addkey() {
 	_bt_kmod+=("$mods")
 	return 0
 }
+
+# ---------------------------------------------------------------------------
+# join -- POSIX.1-2017:
+#	join [-a file_number] [-e string] [-o list] [-t char] [-v file_number]
+#	     [-1 field] [-2 field] file1 file2
+# ---------------------------------------------------------------------------
+
+# Split $1 into _bt_jf.  Without -t a field is a run of non-blanks and the
+# leading blanks are dropped; with -t every separator starts a new field.
+_bt_join_split() {
+	local s=$1 hadf=0
+	if [ -n "$_bt_jsep" ]; then
+		_bt_fld=()
+		_bt_split "$s" "$_bt_jsep"
+		_bt_jf=(${_bt_fld[@]+"${_bt_fld[@]}"})
+		return 0
+	fi
+	case $- in *f*) hadf=1 ;; esac
+	set -f
+	local IFS=$' \t'
+	set -- $s
+	_bt_jf=("$@")
+	[ "$hadf" = 1 ] || set +f
+	return 0
+}
+
+# Build one output line for the pair currently in _bt_a1/_bt_a2 (either may
+# be empty for an unpaired line) into _bt_out.
+_bt_join_line() {
+	local which=$1 spec f n i first=1 v
+	_bt_out=
+	if [ -n "$_bt_olist" ]; then
+		for spec in $_bt_olist; do
+			case $spec in
+			0)	v=$_bt_key ;;
+			1.*)	n=${spec#1.}
+				if [ "$which" = 2 ]; then v=$_bt_efill
+				else
+					v=${_bt_f1[n-1]-}
+					[ -n "$v" ] || v=$_bt_efill
+				fi ;;
+			2.*)	n=${spec#2.}
+				if [ "$which" = 1 ]; then v=$_bt_efill
+				else
+					v=${_bt_f2[n-1]-}
+					[ -n "$v" ] || v=$_bt_efill
+				fi ;;
+			*)	v= ;;
+			esac
+			if [ "$first" = 1 ]; then _bt_out=$v; first=0
+			else _bt_out=$_bt_out$_bt_osep$v; fi
+		done
+		return 0
+	fi
+	_bt_out=$_bt_key
+	if [ "$which" != 2 ]; then
+		for (( i = 0; i < ${#_bt_f1[@]}; i++ )); do
+			[ $(( i + 1 )) -eq "$_bt_j1" ] && continue
+			_bt_out=$_bt_out$_bt_osep${_bt_f1[i]}
+		done
+	fi
+	if [ "$which" != 1 ]; then
+		for (( i = 0; i < ${#_bt_f2[@]}; i++ )); do
+			[ $(( i + 1 )) -eq "$_bt_j2" ] && continue
+			_bt_out=$_bt_out$_bt_osep${_bt_f2[i]}
+		done
+	fi
+	return 0
+}
+
+join () {
+	local LC_ALL=C
+	local arg opt val fd1 fd2 status=0 _bt_reason
+	local a1=0 a2=0 v1=0 v2=0
+	local _bt_jsep= _bt_osep=' ' _bt_olist= _bt_efill= _bt_j1=1 _bt_j2=1
+	local _bt_key _bt_out
+	local -a _bt_jf=() _bt_fld=() _bt_f1=() _bt_f2=() l1=() l2=() k1=() k2=()
+	local i j n m gi gj ge1 ge2 c line
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				a|e|o|t|v|1|2)
+					if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "join: option requires an argument -- $opt"
+						return 1
+					fi
+					case $opt in
+					a)	case $val in
+						1)	a1=1 ;;
+						2)	a2=1 ;;
+						*)	_bt_err "join: invalid file number: $val"; return 1 ;;
+						esac ;;
+					v)	case $val in
+						1)	v1=1 ;;
+						2)	v2=1 ;;
+						*)	_bt_err "join: invalid file number: $val"; return 1 ;;
+						esac ;;
+					e)	_bt_efill=$val ;;
+					o)	_bt_olist="${_bt_olist} ${val//,/ }" ;;
+					t)	_bt_jsep=${val:0:1}; _bt_osep=$_bt_jsep ;;
+					1)	_bt_isnum "$val" || { _bt_err "join: invalid field number: $val"; return 1; }
+						_bt_j1=$(( 10#$val )) ;;
+					2)	_bt_isnum "$val" || { _bt_err "join: invalid field number: $val"; return 1; }
+						_bt_j2=$(( 10#$val )) ;;
+					esac ;;
+				*)	_bt_err "join: illegal option -- $opt"
+					_bt_err "usage: join [-a n] [-e s] [-o list] [-t c] [-v n] [-1 f] [-2 f] file1 file2"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -ne 2 ]; then
+		_bt_err "usage: join [-a n] [-e s] [-o list] [-t c] [-v n] [-1 f] [-2 f] file1 file2"
+		return 1
+	fi
+
+	if [ "$1" = - ]; then fd1=0
+	elif [ -d "$1" ] || ! { exec {fd1}<"$1"; } 2>/dev/null; then
+		_bt_why "$1"; _bt_err "join: $1: $_bt_reason"; return 1
+	fi
+	line=
+	while IFS= read -r line <&"$fd1" || [ -n "$line" ]; do
+		l1+=("$line")
+		_bt_join_split "$line"
+		k1+=("${_bt_jf[_bt_j1-1]-}")
+		line=
+	done
+	[ "$fd1" = 0 ] || exec {fd1}<&-
+
+	if [ "$2" = - ]; then fd2=0
+	elif [ -d "$2" ] || ! { exec {fd2}<"$2"; } 2>/dev/null; then
+		_bt_why "$2"; _bt_err "join: $2: $_bt_reason"; return 1
+	fi
+	line=
+	while IFS= read -r line <&"$fd2" || [ -n "$line" ]; do
+		l2+=("$line")
+		_bt_join_split "$line"
+		k2+=("${_bt_jf[_bt_j2-1]-}")
+		line=
+	done
+	[ "$fd2" = 0 ] || exec {fd2}<&-
+
+	n=${#l1[@]} m=${#l2[@]}
+	i=0 j=0
+	while [ "$i" -lt "$n" ] || [ "$j" -lt "$m" ]; do
+		if [ "$i" -ge "$n" ]; then c=1
+		elif [ "$j" -ge "$m" ]; then c=-1
+		elif [ "${k1[i]}" = "${k2[j]}" ]; then c=0
+		elif [[ ${k1[i]} < ${k2[j]} ]]; then c=-1
+		else c=1
+		fi
+		if [ "$c" -lt 0 ]; then
+			if [ "$a1" = 1 ] || [ "$v1" = 1 ]; then
+				_bt_key=${k1[i]}
+				_bt_join_split "${l1[i]}"; _bt_f1=(${_bt_jf[@]+"${_bt_jf[@]}"}); _bt_f2=()
+				_bt_join_line 1
+				printf '%s\n' "$_bt_out"
+			fi
+			i=$(( i + 1 ))
+			continue
+		fi
+		if [ "$c" -gt 0 ]; then
+			if [ "$a2" = 1 ] || [ "$v2" = 1 ]; then
+				_bt_key=${k2[j]}
+				_bt_join_split "${l2[j]}"; _bt_f2=(${_bt_jf[@]+"${_bt_jf[@]}"}); _bt_f1=()
+				_bt_join_line 2
+				printf '%s\n' "$_bt_out"
+			fi
+			j=$(( j + 1 ))
+			continue
+		fi
+		# equal keys: every line of one group against every line of the other
+		ge1=$i
+		while [ "$ge1" -lt "$n" ] && [ "${k1[ge1]}" = "${k1[i]}" ]; do ge1=$(( ge1 + 1 )); done
+		ge2=$j
+		while [ "$ge2" -lt "$m" ] && [ "${k2[ge2]}" = "${k2[j]}" ]; do ge2=$(( ge2 + 1 )); done
+		if [ "$v1" = 0 ] && [ "$v2" = 0 ]; then
+			for (( gi = i; gi < ge1; gi++ )); do
+				for (( gj = j; gj < ge2; gj++ )); do
+					_bt_key=${k1[gi]}
+					_bt_join_split "${l1[gi]}"; _bt_f1=(${_bt_jf[@]+"${_bt_jf[@]}"})
+					_bt_join_split "${l2[gj]}"; _bt_f2=(${_bt_jf[@]+"${_bt_jf[@]}"})
+					_bt_join_line 0
+					printf '%s\n' "$_bt_out"
+				done
+			done
+		fi
+		i=$ge1 j=$ge2
+	done
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# csplit -- POSIX.1-2017: csplit [-ks] [-f prefix] [-n number] file arg...
+#
+# On an error csplit is supposed to remove the files it created; unlink() is
+# out of reach, so they are truncated to nothing instead and named on stderr.
+# ---------------------------------------------------------------------------
+csplit () {
+	local LC_ALL=C
+	local arg opt val prefix=xx width=2 keep=0 silent=0 file fd status=0
+	local i n cur=0 idx=0 target off spec rep name bytes line re _bt_re _bt_reason
+	local -a lines=() made=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				k)	keep=1 ;;
+				s)	silent=1 ;;
+				f|n)	if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "csplit: option requires an argument -- $opt"
+						return 1
+					fi
+					if [ "$opt" = f ]; then
+						prefix=$val
+					else
+						_bt_isnum "$val" || { _bt_err "csplit: invalid number: $val"; return 1; }
+						width=$(( 10#$val ))
+					fi ;;
+				*)	_bt_err "csplit: illegal option -- $opt"
+					_bt_err "usage: csplit [-ks] [-f prefix] [-n number] file arg..."
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -lt 2 ]; then
+		_bt_err "usage: csplit [-ks] [-f prefix] [-n number] file arg..."
+		return 1
+	fi
+	file=$1
+	shift
+
+	if [ "$file" = - ]; then
+		fd=0
+	elif [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+		_bt_why "$file"
+		_bt_err "csplit: $file: $_bt_reason"
+		return 1
+	fi
+	line=
+	while IFS= read -r line <&"$fd" || [ -n "$line" ]; do
+		lines+=("$line")
+		line=
+	done
+	[ "$fd" = 0 ] || exec {fd}<&-
+	n=${#lines[@]}
+
+	# Write lines [cur, $1) to the next output file.
+	_bt_csplit_write() {
+		local upto=$1 quiet=$2 j
+		printf -v name "%s%0*d" "$prefix" "$width" "$idx"
+		if ! { exec {fd}>"$name"; } 2>/dev/null; then
+			_bt_err "csplit: cannot create $name"
+			return 1
+		fi
+		made+=("$name")
+		bytes=0
+		for (( j = cur; j < upto; j++ )); do
+			printf '%s\n' "${lines[j]}" >&"$fd"
+			bytes=$(( bytes + ${#lines[j]} + 1 ))
+		done
+		exec {fd}>&-
+		[ "$silent" = 1 ] || [ "$quiet" = 1 ] || printf '%d\n' "$bytes"
+		idx=$(( idx + 1 ))
+		cur=$upto
+		return 0
+	}
+	_bt_csplit_fail() {
+		# The remainder is still written and counted before the error
+		# is reported, which is what csplit does.
+		_bt_csplit_write "$n" 0
+		_bt_err "csplit: '$1': $2"
+		if [ "$keep" = 0 ] && [ "${#made[@]}" -gt 0 ]; then
+			for name in "${made[@]}"; do
+				: > "$name" 2>/dev/null
+			done
+			_bt_err "csplit: could not remove ${made[*]} (no unlink from a builtin); truncated instead"
+		fi
+		unset -f _bt_csplit_write _bt_csplit_fail
+		return 1
+	}
+
+	rep=1
+	for spec in "$@"; do
+		case $spec in
+		'{'*'}')
+			val=${spec#\{}; val=${val%\}}
+			if ! _bt_isnum "$val"; then
+				_bt_csplit_fail "$spec" "invalid repeat count"
+				return 1
+			fi
+			rep=$(( 10#$val ))
+			# repeat the previous operand
+			for (( i = 0; i < rep; i++ )); do
+				# A repeated line number means that many more lines
+				# each time, not the same absolute line again.
+				if ! _bt_csplit_apply "$_bt_last" 1; then
+					return 1
+				fi
+			done
+			rep=1
+			continue ;;
+		esac
+		_bt_last=$spec
+		if ! _bt_csplit_apply "$spec"; then
+			return 1
+		fi
+	done
+
+	_bt_csplit_write "$n" 0
+	unset -f _bt_csplit_write _bt_csplit_fail
+	return "$status"
+}
+
+# Apply one csplit operand.  Relies on the locals of its caller.
+_bt_csplit_apply() {
+	local spec=$1 rel=${2:-0} target off re skipit=0 j
+	case $spec in
+	/*)	re=${spec#/}
+		case $re in
+		*/*)	off=${re##*/}; re=${re%/*} ;;
+		*)	off= ;;
+		esac ;;
+	%*)	skipit=1
+		re=${spec#%}
+		case $re in
+		*%*)	off=${re##*%}; re=${re%\%*} ;;
+		*)	off= ;;
+		esac ;;
+	*)	if ! _bt_isnum "$spec"; then
+			_bt_csplit_fail "$spec" "invalid pattern"
+			return 1
+		fi
+		if [ "$rel" = 1 ]; then
+			target=$(( cur + 10#$spec ))
+		else
+			target=$(( 10#$spec - 1 ))
+		fi
+		if [ "$target" -lt "$cur" ] || [ "$target" -gt "$n" ]; then
+			_bt_csplit_fail "$spec" "line number out of range"
+			return 1
+		fi
+		_bt_csplit_write "$target" 0 || return 1
+		return 0 ;;
+	esac
+
+	_bt_bre2ere "$re"
+	re=$_bt_re
+	target=-1
+	for (( j = cur + 1; j < n; j++ )); do
+		if [[ ${lines[j]} =~ $re ]]; then
+			target=$j
+			break
+		fi
+	done
+	if [ "$target" -lt 0 ]; then
+		_bt_csplit_fail "$spec" "match not found"
+		return 1
+	fi
+	if [ -n "$off" ]; then
+		target=$(( target + off ))
+	fi
+	if [ "$target" -lt "$cur" ] || [ "$target" -gt "$n" ]; then
+		_bt_csplit_fail "$spec" "line number out of range"
+		return 1
+	fi
+	if [ "$skipit" = 1 ]; then
+		# %regexp% moves the position without writing anything
+		cur=$target
+		return 0
+	fi
+	_bt_csplit_write "$target" 0 || return 1
+	return 0
+}
