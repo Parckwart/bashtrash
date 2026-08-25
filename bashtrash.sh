@@ -19459,3 +19459,529 @@ cxref () {
 	fi
 	return "$status"
 }
+
+# ---------------------------------------------------------------------------
+# file -- POSIX.1-2017:
+#	file [-dh] [-M file] [-m file] file...
+#	file -i [-h] file...
+#
+# The order of the tests is the standard's: what sort of file it is, whether
+# it is empty, then the tests that look at particular places in it, then the
+# ones that look at it as a whole, and failing all of those, data.  The magic
+# files -m and -M read are the four column format the standard describes.
+# ---------------------------------------------------------------------------
+
+# The first $2 bytes of the file open on fd $1, into _bt_b.
+_bt_file_head() {
+	local fd=$1 want=$2 i len v rc
+	local _bt_buf _bt_nul
+	_bt_b=()
+	while [ "${#_bt_b[@]}" -lt "$want" ]; do
+		if _bt_read "$fd"; then rc=0; else rc=1; fi
+		len=${#_bt_buf}
+		for (( i = 0; i < len; i++ )); do
+			printf -v v '%d' "'${_bt_buf:i:1}"
+			_bt_b+=("$v")
+			[ "${#_bt_b[@]}" -ge "$want" ] && break
+		done
+		if [ "$rc" = 0 ] && [ "$_bt_nul" = 1 ] &&
+		   [ "${#_bt_b[@]}" -lt "$want" ]; then
+			_bt_b+=(0)
+		fi
+		[ "$rc" = 1 ] && break
+	done
+	return 0
+}
+
+# The bytes from $1 for $2 bytes, as a string, into _bt_str.
+_bt_file_str() {
+	local i out= end=$(( $1 + $2 ))
+	for (( i = $1; i < end; i++ )); do
+		[ "$i" -ge "${#_bt_b[@]}" ] && break
+		_bt_chr "${_bt_b[i]}"
+		out=$out$_bt_c
+	done
+	_bt_str=$out
+	return 0
+}
+
+# The number of $2 bytes at offset $1, smallest byte first, into _bt_int.
+_bt_file_num() {
+	local off=$1 n=$2 i v=0
+	for (( i = n - 1; i >= 0; i-- )); do
+		v=$(( (v << 8) | _bt_b[off + i] ))
+	done
+	_bt_int=$v
+	return 0
+}
+
+# The same, largest byte first.
+_bt_file_bnum() {
+	local off=$1 n=$2 i v=0
+	for (( i = 0; i < n; i++ )); do
+		v=$(( (v << 8) | _bt_b[off + i] ))
+	done
+	_bt_int=$v
+	return 0
+}
+
+# The escapes a magic file's value field may hold, into _bt_str.
+_bt_file_esc() {
+	local s=$1 n=${#1} i=0 out= c d v
+	while [ "$i" -lt "$n" ]; do
+		c=${s:i:1}
+		if [ "$c" != '\' ]; then
+			out=$out$c
+			i=$(( i + 1 ))
+			continue
+		fi
+		i=$(( i + 1 ))
+		d=${s:i:1}
+		case $d in
+		'\')	out=$out'\'; i=$(( i + 1 )) ;;
+		a)	out=$out$'\a'; i=$(( i + 1 )) ;;
+		b)	out=$out$'\b'; i=$(( i + 1 )) ;;
+		f)	out=$out$'\f'; i=$(( i + 1 )) ;;
+		n)	out=$out$'\n'; i=$(( i + 1 )) ;;
+		r)	out=$out$'\r'; i=$(( i + 1 )) ;;
+		t)	out=$out$'\t'; i=$(( i + 1 )) ;;
+		v)	out=$out$'\v'; i=$(( i + 1 )) ;;
+		' ')	out=$out' '; i=$(( i + 1 )) ;;
+		[0-7])	v=0
+			d=0
+			while [ "$d" -lt 3 ]; do
+				case ${s:i:1} in
+				[0-7])	v=$(( v * 8 + ${s:i:1} )); i=$(( i + 1 )); d=$(( d + 1 )) ;;
+				*)	break ;;
+				esac
+			done
+			if [ "$v" != 0 ]; then
+				_bt_chr "$v"
+				out=$out$_bt_c
+			fi ;;
+		'')	out=$out'\' ;;
+		*)	out=$out$d; i=$(( i + 1 )) ;;
+		esac
+	done
+	_bt_str=$out
+	return 0
+}
+
+# A number written the way a magic file writes one, into _bt_int.
+_bt_file_val() {
+	local v=$1 sign=1
+	case $v in
+	-*)	sign=-1; v=${v#-} ;;
+	esac
+	case $v in
+	0[xX]*)	_bt_int=$(( sign * 16#${v#0[xX]} )) ;;
+	0[0-7]*)	_bt_int=$(( sign * 8#${v#0} )) ;;
+	'')	_bt_int=0 ;;
+	*[!0-9]*)	_bt_int=0 ;;
+	*)	_bt_int=$(( sign * 10#$v )) ;;
+	esac
+	return 0
+}
+
+# Read magic file $1 into the arrays that hold the tests.
+_bt_file_magic() {
+	local fd line off type val msg rest
+	if ! { exec {fd}<"$1"; } 2>/dev/null; then
+		_bt_err "file: cannot open magic file $1"
+		return 1
+	fi
+	while IFS= read -r line || [ -n "$line" ]; do
+		case $line in
+		''|'#'*)	line=; continue ;;
+		esac
+		# the fields are separated by white space
+		off=${line%%[	 ]*}
+		rest=${line#"$off"}
+		rest=${rest#"${rest%%[!	 ]*}"}
+		type=${rest%%[	 ]*}
+		rest=${rest#"$type"}
+		rest=${rest#"${rest%%[!	 ]*}"}
+		val=${rest%%[	 ]*}
+		msg=${rest#"$val"}
+		msg=${msg#"${msg%%[!	 ]*}"}
+		_mg_off+=("$off")
+		_mg_type+=("$type")
+		_mg_val+=("$val")
+		_mg_msg+=("$msg")
+		line=
+	done <&"$fd"
+	exec {fd}<&-
+	return 0
+}
+
+# Try test number $1 against the bytes in hand.  The message it would print
+# comes back in _bt_str.
+_bt_file_test() {
+	local i=$1 off=${_mg_off[$1]} type=${_mg_type[$1]} val=${_mg_val[$1]}
+	local msg=${_mg_msg[$1]} mask= size=0 kind cmp= got want rest
+	off=${off#>}
+	_bt_file_val "$off"
+	# the message is a printf format, and the escapes the standard names
+	# are undone first so that a leading \  can put a space in front
+	_bt_file_esc "$msg"
+	msg=$_bt_str
+	off=$_bt_int
+	case $type in
+	*'&'*)	mask=${type#*&}; type=${type%%&*} ;;
+	esac
+	case $type in
+	s|string)	kind=s ;;
+	byte)		kind=d; size=1 ;;
+	short)		kind=d; size=2 ;;
+	long)		kind=d; size=4 ;;
+	d*|u*)		kind=${type:0:1}
+			rest=${type:1}
+			case $rest in
+			C)	size=1 ;;
+			S)	size=2 ;;
+			I)	size=4 ;;
+			L)	size=8 ;;
+			'')	size=4 ;;
+			*[!0-9]*)	size=4 ;;
+			*)	size=$(( 10#$rest )) ;;
+			esac ;;
+		*)	return 1 ;;
+	esac
+	if [ "$kind" = s ]; then
+		_bt_file_esc "$val"
+		want=$_bt_str
+		[ $(( off + ${#want} )) -gt "${#_bt_b[@]}" ] && return 1
+		_bt_file_str "$off" "${#want}"
+		[ "$_bt_str" = "$want" ] || return 1
+		printf -v _bt_str "$msg" "$want"
+		return 0
+	fi
+	case $val in
+	=*|'<'*|'>'*|'&'*|'^'*|x)	cmp=${val:0:1}; val=${val:1} ;;
+	*)				cmp='=' ;;
+	esac
+	[ "${_mg_val[$1]}" = x ] && cmp=x
+	[ $(( off + size )) -gt "${#_bt_b[@]}" ] && return 1
+	_bt_file_num "$off" "$size"
+	got=$_bt_int
+	if [ -n "$mask" ]; then
+		_bt_file_val "$mask"
+		got=$(( got & _bt_int ))
+	fi
+	if [ "$cmp" = x ]; then
+		printf -v _bt_str "$msg" "$got"
+		return 0
+	fi
+	_bt_file_val "$val"
+	want=$_bt_int
+	if [ "$kind" = u ] && [ "$got" -lt 0 ]; then
+		got=$(( got & 0xffffffffffffffff ))
+	fi
+	case $cmp in
+	'=')	[ "$got" = "$want" ] || return 1 ;;
+	'<')	[ "$got" -lt "$want" ] || return 1 ;;
+	'>')	[ "$got" -gt "$want" ] || return 1 ;;
+	'&')	[ $(( got & want )) = "$want" ] || return 1 ;;
+	'^')	[ $(( got & want )) != "$want" ] || return 1 ;;
+	esac
+	printf -v _bt_str "$msg" "$got"
+	return 0
+}
+
+# Walk the magic tests that were read, into _bt_str.
+_bt_file_trymagic() {
+	local i n=${#_mg_off[@]} out= ok=0
+	for (( i = 0; i < n; i++ )); do
+		case ${_mg_off[i]} in
+		'>'*)	[ "$ok" = 1 ] || continue
+			if _bt_file_test "$i"; then
+				out=$out$_bt_str
+			fi
+			continue ;;
+		esac
+		[ "$ok" = 1 ] && break
+		if _bt_file_test "$i"; then
+			out=$_bt_str
+			ok=1
+		fi
+	done
+	_bt_str=$out
+	[ "$ok" = 1 ] && return 0
+	return 1
+}
+
+# The tests this file knows by heart, into _bt_str.
+_bt_file_builtin() {
+	local s t n=${#_bt_b[@]}
+	[ "$n" = 0 ] && return 1
+	_bt_file_str 0 8
+	s=$_bt_str
+	case $s in
+	$'\177ELF'*)	_bt_file_elf "$1"; return 0 ;;
+	'!<arch>'*)	_bt_str='current ar archive'; return 0 ;;
+	'070701'*|'070702'*|'070707'*)
+			_bt_str='cpio archive'; return 0 ;;
+	$'\303\161'*|$'\161\303'*)
+			_bt_str='cpio archive'; return 0 ;;
+	$'\037\213'*)	_bt_str='gzip compressed data'; return 0 ;;
+	$'\037\235'*)	_bt_str='compressed data'; return 0 ;;
+	'BZh'*)		_bt_str='bzip2 compressed data'; return 0 ;;
+	$'\375''7zXZ'*)	_bt_str='XZ compressed data'; return 0 ;;
+	'PK'$'\003\004'*|'PK'$'\005\006'*)
+			_bt_str='Zip archive data'; return 0 ;;
+	$'\211'PNG*)	_bt_str='PNG image data'; return 0 ;;
+	$'\377\330\377'*)
+			_bt_str='JPEG image data'; return 0 ;;
+	'GIF87a'*|'GIF89a'*)
+			_bt_str='GIF image data'; return 0 ;;
+	'%PDF-'*)	_bt_str='PDF document'; return 0 ;;
+	'%!PS'*)	_bt_str='PostScript document text'; return 0 ;;
+	esac
+	if [ "$n" -gt 262 ]; then
+		_bt_file_str 257 5
+		case $_bt_str in
+		ustar)	_bt_str='tar archive'; return 0 ;;
+		esac
+	fi
+	return 1
+}
+
+# What sort of ELF file this is, into _bt_str.
+_bt_file_elf() {
+	local class endian type machine out fd i phoff phnum phent p interp=0
+	# the program headers are usually past the first block, and whether
+	# there is one asking for an interpreter is what tells a program that
+	# happens to be a shared object from a library that is one
+	if [ -n "${1-}" ] && { exec {fd}<"$1"; } 2>/dev/null; then
+		_bt_file_head "$fd" 4096
+		exec {fd}<&-
+	fi
+	class=${_bt_b[4]}
+	endian=${_bt_b[5]}
+	if [ "$endian" = 2 ]; then
+		_bt_file_bnum 16 2
+	else
+		_bt_file_num 16 2
+	fi
+	type=$_bt_int
+	case $class in
+	1)	out='ELF 32-bit' ;;
+	2)	out='ELF 64-bit' ;;
+	*)	out='ELF' ;;
+	esac
+	case $endian in
+	1)	out="$out LSB" ;;
+	2)	out="$out MSB" ;;
+	esac
+	if [ "$type" = 3 ]; then
+		if [ "$class" = 2 ]; then
+			_bt_file_num 32 8; phoff=$_bt_int
+			_bt_file_num 54 2; phent=$_bt_int
+			_bt_file_num 56 2; phnum=$_bt_int
+		else
+			_bt_file_num 28 4; phoff=$_bt_int
+			_bt_file_num 42 2; phent=$_bt_int
+			_bt_file_num 44 2; phnum=$_bt_int
+		fi
+		for (( i = 0; i < phnum; i++ )); do
+			p=$(( phoff + i * phent ))
+			[ $(( p + 4 )) -gt "${#_bt_b[@]}" ] && break
+			_bt_file_num "$p" 4
+			[ "$_bt_int" = 3 ] && { interp=1; break; }
+		done
+	fi
+	case $type in
+	1)	out="$out relocatable" ;;
+	2)	out="$out executable" ;;
+	3)	if [ "$interp" = 1 ]; then out="$out pie executable"
+		else out="$out shared object"; fi ;;
+	4)	out="$out core file" ;;
+	*)	out="$out object" ;;
+	esac
+	_bt_str=$out
+	return 0
+}
+
+# Reading the file as text: what does it look like?  _bt_str comes back with
+# the answer, and the return says whether the file is text at all.
+_bt_file_text() {
+	local fd=$1 first= body= line i n
+	local _bt_buf _bt_nul rc
+	if _bt_read "$fd"; then rc=0; else rc=1; fi
+	if [ "$rc" = 0 ] && [ "$_bt_nul" = 1 ]; then
+		return 1
+	fi
+	body=$_bt_buf
+	# a pattern held in a variable keeps its range; written out in quotes
+	# the dash would be just a dash
+	local nontext='*[!'$'\t\n\v\f\r\b\a\033'' -~]*'
+	case $body in
+	$nontext)	return 1 ;;
+	esac
+	[ -z "$body" ] && return 1
+	first=${body%%$'\n'*}
+	case $first in
+	'#!'*)	_bt_str='commands text'
+		case $first in
+		*/sh|*/sh' '*|*/bash|*/bash' '*|*/ksh|*/ksh' '*|*/dash|*/dash' '*)
+			_bt_str='shell commands text' ;;
+		*/awk*)	_bt_str='awk commands text' ;;
+		*/sed*)	_bt_str='sed commands text' ;;
+		*/perl*)	_bt_str='perl commands text' ;;
+		*/python*)	_bt_str='python commands text' ;;
+		esac
+		return 0 ;;
+	esac
+	case $body in
+	*'#include'*|*'#define'*)	_bt_str='c program text'; return 0 ;;
+	esac
+	case $body in
+	*'int main('*|*'void main('*|*'int main ('*)
+		_bt_str='c program text'; return 0 ;;
+	esac
+	# fortran: a letter in the first column is a comment, and the keywords
+	# are written in capitals in fixed form source
+	case $body in
+	[cC]' '*|*$'\n'[cC]' '*)
+		case $body in
+		*SUBROUTINE*|*PROGRAM*|*subroutine*|*program*|*END*)
+			_bt_str='fortran program text'; return 0 ;;
+		esac ;;
+	esac
+	case $body in
+	*'      SUBROUTINE '*|*'      PROGRAM '*|*'      FUNCTION '*)
+		_bt_str='fortran program text'; return 0 ;;
+	esac
+	# something that reads like a shell script even without a first line
+	case $body in
+	*$'\n''fi'$'\n'*|*$'\n''done'$'\n'*|*$'\n''esac'$'\n'*|*'; then'*|*'; do'*)
+		_bt_str='shell commands text'; return 0 ;;
+	esac
+	_bt_str='ascii text'
+	return 0
+}
+
+file () {
+	local LC_ALL=C
+	local arg opt f fd status=0 hflag=0 iflag=0 dflag=0 usemagic=0 nodefault=0
+	local out= _bt_str _bt_c _bt_int
+	local -a _bt_b=() _mg_off=() _mg_type=() _mg_val=() _mg_msg=()
+	local rest
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-M)	shift
+			[ "$#" = 0 ] && { _bt_err "file: -M wants a file"; return 1; }
+			_bt_file_magic "$1" || return 1
+			usemagic=1 nodefault=1
+			shift ;;
+		-M*)	_bt_file_magic "${1#-M}" || return 1
+			usemagic=1 nodefault=1
+			shift ;;
+		-m)	shift
+			[ "$#" = 0 ] && { _bt_err "file: -m wants a file"; return 1; }
+			_bt_file_magic "$1" || return 1
+			usemagic=1
+			shift ;;
+		-m*)	_bt_file_magic "${1#-m}" || return 1
+			usemagic=1
+			shift ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				d)	dflag=1 ;;
+				h)	hflag=1 ;;
+				i)	iflag=1 ;;
+				*)	_bt_err "file: illegal option -- $opt"
+					_bt_err "usage: file [-dh] [-M file] [-m file] file..."
+					_bt_err "       file -i [-h] file..."
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	[ "$dflag" = 1 ] && nodefault=0
+
+	if [ "$#" = 0 ]; then
+		_bt_err "usage: file [-dh] [-M file] [-m file] file..."
+		_bt_err "       file -i [-h] file..."
+		return 1
+	fi
+
+	for f in "$@"; do
+		out=
+		if [ -L "$f" ] && { [ "$hflag" = 1 ] || [ ! -e "$f" ]; }; then
+			# there is no readlink to call, so the best that can be
+			# said is what the link leads to
+			if [ -e "$f" ]; then
+				out="symbolic link to $f"
+			else
+				out='symbolic link to (nonexistent file)'
+			fi
+			printf '%s: %s\n' "$f" "$out"
+			continue
+		fi
+		if [ ! -e "$f" ]; then
+			printf '%s: cannot open\n' "$f"
+			continue
+		fi
+		if [ -d "$f" ]; then
+			printf '%s: directory\n' "$f"
+			continue
+		fi
+		if [ -c "$f" ]; then
+			printf '%s: character special\n' "$f"
+			continue
+		fi
+		if [ -b "$f" ]; then
+			printf '%s: block special\n' "$f"
+			continue
+		fi
+		if [ -p "$f" ]; then
+			printf '%s: fifo\n' "$f"
+			continue
+		fi
+		if [ -S "$f" ]; then
+			printf '%s: socket\n' "$f"
+			continue
+		fi
+		if [ ! -r "$f" ]; then
+			printf '%s: cannot open\n' "$f"
+			continue
+		fi
+		if [ ! -s "$f" ]; then
+			printf '%s: empty\n' "$f"
+			continue
+		fi
+		if [ "$iflag" = 1 ]; then
+			printf '%s: regular file\n' "$f"
+			continue
+		fi
+		if ! { exec {fd}<"$f"; } 2>/dev/null; then
+			printf '%s: cannot open\n' "$f"
+			continue
+		fi
+		_bt_file_head "$fd" 512
+		if [ "$usemagic" = 1 ] && _bt_file_trymagic; then
+			out=$_bt_str
+		elif [ "$nodefault" = 0 ] && _bt_file_builtin "$f"; then
+			out=$_bt_str
+		fi
+		if [ -z "$out" ] && [ "$nodefault" = 0 ]; then
+			exec {fd}<&-
+			if { exec {fd}<"$f"; } 2>/dev/null && _bt_file_text "$fd"; then
+				out=$_bt_str
+			fi
+		fi
+		exec {fd}<&-
+		[ -z "$out" ] && out=data
+		printf '%s: %s\n' "$f" "$out"
+	done
+	return "$status"
+}

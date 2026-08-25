@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-79 of the 160 utilities in POSIX.1-2017, as of now.
+80 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -78,6 +78,7 @@ Run the test suite with:
 | `env` | `env [-i] [name=value]... [utility [argument...]]` |
 | `expand` | `expand [-t tablist] [file...]` |
 | `expr` | `expr operand...` |
+| `file` | `file [-dh] [-M file] [-m file] file...`<br>`file -i [-h] file...` |
 | `fold` | `fold [-bs] [-w width] [file...]` |
 | `fuser` | `fuser [-cfu] file...` |
 | `gencat` | `gencat catfile msgfile...` |
@@ -331,17 +332,18 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 79 |
+| implemented here | 80 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **52** |
-| reachable, not yet written | 7 |
+| reachable, not yet written | 6 |
 
 **The ceiling is 86 of 160**, or about 54% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 7 that remain are wildly uneven. `lex` and `yacc` are compilers whose
-output is C, and `sh` would be a shell written in a shell.
+The 6 that remain are wildly uneven. `lex` and `yacc` are compilers whose
+output is C, `localedef` compiles locales into a binary nobody has written
+down, and `sh` would be a shell written in a shell.
 
 ### Smaller deviations, all deliberate
 
@@ -389,6 +391,17 @@ output is C, and `sh` would be a shell written in a shell.
   does and not what mawk does; a `printf` given fewer arguments than
   conversions treats the missing ones as empty, as the standard says, rather
   than stopping.
+* `file` answers with the strings the standard's table asks for -- `empty`,
+  `directory`, `character special`, `cpio archive`, `commands text`,
+  `c program text` and the rest -- rather than the sentences GNU's file
+  writes, which are longer and say more. It reads the four column magic files
+  the standard describes for `-m` and `-M`, including the `>` lines that
+  carry a test on. Two things are out of reach: there is no `readlink`, so a
+  symbolic link is reported by where it leads rather than by what it says;
+  and an ELF shared object that has an interpreter is called a pie
+  executable, since telling one from a library for certain means reading the
+  dynamic section, which lies further into the file than a shell can afford
+  to read a byte at a time.
 * `cxref` has no format to match: the standard leaves the layout of the
   listing open and asks only that the name, the file, the function the name
   was written in and the line numbers all be there, with a star on the

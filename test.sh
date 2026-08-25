@@ -28,7 +28,7 @@ for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          nohup pr dd sed who logname diff cal fuser ipcs patch tput \
          what uuencode uudecode write ps ed m4 iconv ar locale nm \
          admin delta get prs rmdel sact sccs unget val \
-         compress uncompress zcat bc make awk gencat ctags cflow cxref; do
+         compress uncompress zcat bc make awk gencat ctags cflow cxref file; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -3251,6 +3251,132 @@ else note_fail "cxref -o"; fi
 a=$( . "$BT"; cxref nosuch.c 2>/dev/null; echo "rc=$?" )
 if [ "$a" = "rc=1" ]; then pass=$((pass + 1))
 else note_fail "cxref with a missing file: [$a]"; fi
+
+cd .. || exit 1
+
+# --- file -------------------------------------------------------------------
+# The standard gives a table of strings the output has to contain for each
+# sort of file, and that table is the test.  The magic file format it defines
+# for -m and -M is tested on magic files written here.
+echo "### file"
+mkdir -p flt
+cd flt || exit 1
+
+fchk() {	# fchk file expected-substring
+	local f=$1 want=$2 got
+	got=$( . "$BT"; file "$f" 2>/dev/null )
+	case $got in
+	"$f: "*"$want"*)	pass=$((pass + 1)) ;;
+	*)			note_fail "file $f: [$got] does not hold [$want]" ;;
+	esac
+}
+
+: > f_empty
+printf 'hello world\nsecond line\n' > f_text
+printf '#!/bin/sh\necho hi\n' > f_sh
+printf '#include <stdio.h>\nint main(void) { return 0; }\n' > f_c
+printf 'C     a comment\n      PROGRAM MAIN\n      END\n' > f_f
+printf 'a\000b\001\002\003\004\005\006' > f_data
+mkdir -p f_dir
+"$(real_of tar)" cf f_tar f_text 2>/dev/null
+"$(real_of ar)" rc f_ar f_text 2>/dev/null
+printf '070701000000000000000000' > f_cpio
+"$(real_of cp)" "$(real_of cat)" f_exec 2>/dev/null
+
+fchk f_empty empty
+fchk f_text text
+fchk f_sh 'commands text'
+fchk f_c 'c program text'
+fchk f_f 'fortran program text'
+fchk f_data data
+fchk f_dir directory
+fchk f_tar 'tar archive'
+fchk f_ar archive
+fchk f_cpio 'cpio archive'
+fchk f_exec executable
+fchk /dev/null 'character special'
+
+# things that are not files of their own
+got=$( . "$BT"; file f_missing 2>/dev/null )
+if [ "$got" = "f_missing: cannot open" ]; then pass=$((pass + 1))
+else note_fail "file on a missing file: [$got]"; fi
+a=$( . "$BT"; file f_missing > /dev/null 2>&1; echo $? )
+if [ "$a" = 0 ]; then pass=$((pass + 1))
+else note_fail "file on a missing file should still succeed ($a)"; fi
+
+"$(real_of mkfifo)" f_fifo 2>/dev/null && fchk f_fifo fifo
+"$(real_of ln)" -sf f_text f_link
+got=$( . "$BT"; file -h f_link 2>/dev/null )
+case $got in
+"f_link: symbolic link to"*)	pass=$((pass + 1)) ;;
+*)				note_fail "file -h on a link: [$got]" ;;
+esac
+got=$( . "$BT"; file f_link 2>/dev/null )
+case $got in
+*text*)	pass=$((pass + 1)) ;;
+*)	note_fail "file should follow a link: [$got]" ;;
+esac
+"$(real_of ln)" -sf nowhere f_broken
+got=$( . "$BT"; file f_broken 2>/dev/null )
+case $got in
+"f_broken: symbolic link to"*)	pass=$((pass + 1)) ;;
+*)				note_fail "file on a broken link: [$got]" ;;
+esac
+
+# -i stops at the file type
+got=$( . "$BT"; file -i f_text 2>/dev/null )
+if [ "$got" = "f_text: regular file" ]; then pass=$((pass + 1))
+else note_fail "file -i: [$got]"; fi
+got=$( . "$BT"; file -i f_dir 2>/dev/null )
+if [ "$got" = "f_dir: directory" ]; then pass=$((pass + 1))
+else note_fail "file -i on a directory: [$got]"; fi
+
+# magic files
+printf 'MAGICTEST and the rest\n' > m_one
+printf 'XYZZY\001\002\003' > m_two
+printf 'AB\n' > m_short
+{
+	printf '0\tstring\tMAGICTEST\ta magic test file\n'
+	printf '0\tstring\tXYZZY\tan xyzzy file\n'
+	printf '>5\tbyte\t1\t\\ with a one after it\n'
+	printf '>6\tbyte\t>1\t\\ and something above one\n'
+} > m.magic
+printf '0\tshort\t0x4241\ttwo bytes, smallest first\n' > m2.magic
+printf '0\tstring\tXYZZY\tit says %%s\n' > m3.magic
+
+got=$( . "$BT"; file -m m.magic m_one 2>/dev/null )
+if [ "$got" = "m_one: a magic test file" ]; then pass=$((pass + 1))
+else note_fail "file -m: [$got]"; fi
+got=$( . "$BT"; file -m m.magic m_two 2>/dev/null )
+if [ "$got" = "m_two: an xyzzy file with a one after it and something above one" ]; then pass=$((pass + 1))
+else note_fail "file -m with continuation lines: [$got]"; fi
+got=$( . "$BT"; file -M m2.magic m_short 2>/dev/null )
+if [ "$got" = "m_short: two bytes, smallest first" ]; then pass=$((pass + 1))
+else note_fail "file -M with a number: [$got]"; fi
+got=$( . "$BT"; file -M m3.magic m_two 2>/dev/null )
+if [ "$got" = "m_two: it says XYZZY" ]; then pass=$((pass + 1))
+else note_fail "file magic message: [$got]"; fi
+# -M on its own turns the built-in tests off, -d turns them back on
+got=$( . "$BT"; file -M m.magic f_text 2>/dev/null )
+if [ "$got" = "f_text: data" ]; then pass=$((pass + 1))
+else note_fail "file -M should leave the default tests out: [$got]"; fi
+got=$( . "$BT"; file -M m.magic -d f_text 2>/dev/null )
+case $got in
+*text*)	pass=$((pass + 1)) ;;
+*)	note_fail "file -M -d: [$got]" ;;
+esac
+# -m keeps them
+got=$( . "$BT"; file -m m.magic f_text 2>/dev/null )
+case $got in
+*text*)	pass=$((pass + 1)) ;;
+*)	note_fail "file -m should keep the default tests: [$got]" ;;
+esac
+
+# the format is one line to a file, with no padding
+got=$( . "$BT"; file f_empty f_text 2>/dev/null )
+if [ "$got" = "f_empty: empty
+f_text: ascii text" ]; then pass=$((pass + 1))
+else note_fail "file with two operands: [$got]"; fi
 
 cd .. || exit 1
 
