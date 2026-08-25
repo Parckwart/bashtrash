@@ -18590,3 +18590,477 @@ ctags () {
 	exec {fd}>&-
 	return "$status"
 }
+
+# ---------------------------------------------------------------------------
+# cflow -- POSIX.1-2017:
+#	cflow [-r] [-d num] [-D name[=def]]... [-i incl] [-I dir]...
+#	      [-U dir]... file...
+#
+# The graph is built out of the same character-at-a-time reading of C that
+# ctags does: what is defined at file scope, and what each function body
+# mentions.  The standard's own example is the shape the output takes -- a
+# reference number, four columns of indentation a level, the name, and either
+# its definition or the number of the line where that definition was written.
+# ---------------------------------------------------------------------------
+
+_bt_cflow_kw() {
+	case $1 in
+	if|while|for|switch|return|sizeof|do|else|case|goto|break|continue|\
+	defined|typedef|struct|union|enum|static|extern|const|volatile|\
+	register|inline|signed|unsigned|void|char|short|int|long|float|double|\
+	auto|default|typeof|__attribute__|__asm__|asm)	return 0 ;;
+	esac
+	return 1
+}
+
+# Is $1 a word that only says how a thing is stored?
+_bt_cflow_storage() {
+	case $1 in
+	static|extern|register|auto|inline|typedef)	return 0 ;;
+	esac
+	return 1
+}
+
+# The type the words in $1 and the stars in $2 spell out, into _bt_str.
+_bt_cflow_type() {
+	local words=$1 stars=$2 out= w
+	for w in $words; do
+		_bt_cflow_storage "$w" && continue
+		out=${out:+$out }$w
+	done
+	[ -z "$out" ] && out=int
+	[ -n "$stars" ] && out="$out $stars"
+	_bt_str=$out
+	return 0
+}
+
+# Remember that $1 is defined here: $2 its type, $3 the line, $4 func or data.
+_bt_cflow_def() {
+	local name=$1
+	case $name in
+	_*)	[ "$under" = 1 ] || return 0 ;;
+	esac
+	[ -n "${_cf_type[$name]+x}" ] && return 0
+	_cf_type[$name]=$2
+	_cf_file[$name]=$_cf_cur
+	_cf_line[$name]=$(( $3 + 1 ))
+	_cf_kind[$name]=$4
+	_cf_order="$_cf_order $name"
+	return 0
+}
+
+# Remember that $1 mentions $2.
+_bt_cflow_ref() {
+	local from=$1 to=$2
+	[ -z "$from" ] && return 0
+	case $to in
+	_*)	[ "$under" = 1 ] || return 0 ;;
+	esac
+	case " ${_cf_ref[$from]-} " in
+	*" $to "*)	return 0 ;;
+	esac
+	_cf_ref[$from]="${_cf_ref[$from]-} $to"
+	_cf_called="$_cf_called $to"
+	return 0
+}
+
+# Walk one C file.
+_bt_cflow_scan() {
+	local n=${#_cf_lines[@]} ln s i len c d word
+	local depth=0 paren=0 lastid= lastline=0 cand= candline=0 closed=0
+	local instr= incomment=0 bol=1 pp=0 sawdecl=0
+	local words= stars= cur= dcl=1 ininit=0
+	local -a datarefs=()
+	for (( ln = 0; ln < n; ln++ )); do
+		s=${_cf_lines[ln]}
+		len=${#s}
+		i=0
+		bol=1
+		pp=0
+		while [ "$i" -lt "$len" ]; do
+			c=${s:i:1}
+			if [ "$incomment" = 1 ]; then
+				if [ "${s:i:2}" = '*/' ]; then incomment=0; i=$(( i + 2 )); continue; fi
+				i=$(( i + 1 ))
+				continue
+			fi
+			if [ -n "$instr" ]; then
+				if [ "$c" = '\' ]; then i=$(( i + 2 )); continue; fi
+				[ "$c" = "$instr" ] && instr=
+				i=$(( i + 1 ))
+				continue
+			fi
+			case $c in
+			' '|$'\t')	i=$(( i + 1 )); continue ;;
+			esac
+			if [ "${s:i:2}" = '/*' ]; then incomment=1; i=$(( i + 2 )); continue; fi
+			if [ "${s:i:2}" = '//' ]; then break; fi
+			case $c in
+			'"'|"'")	instr=$c; i=$(( i + 1 )); bol=0; continue ;;
+			esac
+			if [ "$bol" = 1 ] && [ "$c" = '#' ]; then
+				pp=1
+				i=$(( i + 1 ))
+				bol=0
+				continue
+			fi
+			bol=0
+			if [ "$pp" = 1 ]; then
+				i=$(( i + 1 ))
+				continue
+			fi
+			case $c in
+			[A-Za-z_])
+				word=
+				while [ "$i" -lt "$len" ]; do
+					d=${s:i:1}
+					case $d in
+					[A-Za-z0-9_])	word=$word$d; i=$(( i + 1 )) ;;
+					*)		break ;;
+					esac
+				done
+				# what follows an = at file scope is a value,
+				# and names nothing
+				[ "$ininit" = 1 ] && [ "$depth" = 0 ] && continue
+				# a call is a name with a bracket after it
+				d=$i
+				while [ "$d" -lt "$len" ]; do
+					case ${s:d:1} in
+					' '|$'\t')	d=$(( d + 1 )) ;;
+					*)		break ;;
+					esac
+				done
+				if [ "$depth" -gt 0 ]; then
+					if [ "${s:d:1}" = '(' ] && ! _bt_cflow_kw "$word"; then
+						_bt_cflow_ref "$cur" "$word"
+					elif ! _bt_cflow_kw "$word"; then
+						datarefs+=("$word")
+					fi
+					lastid=$word
+					lastline=$ln
+					continue
+				fi
+				if [ "$paren" -gt 0 ]; then
+					# what is between the brackets is the
+					# parameter list, not the type
+					lastid=$word
+					lastline=$ln
+					continue
+				fi
+				if [ "$closed" = 1 ]; then
+					sawdecl=1
+					lastid=$word
+					lastline=$ln
+					continue
+				fi
+				words="$words $word"
+				lastid=$word
+				lastline=$ln
+				continue ;;
+			[0-9])	while [ "$i" -lt "$len" ]; do
+					case ${s:i:1} in
+					[0-9A-Za-z._])	i=$(( i + 1 )) ;;
+					*)		break ;;
+					esac
+				done
+				continue ;;
+			'*')	[ "$depth" = 0 ] && [ "$paren" = 0 ] && stars=$stars'*'
+				i=$(( i + 1 ))
+				continue ;;
+			'(')	if [ "$depth" = 0 ] && [ "$paren" = 0 ] &&
+				   [ -n "$lastid" ] && ! _bt_cflow_kw "$lastid"; then
+					cand=$lastid
+					candline=$lastline
+					closed=0
+				fi
+				paren=$(( paren + 1 ))
+				i=$(( i + 1 ))
+				continue ;;
+			')')	paren=$(( paren - 1 ))
+				[ "$paren" -lt 0 ] && paren=0
+				if [ "$paren" = 0 ] && [ -n "$cand" ]; then
+					closed=1
+					sawdecl=0
+				fi
+				i=$(( i + 1 ))
+				continue ;;
+			'{')	if [ "$depth" = 0 ] && [ "$closed" = 1 ]; then
+					words=${words% "$cand"}
+					words=${words%"$cand"}
+					_bt_cflow_type "$words" "$stars"
+					_bt_cflow_def "$cand" "$_bt_str()" "$candline" func
+					cur=$cand
+					datarefs=()
+				fi
+				depth=$(( depth + 1 ))
+				i=$(( i + 1 ))
+				continue ;;
+			'}')	depth=$(( depth - 1 ))
+				if [ "$depth" -le 0 ]; then
+					depth=0
+					if [ -n "$cur" ]; then
+						# data comes after the calls
+						for word in ${datarefs[@]+"${datarefs[@]}"}; do
+							[ -n "${_cf_type[$word]+x}" ] &&
+							[ "${_cf_kind[$word]}" = data ] &&
+								_bt_cflow_ref "$cur" "$word"
+						done
+						datarefs=()
+					fi
+					cur=
+					cand= closed=0 words= stars= lastid=
+				fi
+				i=$(( i + 1 ))
+				continue ;;
+			';')	if [ "$depth" = 0 ]; then
+					ininit=0
+					if [ "$closed" = 0 ] && [ -n "$lastid" ] &&
+					   ! _bt_cflow_kw "$lastid" && [ "$paren" = 0 ]; then
+						words=${words% "$lastid"}
+						words=${words%"$lastid"}
+						_bt_cflow_type "$words" "$stars"
+						_bt_cflow_def "$lastid" "$_bt_str" "$lastline" data
+					fi
+					if [ "$closed" = 0 ] || [ "$sawdecl" = 0 ]; then
+						cand=
+						closed=0
+					fi
+					words= stars= lastid=
+				fi
+				i=$(( i + 1 ))
+				continue ;;
+			',')	if [ "$depth" = 0 ] && [ "$paren" = 0 ]; then
+					ininit=0
+					if [ "$closed" = 0 ] && [ -n "$lastid" ] &&
+					   ! _bt_cflow_kw "$lastid"; then
+						words=${words% "$lastid"}
+						words=${words%"$lastid"}
+						_bt_cflow_type "$words" "$stars"
+						_bt_cflow_def "$lastid" "$_bt_str" "$lastline" data
+						words="$words"
+					fi
+					stars=
+					lastid=
+				fi
+				i=$(( i + 1 ))
+				continue ;;
+			'=')	[ "$depth" = 0 ] && [ "$paren" = 0 ] && ininit=1
+				if [ "$depth" = 0 ] && [ "$paren" = 0 ] && [ -n "$lastid" ] &&
+				   [ "$closed" = 0 ] && ! _bt_cflow_kw "$lastid"; then
+					words=${words% "$lastid"}
+					words=${words%"$lastid"}
+					_bt_cflow_type "$words" "$stars"
+					_bt_cflow_def "$lastid" "$_bt_str" "$lastline" data
+					lastid=
+				fi
+				[ "$depth" = 0 ] && [ "$paren" = 0 ] && { cand=; closed=0; }
+				i=$(( i + 1 ))
+				continue ;;
+			esac
+			i=$(( i + 1 ))
+		done
+	done
+	return 0
+}
+
+# Write $1 and everything it leads to, at level $2.
+_bt_cflow_emit() {
+	local name=$1 level=$2 pad= i child
+	[ "$level" -ge "$maxdepth" ] && return 0
+	num=$(( num + 1 ))
+	if [ "$level" = 0 ]; then
+		pad=' '
+	else
+		for (( i = 0; i < level * 4; i++ )); do pad=$pad' '; done
+	fi
+	if [ -n "${_cf_seen[$name]+x}" ]; then
+		printf '%d%s%s: %d\n' "$num" "$pad" "$name" "${_cf_seen[$name]}"
+		return 0
+	fi
+	if [ -n "${_cf_type[$name]+x}" ]; then
+		_cf_seen[$name]=$num
+		printf '%d%s%s: %s, <%s %d>\n' "$num" "$pad" "$name" "${_cf_type[$name]}" \
+		       "${_cf_file[$name]}" "${_cf_line[$name]}"
+	else
+		printf '%d%s%s: <>\n' "$num" "$pad" "$name"
+		return 0
+	fi
+	for child in ${_cf_ref[$name]-}; do
+		_bt_cflow_emit "$child" $(( level + 1 ))
+	done
+	return 0
+}
+
+# The other way round: who calls $1.
+_bt_cflow_emitr() {
+	local name=$1 level=$2 pad= i caller
+	[ "$level" -ge "$maxdepth" ] && return 0
+	num=$(( num + 1 ))
+	if [ "$level" = 0 ]; then
+		pad=' '
+	else
+		for (( i = 0; i < level * 4; i++ )); do pad=$pad' '; done
+	fi
+	if [ -n "${_cf_seen[$name]+x}" ]; then
+		printf '%d%s%s: %d\n' "$num" "$pad" "$name" "${_cf_seen[$name]}"
+		return 0
+	fi
+	if [ -n "${_cf_type[$name]+x}" ]; then
+		_cf_seen[$name]=$num
+		printf '%d%s%s: %s, <%s %d>\n' "$num" "$pad" "$name" "${_cf_type[$name]}" \
+		       "${_cf_file[$name]}" "${_cf_line[$name]}"
+	else
+		printf '%d%s%s: <>\n' "$num" "$pad" "$name"
+		return 0
+	fi
+	for caller in ${_cf_by[$name]-}; do
+		_bt_cflow_emitr "$caller" $(( level + 1 ))
+	done
+	return 0
+}
+
+# The names in $1 in alphabetical order, into _bt_str.
+_bt_cflow_sort() {
+	local -a names=()
+	local n i j tmp
+	for n in $1; do names+=("$n"); done
+	for (( i = 1; i < ${#names[@]}; i++ )); do
+		tmp=${names[i]}
+		j=$(( i - 1 ))
+		while [ "$j" -ge 0 ] && [[ ${names[j]} > $tmp ]]; do
+			names[j+1]=${names[j]}
+			j=$(( j - 1 ))
+		done
+		names[j+1]=$tmp
+	done
+	_bt_str=${names[*]-}
+	return 0
+}
+
+cflow () {
+	local LC_ALL=C
+	local arg opt f fd line status=0 reverse=0 maxdepth=32767 under=0 xdata=0
+	local name caller child num=0 first seen=
+	local _cf_cur= _cf_order= _cf_called= _bt_str
+	local -a _cf_lines=()
+	local -A _cf_type=() _cf_file=() _cf_line=() _cf_kind=() _cf_ref=()
+	local -A _cf_seen=() _cf_by=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-r)	reverse=1; shift ;;
+		-d)	shift
+			[ "$#" = 0 ] && { _bt_err "cflow: -d wants a number"; return 1; }
+			case $1 in
+			*[!0-9]*|'')	;;
+			*)	[ "$1" -gt 0 ] && maxdepth=$1 ;;
+			esac
+			shift ;;
+		-d*)	arg=${1#-d}
+			case $arg in
+			*[!0-9]*|'')	;;
+			*)	[ "$arg" -gt 0 ] && maxdepth=$arg ;;
+			esac
+			shift ;;
+		-i)	shift
+			[ "$#" = 0 ] && { _bt_err "cflow: -i wants x or _"; return 1; }
+			case $1 in
+			*x*)	xdata=1 ;;
+			esac
+			case $1 in
+			*_*)	under=1 ;;
+			esac
+			shift ;;
+		-i*)	arg=${1#-i}
+			case $arg in
+			*x*)	xdata=1 ;;
+			esac
+			case $arg in
+			*_*)	under=1 ;;
+			esac
+			shift ;;
+		-D|-I|-U)	shift; shift ;;
+		-D*|-I*|-U*)	shift ;;
+		-*)	_bt_err "cflow: illegal option -- ${1#-}"
+			_bt_err "usage: cflow [-r] [-d num] [-i incl] [-D name[=def]]... [-I dir]... [-U name]... file..."
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" = 0 ]; then
+		_bt_err "usage: cflow [-r] [-d num] [-i incl] file..."
+		return 1
+	fi
+
+	for f in "$@"; do
+		if ! { exec {fd}<"$f"; } 2>/dev/null; then
+			_bt_err "cflow: cannot open $f"
+			status=1
+			continue
+		fi
+		_cf_lines=()
+		line=
+		while IFS= read -r line; do
+			_cf_lines+=("$line")
+			line=
+		done <&"$fd"
+		[ -n "$line" ] && _cf_lines+=("$line")
+		exec {fd}<&-
+		_cf_cur=$f
+		_bt_cflow_scan
+	done
+
+	# without -i x the graph is functions and nothing else
+	if [ "$xdata" = 0 ]; then
+		for name in $_cf_order; do
+			[ "${_cf_kind[$name]}" = data ] || continue
+			for caller in $_cf_order; do
+				_cf_ref[$caller]=" ${_cf_ref[$caller]-} "
+				_cf_ref[$caller]=${_cf_ref[$caller]// $name / }
+			done
+		done
+	fi
+
+	if [ "$reverse" = 1 ]; then
+		for caller in $_cf_order; do
+			for child in ${_cf_ref[$caller]-}; do
+				_cf_by[$child]="${_cf_by[$child]-} $caller"
+			done
+		done
+		seen=
+		for name in $_cf_order; do
+			[ "$xdata" = 0 ] && [ "${_cf_kind[$name]}" = data ] && continue
+			seen="$seen $name"
+		done
+		for name in $_cf_called; do
+			[ "$xdata" = 0 ] && [ "${_cf_kind[$name]-}" = data ] && continue
+			case " $seen " in
+			*" $name "*)	;;
+			*)		seen="$seen $name" ;;
+			esac
+		done
+		_bt_cflow_sort "$seen"
+		for name in $_bt_str; do
+			_bt_cflow_emitr "$name" 0
+		done
+		return "$status"
+	fi
+
+	# a root is something defined here that nothing else calls
+	for name in $_cf_order; do
+		[ "${_cf_kind[$name]}" = func ] || continue
+		case " $_cf_called " in
+		*" $name "*)	continue ;;
+		esac
+		_bt_cflow_emit "$name" 0
+	done
+	# functions that only call each other have no root between them, so
+	# whichever comes first stands in for one
+	for name in $_cf_order; do
+		[ "${_cf_kind[$name]}" = func ] || continue
+		[ -n "${_cf_seen[$name]+x}" ] && continue
+		_bt_cflow_emit "$name" 0
+	done
+	return "$status"
+}

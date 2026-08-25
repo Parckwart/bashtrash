@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-77 of the 160 utilities in POSIX.1-2017, as of now.
+78 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -60,6 +60,7 @@ Run the test suite with:
 | `bc` | `bc [-l] [file...]` |
 | `cal` | `cal [[month] year]` |
 | `cat` | `cat [-u] [file...]` |
+| `cflow` | `cflow [-r] [-d num] [-i incl] [-D name[=def]]... [-I dir]... [-U name]... file...` |
 | `cksum` | `cksum [file...]` |
 | `cmp` | `cmp [-l\|-s] file1 file2` |
 | `comm` | `comm [-123] file1 file2` |
@@ -329,16 +330,16 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 77 |
+| implemented here | 78 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **52** |
-| reachable, not yet written | 9 |
+| reachable, not yet written | 8 |
 
 **The ceiling is 86 of 160**, or about 54% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 9 that remain are wildly uneven. `lex` and `yacc` are compilers whose
+The 8 that remain are wildly uneven. `lex` and `yacc` are compilers whose
 output is C, and `sh` would be a shell written in a shell.
 
 ### Smaller deviations, all deliberate
@@ -387,6 +388,13 @@ output is C, and `sh` would be a shell written in a shell.
   does and not what mawk does; a `printf` given fewer arguments than
   conversions treats the missing ones as empty, as the standard says, rather
   than stopping.
+* `cflow` reads C source, which is what there is to read: object files and
+  assembler, which the standard also allows as input, would need a symbol
+  table walk and an assembler's idea of a call. `-D`, `-I` and `-U` are
+  accepted and ignored, there being no preprocessor to pass them to, and a
+  `.l` or `.y` file is read as the C around its rules. The graph it draws for
+  the program in the standard's own example is the graph the standard prints,
+  line for line.
 * `ctags` writes out function definitions, type definitions and macros, which
   is what the standard requires, and nothing else; structures, unions, enums
   and global variables are among the things it is allowed to leave out, and

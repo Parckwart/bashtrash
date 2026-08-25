@@ -28,7 +28,7 @@ for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          nohup pr dd sed who logname diff cal fuser ipcs patch tput \
          what uuencode uudecode write ps ed m4 iconv ar locale nm \
          admin delta get prs rmdel sact sccs unget val \
-         compress uncompress zcat bc make awk gencat ctags; do
+         compress uncompress zcat bc make awk gencat ctags cflow; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -3006,6 +3006,130 @@ printf 'int div_it(int a) /* a / b */\n{\n\treturn a;\n}\n' > c4.c
 ( . "$BT"; ctags -f c4.tags c4.c )
 if [ "$( cut -f3 c4.tags )" = '/^int div_it(int a) \/* a \/ b *\/$/' ]; then pass=$((pass + 1))
 else note_fail "ctags escaping: [$( cut -f3 c4.tags )]"; fi
+
+cd .. || exit 1
+
+# --- cflow ------------------------------------------------------------------
+# The standard gives an example program and the graph it should produce, which
+# is the strongest thing to test against; the rest is checked by construction.
+echo "### cflow"
+mkdir -p cft
+cd cft || exit 1
+
+cat > x1.c <<'CEOF'
+int i;
+int f();
+int g();
+int h();
+int
+main()
+{
+    f();
+    g();
+    f();
+}
+int
+f()
+{
+    i = h();
+}
+CEOF
+
+want='1 main: int(), <x1.c 6>
+2    f: int(), <x1.c 13>
+3        h: <>
+4        i: int, <x1.c 1>
+5    g: <>'
+got=$( . "$BT"; cflow -i x x1.c )
+if [ "$got" = "$want" ]; then pass=$((pass + 1))
+else note_fail "cflow on the standard's example: [$got]"; fi
+
+# without -i x the data is left out
+want='1 main: int(), <x1.c 6>
+2    f: int(), <x1.c 13>
+3        h: <>
+4    g: <>'
+got=$( . "$BT"; cflow x1.c )
+if [ "$got" = "$want" ]; then pass=$((pass + 1))
+else note_fail "cflow without -i x: [$got]"; fi
+
+# -d cuts the graph off
+want='1 main: int(), <x1.c 6>
+2    f: int(), <x1.c 13>
+3    g: <>'
+got=$( . "$BT"; cflow -d 2 x1.c )
+if [ "$got" = "$want" ]; then pass=$((pass + 1))
+else note_fail "cflow -d 2: [$got]"; fi
+got=$( . "$BT"; cflow -d 0 x1.c )
+if [ "$got" = "$( . "$BT"; cflow x1.c )" ]; then pass=$((pass + 1))
+else note_fail "cflow -d 0 should be ignored"; fi
+
+# -r turns it round and sorts by the thing being called
+want='1 f: int(), <x1.c 13>
+2    main: int(), <x1.c 6>
+3 g: <>
+4 h: <>
+5 main: 2'
+got=$( . "$BT"; cflow -r x1.c )
+if [ "$got" = "$want" ]; then pass=$((pass + 1))
+else note_fail "cflow -r: [$got]"; fi
+
+# a name already written out is referred to by its number
+cat > x2.c <<'CEOF'
+int fact(int n)
+{
+	if (n <= 1) return 1;
+	return n * fact(n - 1);
+}
+int even(int n) { return odd(n); }
+int odd(int n) { return even(n); }
+CEOF
+want='1 fact: int(), <x2.c 1>
+2    fact: 1
+3 even: int(), <x2.c 6>
+4    odd: int(), <x2.c 7>
+5        even: 3'
+got=$( . "$BT"; cflow x2.c )
+if [ "$got" = "$want" ]; then pass=$((pass + 1))
+else note_fail "cflow with recursion: [$got]"; fi
+
+# names beginning with an underscore are left out unless asked for
+cat > x3.c <<'CEOF'
+static void _hidden(void) { }
+void shown(void)
+{
+	_hidden();
+	other();
+}
+CEOF
+got=$( . "$BT"; cflow x3.c )
+case $got in
+*_hidden*)	note_fail "cflow showed an underscore name: [$got]" ;;
+*)		pass=$((pass + 1)) ;;
+esac
+got=$( . "$BT"; cflow -i _ x3.c )
+case $got in
+*_hidden*)	pass=$((pass + 1)) ;;
+*)		note_fail "cflow -i _ hid an underscore name: [$got]" ;;
+esac
+
+# the types come out as abstract declarations
+cat > x4.c <<'CEOF'
+struct node { int v; };
+static struct node *make(void) { return 0; }
+char *name(void) { return 0; }
+static const char *table[] = { "a", "b" };
+CEOF
+got=$( . "$BT"; cflow -i x x4.c )
+want='1 make: struct node *(), <x4.c 2>
+2 name: char *(), <x4.c 3>'
+if [ "$got" = "$want" ]; then pass=$((pass + 1))
+else note_fail "cflow types: [$got]"; fi
+
+# a file that is not there
+a=$( . "$BT"; cflow nosuch.c 2>/dev/null; echo "rc=$?" )
+if [ "$a" = "rc=1" ]; then pass=$((pass + 1))
+else note_fail "cflow with a missing file: [$a]"; fi
 
 cd .. || exit 1
 
