@@ -15,6 +15,22 @@ BT=$(cd -- "$(dirname -- "$0")" && pwd)/bashtrash.sh
 R_CAT=$(command -v cat) || exit 1
 R_TAIL=$(command -v tail) || exit 1
 
+# A syntax error in the library would leave the real utilities in place
+# and every comparison below would be coreutils against itself, passing
+# silently.  Refuse to run in that state.
+if ! ( . "$BT" ) 2>/dev/null; then
+	echo "cannot source $BT" >&2
+	exit 1
+fi
+for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
+         fold head id nl od paste pathchk sleep sort split strings tabs \
+         tail tee tr tsort tty uname unexpand uniq wc; do
+	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
+		echo "$u is not defined as a function after sourcing $BT" >&2
+		exit 1
+	fi
+done
+
 work=$(mktemp -d) || exit 1
 trap 'rm -rf "$work"' EXIT
 cd "$work" || exit 1
@@ -629,6 +645,63 @@ for o in "-j 3 -t x1" "-j 1 -c" "-j 20 -t x1" "-j 100 -c" "-N 5 -t x1" "-N 1 -c"
 done
 chk "od missing"  od no-such-file
 chk "od two"      od -t x1 odin odw
+
+# --- sort -----------------------------------------------------------------
+echo "### sort"
+printf 'banana\napple\nCherry\napple\n10\n9\n2\n'   > so1
+printf '  b 2\na 10\n c 1\nd 3\n'                   > so2
+printf '3:z\n1:y\n2:x\n'                            > so3
+printf '10\n9\n2\n-1\n2.5\n0.5\n-3.25\n007\n\nfoo\n' > so4
+printf 'x\ny\nx\nz\ny\n'                            > so5
+# a mixed table: numbers, blanks, cases, colon fields, empty lines
+: > so6
+i=0
+while [ "$i" -lt 60 ]; do
+	case $(( i % 6 )) in
+	0)	printf '%s k%s %s\n' $(( (i * 7) % 100 )) $(( i % 9 )) $(( (i * 13) % 1000 )) ;;
+	1)	printf '  w%s\t%s\n' $(( i % 20 )) $(( (i * 3) % 50 )) ;;
+	2)	printf '%s:F%s:%s\n' $(( (i * 11) % 30 )) $(( i % 5 )) $(( i % 9 )) ;;
+	3)	printf 'Word%s\n' $(( i % 15 )) ;;
+	4)	printf -- '-%s.%s\n' $(( i % 40 )) $(( (i * 17) % 99 )) ;;
+	5)	printf '\n' ;;
+	esac >> so6
+	i=$(( i + 1 ))
+done
+
+for o in "" -r -u -f -n -b -d -i -nr -ru -fbu -nu -un -uf; do
+	for f in so1 so4 so5 so6; do
+		# shellcheck disable=SC2086
+		if [ -z "$o" ]; then chk "sort $f" sort "$f"; else chk "sort $o $f" sort $o "$f"; fi
+	done
+done
+for o in "-k1" "-k2" "-k1,1" "-k2,2" "-k1n" "-k2n" "-k1r" "-k2 -k1" "-k1.2" "-k1,1.3" "-k2nr" "-k2u"; do
+	# shellcheck disable=SC2086
+	chk "sort $o so2" sort $o so2
+	# shellcheck disable=SC2086
+	chk "sort $o so6" sort $o so6
+done
+chk "sort -b -k2"     sort -b -k2 so2
+chk "sort -t: -k2"    sort -t: -k2 so3
+chk "sort -t: -k1n"   sort -t: -k1n so3
+chk "sort -t: -k2,2"  sort -t: -k2,2 so3
+chk "sort -t: -k2"    sort -t: -k2 so6
+chk "sort empty"      sort empty
+chk "sort missing"    sort no-such-file
+chk "sort two files"  sort so1 so5
+chks "sort stdin"     so1 sort
+
+for f in so1 so5 so6; do
+	( . "$BT"; sort -c "$f" ) > /dev/null 2>&1; a=$?
+	"$(real_of sort)" -c "$f" > /dev/null 2>&1; b=$?
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "sort -c $f ($a vs $b)"; fi
+done
+"$(real_of sort)" so1 > sorted1
+( . "$BT"; sort -c sorted1 ) > /dev/null 2>&1; a=$?
+"$(real_of sort)" -c sorted1 > /dev/null 2>&1; b=$?
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "sort -c on sorted input"; fi
+( . "$BT"; sort -o m.out so1 ) 2>/dev/null
+"$(real_of sort)" -o g.out so1
+if cmp -s m.out g.out; then pass=$((pass + 1)); else note_fail "sort -o"; fi
 
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"

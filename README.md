@@ -28,7 +28,7 @@ $ cat README.md | head -n 3 | wc -l
 
 This is a toy, and it is meant to be one. It is also a real conformance
 exercise: every utility is checked against GNU coreutils, byte for byte on
-stdout and on exit status, over 5677 comparisons.
+stdout and on exit status, over 5771 comparisons.
 
 ## Use it
 
@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-32 of the 160 utilities in POSIX.1-2017, as of now.
+33 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -71,6 +71,7 @@ Run the test suite with:
 | `od` | `od [-v] [-A base] [-j skip] [-N count] [-t type]... [file...]` |
 | `paste` | `paste [-s] [-d list] file...` |
 | `pathchk` | `pathchk [-p] pathname...` |
+| `sort` | `sort [-m] [-o out] [-bdfinru] [-t char] [-k keydef]... [file...]` · `sort -c ...` |
 | `sleep` | `sleep time` |
 | `split` | `split [-l line_count] [-a suffix_length] [file [name]]` · `split -b n[k\|m] ...` |
 | `strings` | `strings [-a] [-t format] [-n number] [file...]` |
@@ -133,7 +134,7 @@ $ ./test.sh
 ### fuzz
 ### id
 ...
-==== pass=5677 fail=0 ====
+==== pass=5771 fail=0 ====
 ```
 
 Every case runs twice — once through the bash function, once through the system
@@ -183,16 +184,16 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 32 |
+| implemented here | 33 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **40** |
-| reachable, not yet written | 66 |
+| reachable, not yet written | 65 |
 
 **The ceiling is 98 of 160**, or about 61% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 66 that remain are wildly uneven, too. `true`, `false`, `logname` and
+The 65 that remain are wildly uneven, too. `true`, `false`, `logname` and
 `printf` are afternoons. `awk`, `sed`, `m4`, `bc`, `make`, `lex` and `yacc` are
 interpreters and compilers, each larger than everything here put together,
 written in a language with no arrays of structs and no way to turn a character
@@ -228,6 +229,7 @@ Measured on a 2.6 MB text file, in this container:
 | `tail -n 5` | ~9 MB/s |
 | `wc -l` | ~3 MB/s |
 | `tr a-z A-Z` | ~12 KB/s |
+| `sort` (500 lines) | ~1.3 s |
 
 `cat` only moves whole blocks around, so it stays fast. `tr` has to touch
 every single byte inside the interpreter, and it shows. Fast enough to be

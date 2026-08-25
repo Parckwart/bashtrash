@@ -4090,3 +4090,394 @@ od () {
 	fi
 	return "$status"
 }
+
+# ---------------------------------------------------------------------------
+# sort -- POSIX.1-2017:
+#	sort [-m] [-o output] [-bdfinru] [-t char] [-k keydef]... [file...]
+#	sort -c [-bdfinru] [-t char] [-k keydef] [file]
+# ---------------------------------------------------------------------------
+
+# Character offsets at which each field of $1 begins, into _bt_fs.  Without a
+# -t separator a field carries its own leading blanks, which is what makes
+# -b meaningful.
+_bt_sort_fields() {
+	local s=$1 i=0 n=${#1}
+	_bt_fs=(0)
+	if [ -n "$_bt_sep" ]; then
+		while [ "$i" -lt "$n" ]; do
+			if [ "${s:i:1}" = "$_bt_sep" ]; then
+				_bt_fs+=($(( i + 1 )))
+			fi
+			i=$(( i + 1 ))
+		done
+	else
+		while [ "$i" -lt "$n" ]; do
+			while [ "$i" -lt "$n" ]; do
+				case ${s:i:1} in
+				[[:blank:]])	i=$(( i + 1 )) ;;
+				*)		break ;;
+				esac
+			done
+			while [ "$i" -lt "$n" ]; do
+				case ${s:i:1} in
+				[[:blank:]])	break ;;
+				*)		i=$(( i + 1 )) ;;
+				esac
+			done
+			[ "$i" -lt "$n" ] && _bt_fs+=("$i")
+		done
+	fi
+	return 0
+}
+
+# End offset (exclusive) of field $1 of the line whose starts are in _bt_fs.
+_bt_sort_fend() {
+	local f=$1
+	if [ "$f" -lt "${#_bt_fs[@]}" ]; then
+		if [ -n "$_bt_sep" ]; then
+			# the separator itself is not part of the field
+			_bt_fe=$(( _bt_fs[f] - 1 ))
+		else
+			_bt_fe=${_bt_fs[f]}
+		fi
+	else
+		_bt_fe=$_bt_linelen
+	fi
+	return 0
+}
+
+# The key of line $1 under key spec index $2, into _bt_k.
+_bt_sort_key() {
+	local s=$1 k=$2 sf sc ef ec start end mods
+	sf=${_bt_ksf[k]} sc=${_bt_ksc[k]} ef=${_bt_kef[k]} ec=${_bt_kec[k]} mods=${_bt_kmod[k]}
+	_bt_linelen=${#s}
+	_bt_sort_fields "$s"
+	if [ "$sf" -gt "${#_bt_fs[@]}" ]; then
+		_bt_k=
+		return 0
+	fi
+	start=${_bt_fs[sf-1]}
+	case $mods in
+	*b*)	while [ "$start" -lt "$_bt_linelen" ]; do
+			case ${s:start:1} in
+			[[:blank:]])	start=$(( start + 1 )) ;;
+			*)		break ;;
+			esac
+		done ;;
+	esac
+	start=$(( start + sc - 1 ))
+	if [ "$ef" -eq 0 ]; then
+		end=$_bt_linelen
+	elif [ "$ef" -gt "${#_bt_fs[@]}" ]; then
+		end=$_bt_linelen
+	else
+		_bt_sort_fend "$ef"
+		end=$_bt_fe
+		if [ "$ec" -gt 0 ]; then
+			end=$(( _bt_fs[ef-1] + ec ))
+			[ "$end" -gt "$_bt_linelen" ] && end=$_bt_linelen
+		fi
+	fi
+	[ "$end" -lt "$start" ] && end=$start
+	_bt_k=${s:start:end-start}
+	return 0
+}
+
+# Apply -d, -f and -i to a key.
+_bt_sort_fold() {
+	local s=$1 mods=$2 out= i c
+	case $mods in
+	*[dfi]*)	;;
+	*)		_bt_k=$s; return 0 ;;
+	esac
+	for (( i = 0; i < ${#s}; i++ )); do
+		c=${s:i:1}
+		case $mods in
+		*i*)	case $c in
+			[[:print:]])	;;
+			*)		continue ;;
+			esac ;;
+		esac
+		case $mods in
+		*d*)	case $c in
+			[[:alnum:][:blank:]])	;;
+			*)			continue ;;
+			esac ;;
+		esac
+		case $mods in
+		*f*)	case $c in
+			[[:lower:]])	c=${c^} ;;
+			esac ;;
+		esac
+		out=$out$c
+	done
+	_bt_k=$out
+	return 0
+}
+
+# Numeric comparison of $1 and $2 into _bt_c, as sort defines it.
+_bt_sort_numcmp() {
+	local a=$1 b=$2 sa=1 sb=1 ia fa ib fb
+	a=${a#"${a%%[![:blank:]]*}"}
+	b=${b#"${b%%[![:blank:]]*}"}
+	case $a in -*) sa=-1; a=${a#-} ;; +*) a=${a#+} ;; esac
+	case $b in -*) sb=-1; b=${b#-} ;; +*) b=${b#+} ;; esac
+	ia=${a%%[!0-9]*}; fa=
+	case $a in "$ia."*) fa=${a#"$ia."}; fa=${fa%%[!0-9]*} ;; esac
+	ib=${b%%[!0-9]*}; fb=
+	case $b in "$ib."*) fb=${b#"$ib."}; fb=${fb%%[!0-9]*} ;; esac
+	# strip leading zeros so lengths can be compared
+	while [ "${#ia}" -gt 1 ] && [ "${ia:0:1}" = 0 ]; do ia=${ia:1}; done
+	while [ "${#ib}" -gt 1 ] && [ "${ib:0:1}" = 0 ]; do ib=${ib:1}; done
+	[ -n "$ia" ] || ia=0
+	[ -n "$ib" ] || ib=0
+	# a value of zero has no sign
+	if [ "$ia" = 0 ] && [ -z "${fa//0/}" ]; then sa=1; fi
+	if [ "$ib" = 0 ] && [ -z "${fb//0/}" ]; then sb=1; fi
+	if [ "$sa" != "$sb" ]; then
+		[ "$sa" -lt "$sb" ] && _bt_c=-1 || _bt_c=1
+		return 0
+	fi
+	_bt_c=0
+	if [ "${#ia}" -ne "${#ib}" ]; then
+		[ "${#ia}" -lt "${#ib}" ] && _bt_c=-1 || _bt_c=1
+	elif [ "$ia" != "$ib" ]; then
+		[[ $ia < $ib ]] && _bt_c=-1 || _bt_c=1
+	else
+		while [ "${#fa}" -lt "${#fb}" ]; do fa=${fa}0; done
+		while [ "${#fb}" -lt "${#fa}" ]; do fb=${fb}0; done
+		if [ "$fa" != "$fb" ]; then
+			[[ $fa < $fb ]] && _bt_c=-1 || _bt_c=1
+		fi
+	fi
+	[ "$sa" -lt 0 ] && _bt_c=$(( -_bt_c ))
+	return 0
+}
+
+# Compare lines $1 and $2 on the keys alone, into _bt_c.
+_bt_sort_keycmp() {
+	local a=$1 b=$2 k ka kb mods
+	local -a _bt_fs=()
+	local _bt_fe _bt_linelen _bt_k
+	for (( k = 0; k < ${#_bt_ksf[@]}; k++ )); do
+		mods=${_bt_kmod[k]}
+		_bt_sort_key "$a" "$k"; ka=$_bt_k
+		_bt_sort_key "$b" "$k"; kb=$_bt_k
+		_bt_sort_fold "$ka" "$mods"; ka=$_bt_k
+		_bt_sort_fold "$kb" "$mods"; kb=$_bt_k
+		case $mods in
+		*n*)	_bt_sort_numcmp "$ka" "$kb" ;;
+		*)	if [ "$ka" = "$kb" ]; then
+				_bt_c=0
+			elif [[ $ka < $kb ]]; then
+				_bt_c=-1
+			else
+				_bt_c=1
+			fi ;;
+		esac
+		if [ "$_bt_c" -ne 0 ]; then
+			case $mods in
+			*r*)	_bt_c=$(( -_bt_c )) ;;
+			esac
+			return 0
+		fi
+	done
+	_bt_c=0
+	return 0
+}
+
+# Full comparison: the keys, then the whole line as a last resort.
+_bt_sort_cmp() {
+	local a=$1 b=$2
+	_bt_sort_keycmp "$a" "$b"
+	[ "$_bt_c" -ne 0 ] && return 0
+	# Under -u the whole-line tiebreak is dropped, so the merge being
+	# stable is what decides which line of an equal run survives.
+	[ "$_bt_nolast" = 1 ] && return 0
+	if [ "$a" = "$b" ]; then
+		_bt_c=0
+	elif [[ $a < $b ]]; then
+		_bt_c=-1
+	else
+		_bt_c=1
+	fi
+	[ "$_bt_rev" = 1 ] && _bt_c=$(( -_bt_c ))
+	return 0
+}
+
+sort () {
+	local LC_ALL=C
+	local arg opt val file fd status=0 out= merge=0 check=0 uniq=0
+	local gmods= i j n width lo mid hi a b line prev
+	local _bt_sep= _bt_rev=0 _bt_nolast=0 _bt_c _bt_reason
+	local -a _bt_ksf=() _bt_ksc=() _bt_kef=() _bt_kec=() _bt_kmod=()
+	local -a lines=() idx=() tmp=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				b|d|f|i|n)	gmods=$gmods$opt ;;
+				r)	_bt_rev=1; gmods=${gmods}r ;;
+				u)	uniq=1 ;;
+				m)	merge=1 ;;
+				c)	check=1 ;;
+				o|t|k)	if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "sort: option requires an argument -- $opt"
+						return 2
+					fi
+					case $opt in
+					o)	out=$val ;;
+					t)	_bt_sep=${val:0:1} ;;
+					k)	_bt_sort_addkey "$val" || return 2 ;;
+					esac ;;
+				*)	_bt_err "sort: illegal option -- $opt"
+					_bt_err "usage: sort [-m] [-o output] [-bdfinru] [-t char] [-k keydef]... [file...]"
+					return 2 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	[ "$uniq" = 1 ] && _bt_nolast=1
+	# With no -k the whole line is the key.
+	if [ "${#_bt_ksf[@]}" -eq 0 ]; then
+		_bt_ksf=(1); _bt_ksc=(1); _bt_kef=(0); _bt_kec=(0); _bt_kmod=("$gmods")
+	else
+		for (( i = 0; i < ${#_bt_kmod[@]}; i++ )); do
+			[ -n "${_bt_kmod[i]}" ] || _bt_kmod[i]=$gmods
+		done
+	fi
+
+	[ "$#" -eq 0 ] && set -- -
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			fd=0
+		elif [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_why "$file"
+			_bt_err "sort: $file: $_bt_reason"
+			return 2
+		fi
+		line=
+		while IFS= read -r line <&"$fd" || [ -n "$line" ]; do
+			lines+=("$line")
+			line=
+		done
+		[ "$fd" = 0 ] || exec {fd}<&-
+	done
+	n=${#lines[@]}
+
+	if [ "$check" = 1 ]; then
+		for (( i = 1; i < n; i++ )); do
+			if [ "$uniq" = 1 ]; then
+				_bt_sort_keycmp "${lines[i-1]}" "${lines[i]}"
+			else
+				_bt_sort_cmp "${lines[i-1]}" "${lines[i]}"
+			fi
+			if [ "$_bt_c" -gt 0 ] || { [ "$uniq" = 1 ] && [ "$_bt_c" -eq 0 ]; }; then
+				_bt_err "sort: $file:$(( i + 1 )): disorder: ${lines[i]}"
+				return 1
+			fi
+		done
+		return 0
+	fi
+
+	# bottom-up merge sort over an index array
+	for (( i = 0; i < n; i++ )); do idx[i]=$i; done
+	width=1
+	while [ "$width" -lt "$n" ]; do
+		i=0
+		while [ "$i" -lt "$n" ]; do
+			lo=$i
+			mid=$(( i + width )); [ "$mid" -gt "$n" ] && mid=$n
+			hi=$(( i + 2 * width )); [ "$hi" -gt "$n" ] && hi=$n
+			a=$lo b=$mid j=$lo
+			while [ "$a" -lt "$mid" ] && [ "$b" -lt "$hi" ]; do
+				_bt_sort_cmp "${lines[idx[a]]}" "${lines[idx[b]]}"
+				if [ "$_bt_c" -le 0 ]; then
+					tmp[j]=${idx[a]}; a=$(( a + 1 ))
+				else
+					tmp[j]=${idx[b]}; b=$(( b + 1 ))
+				fi
+				j=$(( j + 1 ))
+			done
+			while [ "$a" -lt "$mid" ]; do tmp[j]=${idx[a]}; a=$(( a + 1 )); j=$(( j + 1 )); done
+			while [ "$b" -lt "$hi" ]; do tmp[j]=${idx[b]}; b=$(( b + 1 )); j=$(( j + 1 )); done
+			i=$hi
+		done
+		for (( i = 0; i < n; i++ )); do idx[i]=${tmp[i]}; done
+		width=$(( width * 2 ))
+	done
+
+	if [ -n "$out" ]; then
+		if ! { exec {fd}>"$out"; } 2>/dev/null; then
+			_bt_err "sort: cannot create $out"
+			return 2
+		fi
+	else
+		fd=1
+	fi
+	prev=
+	for (( i = 0; i < n; i++ )); do
+		line=${lines[idx[i]]}
+		if [ "$uniq" = 1 ] && [ "$i" -gt 0 ]; then
+			_bt_sort_keycmp "$prev" "$line"
+			[ "$_bt_c" -eq 0 ] && continue
+		fi
+		printf '%s\n' "$line" >&"$fd"
+		prev=$line
+	done
+	[ -n "$out" ] && exec {fd}>&-
+	return "$status"
+}
+
+# Parse one -k keydef into the parallel key arrays.
+_bt_sort_addkey() {
+	local spec=$1 s e sf sc ef=0 ec=0 mods=
+	s=${spec%%,*}
+	case $spec in
+	*,*)	e=${spec#*,} ;;
+	*)	e= ;;
+	esac
+	sf=${s%%[!0-9]*}
+	[ -n "$sf" ] || { _bt_err "sort: invalid key: $spec"; return 1; }
+	s=${s#"$sf"}
+	sc=1
+	case $s in
+	.*)	s=${s#.}
+		sc=${s%%[!0-9]*}
+		s=${s#"$sc"}
+		[ -n "$sc" ] || sc=1 ;;
+	esac
+	mods=$mods$s
+	if [ -n "$e" ]; then
+		ef=${e%%[!0-9]*}
+		[ -n "$ef" ] || { _bt_err "sort: invalid key: $spec"; return 1; }
+		e=${e#"$ef"}
+		case $e in
+		.*)	e=${e#.}
+			ec=${e%%[!0-9]*}
+			e=${e#"$ec"}
+			[ -n "$ec" ] || ec=0 ;;
+		esac
+		mods=$mods$e
+	fi
+	# Only the ordering options are valid inside a key definition.
+	case $mods in
+	*[!bdfinr]*)	_bt_err "sort: invalid key modifier in: $spec"; return 1 ;;
+	esac
+	_bt_ksf+=("$sf"); _bt_ksc+=("$sc"); _bt_kef+=("$ef"); _bt_kec+=("$ec")
+	_bt_kmod+=("$mods")
+	return 0
+}
