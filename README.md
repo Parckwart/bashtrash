@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-81 of the 160 utilities in POSIX.1-2017, as of now.
+82 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -132,6 +132,7 @@ Run the test suite with:
 | `who` | `who [-mTu] [file]` |
 | `write` | `write user_name [terminal]` |
 | `xargs` | `xargs [-t] [-E eof] [-I repl] [-L n] [-n n] [-s size] [utility [arg...]]` |
+| `yacc` | `yacc [-dltv] [-b file_prefix] [-p sym_prefix] grammar` |
 | `zcat` | `zcat [file...]` |
 
 Including the parts that are easy to forget: `--` ends the options and a lone
@@ -231,6 +232,20 @@ declarations in between allowed, which is what tells a definition from a
 declaration. Braces inside strings and comments are counted by nobody, and
 the tag `main` is written out as `M` and the file's name, as the standard
 asks.
+
+**`yacc` works out the lookaheads the hard way.** The LR(0) machine of item
+sets comes first; what makes it LALR(1) is knowing which token can follow each
+item, and that is settled in the two steps the textbooks give: a closure with
+a marker lookahead says which lookaheads a state generates on its own and
+which it hands on to another state, and then the handing-on is run to a
+standstill over a worklist. Conflicts are settled the way yacc settles them --
+precedence and associativity where a rule and a token both have them, the
+shift otherwise, and the rule written first when two reductions collide -- and
+the counts are reported. A state whose only move is one reduction takes it
+without reading a token, which is why the actions of a rule can run before an
+error further along is noticed, exactly as they do with the real yacc. The
+grammar of C itself, all 215 rules of it, comes out in about ten seconds with
+the one shift/reduce conflict everybody's yacc reports for it.
 
 **`lex` builds a machine and writes it out as C.** Each rule's regular
 expression becomes a machine by Thompson's construction -- a state for every
@@ -347,18 +362,19 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 81 |
+| implemented here | 82 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **52** |
-| reachable, not yet written | 5 |
+| reachable, not yet written | 4 |
 
 **The ceiling is 86 of 160**, or about 54% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 5 that remain are wildly uneven. `yacc` is a compiler whose output is C,
-`localedef` compiles locales into a binary nobody has written down, and `sh`
-would be a shell written in a shell.
+The 4 that remain are `localedef`, which compiles locales into a binary
+nobody has written down, `mailx`, which has to hand a message to a mailer,
+`man`, which has to find and set pages nobody here has, and `sh`, which would
+be a shell written in a shell.
 
 ### Smaller deviations, all deliberate
 
@@ -406,6 +422,12 @@ would be a shell written in a shell.
   does and not what mawk does; a `printf` given fewer arguments than
   conversions treats the missing ones as empty, as the standard says, rather
   than stopping.
+* `yacc` writes the tables out in full -- a row for every state and a column
+  for every token -- where the real yacc packs them into overlapping arrays.
+  The parser it writes is the same parser; the file is just bigger. There is
+  no yacc library to link against, so a grammar has to bring its own `main`
+  and `yyerror`, as it would with `-l y` on a system that has one, and `-l`
+  is accepted with nothing to do since no `#line` is ever written.
 * `lex` writes a scanner that reads all of its input into memory rather than
   through a sliding window, which is what makes `unput` and `yyless` simple
   and what would make it a poor choice for a stream that never ends. There is

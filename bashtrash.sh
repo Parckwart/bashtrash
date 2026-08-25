@@ -21420,3 +21420,1441 @@ _bt_lex_stats() {
 	printf '%d/%d transitions\n' "$(( _lx_dn * (_lx_ncls - 1) ))" "$(( _lx_dn * (_lx_ncls - 1) ))"
 	return 0
 }
+
+# ---------------------------------------------------------------------------
+# yacc -- POSIX.1-2017:  yacc [-dltv] [-b file_prefix] [-p sym_prefix] grammar
+#
+# A parser generator.  The grammar is read, the LR(0) machine of item sets is
+# built out of it, the lookaheads that make it LALR(1) are worked out by the
+# usual two step -- which ones are generated where, and which ones are handed
+# on from one item to another -- and the tables that come out of that are
+# written as C together with a parser that runs them.
+# ---------------------------------------------------------------------------
+
+# The number of the symbol $1, making it if it is new.  $2 says whether it is
+# known to be a terminal.
+_bt_yacc_sym() {
+	local name=$1
+	if [ -n "${_yc_symid[$name]+x}" ]; then
+		_yc_s=${_yc_symid[$name]}
+		[ "${2-}" = t ] && _yc_isterm[_yc_s]=1
+		return 0
+	fi
+	_yc_s=$_yc_nsym
+	_yc_symid[$name]=$_yc_s
+	_yc_symname[_yc_s]=$name
+	if [ "${2-}" = t ]; then _yc_isterm[_yc_s]=1; else _yc_isterm[_yc_s]=0; fi
+	_yc_prec[_yc_s]=0
+	_yc_assoc[_yc_s]=
+	_yc_code[_yc_s]=-1
+	_yc_tag[_yc_s]=
+	_yc_nsym=$(( _yc_nsym + 1 ))
+	return 0
+}
+
+# The next token of the grammar file, into _yc_tk (kind) and _yc_tv (text).
+# Kinds: name, lit, pct (a % word), punct, code (a { } block), end.
+_bt_yacc_next() {
+	local c d n=${#_yc_txt} depth
+	while [ "$_yc_i" -lt "$n" ]; do
+		c=${_yc_txt:_yc_i:1}
+		case $c in
+		' '|$'\t'|$'\n'|$'\f'|$'\r')	_yc_i=$(( _yc_i + 1 )); continue ;;
+		'/')	if [ "${_yc_txt:_yc_i+1:1}" = '*' ]; then
+				_yc_i=$(( _yc_i + 2 ))
+				while [ "$_yc_i" -lt "$n" ]; do
+					if [ "${_yc_txt:_yc_i:2}" = '*/' ]; then
+						_yc_i=$(( _yc_i + 2 ))
+						break
+					fi
+					_yc_i=$(( _yc_i + 1 ))
+				done
+				continue
+			fi
+			if [ "${_yc_txt:_yc_i+1:1}" = '/' ]; then
+				while [ "$_yc_i" -lt "$n" ] && [ "${_yc_txt:_yc_i:1}" != $'\n' ]; do
+					_yc_i=$(( _yc_i + 1 ))
+				done
+				continue
+			fi ;;
+		esac
+		break
+	done
+	if [ "$_yc_i" -ge "$n" ]; then
+		_yc_tk=end
+		_yc_tv=
+		return 0
+	fi
+	c=${_yc_txt:_yc_i:1}
+	case $c in
+	[A-Za-z_.])
+		_yc_tv=
+		while [ "$_yc_i" -lt "$n" ]; do
+			d=${_yc_txt:_yc_i:1}
+			case $d in
+			[A-Za-z0-9_.])	_yc_tv=$_yc_tv$d; _yc_i=$(( _yc_i + 1 )) ;;
+			*)		break ;;
+			esac
+		done
+		_yc_tk=name
+		return 0 ;;
+	[0-9])	_yc_tv=
+		while [ "$_yc_i" -lt "$n" ]; do
+			d=${_yc_txt:_yc_i:1}
+			case $d in
+			[0-9])	_yc_tv=$_yc_tv$d; _yc_i=$(( _yc_i + 1 )) ;;
+			*)	break ;;
+			esac
+		done
+		_yc_tk=num
+		return 0 ;;
+	"'")	# a literal character, kept as it was written
+		_yc_tv="'"
+		_yc_i=$(( _yc_i + 1 ))
+		while [ "$_yc_i" -lt "$n" ]; do
+			d=${_yc_txt:_yc_i:1}
+			if [ "$d" = '\' ]; then
+				_yc_tv=$_yc_tv${_yc_txt:_yc_i:2}
+				_yc_i=$(( _yc_i + 2 ))
+				continue
+			fi
+			_yc_tv=$_yc_tv$d
+			_yc_i=$(( _yc_i + 1 ))
+			[ "$d" = "'" ] && break
+		done
+		_yc_tk=lit
+		return 0 ;;
+	'"')	_yc_tv='"'
+		_yc_i=$(( _yc_i + 1 ))
+		while [ "$_yc_i" -lt "$n" ]; do
+			d=${_yc_txt:_yc_i:1}
+			if [ "$d" = '\' ]; then
+				_yc_tv=$_yc_tv${_yc_txt:_yc_i:2}
+				_yc_i=$(( _yc_i + 2 ))
+				continue
+			fi
+			_yc_tv=$_yc_tv$d
+			_yc_i=$(( _yc_i + 1 ))
+			[ "$d" = '"' ] && break
+		done
+		_yc_tk=str
+		return 0 ;;
+	'%')	if [ "${_yc_txt:_yc_i+1:1}" = '%' ]; then
+			_yc_tk=pct
+			_yc_tv='%%'
+			_yc_i=$(( _yc_i + 2 ))
+			return 0
+		fi
+		if [ "${_yc_txt:_yc_i+1:1}" = '{' ]; then
+			_yc_tk=pct
+			_yc_tv='%{'
+			_yc_i=$(( _yc_i + 2 ))
+			return 0
+		fi
+		_yc_tv='%'
+		_yc_i=$(( _yc_i + 1 ))
+		while [ "$_yc_i" -lt "$n" ]; do
+			d=${_yc_txt:_yc_i:1}
+			case $d in
+			[A-Za-z0-9_])	_yc_tv=$_yc_tv$d; _yc_i=$(( _yc_i + 1 )) ;;
+			*)		break ;;
+			esac
+		done
+		_yc_tk=pct
+		return 0 ;;
+	'{')	# an action, brackets and all
+		depth=0
+		_yc_tv=
+		_bt_yacc_block
+		_yc_tk=code
+		return 0 ;;
+	esac
+	_yc_tk=punct
+	_yc_tv=$c
+	_yc_i=$(( _yc_i + 1 ))
+	return 0
+}
+
+# Read a { } block, strings and comments and all, into _yc_tv.
+_bt_yacc_block() {
+	local n=${#_yc_txt} depth=0 c d
+	_yc_tv=
+	while [ "$_yc_i" -lt "$n" ]; do
+		c=${_yc_txt:_yc_i:1}
+		case $c in
+		'/')	if [ "${_yc_txt:_yc_i+1:1}" = '*' ]; then
+				_yc_tv=$_yc_tv'/*'
+				_yc_i=$(( _yc_i + 2 ))
+				while [ "$_yc_i" -lt "$n" ]; do
+					if [ "${_yc_txt:_yc_i:2}" = '*/' ]; then
+						_yc_tv=$_yc_tv'*/'
+						_yc_i=$(( _yc_i + 2 ))
+						break
+					fi
+					_yc_tv=$_yc_tv${_yc_txt:_yc_i:1}
+					_yc_i=$(( _yc_i + 1 ))
+				done
+				continue
+			fi ;;
+		"'"|'"')
+			d=$c
+			_yc_tv=$_yc_tv$c
+			_yc_i=$(( _yc_i + 1 ))
+			while [ "$_yc_i" -lt "$n" ]; do
+				c=${_yc_txt:_yc_i:1}
+				if [ "$c" = '\' ]; then
+					_yc_tv=$_yc_tv${_yc_txt:_yc_i:2}
+					_yc_i=$(( _yc_i + 2 ))
+					continue
+				fi
+				_yc_tv=$_yc_tv$c
+				_yc_i=$(( _yc_i + 1 ))
+				[ "$c" = "$d" ] && break
+			done
+			continue ;;
+		'{')	depth=$(( depth + 1 )) ;;
+		'}')	depth=$(( depth - 1 ))
+			if [ "$depth" = 0 ]; then
+				_yc_tv=$_yc_tv'}'
+				_yc_i=$(( _yc_i + 1 ))
+				return 0
+			fi ;;
+		esac
+		_yc_tv=$_yc_tv$c
+		_yc_i=$(( _yc_i + 1 ))
+	done
+	return 0
+}
+
+# The value of a literal like 'a' or '\n'.
+_bt_yacc_litval() {
+	local s=$1 c
+	s=${s#\'}
+	s=${s%\'}
+	if [ "${s:0:1}" = '\' ]; then
+		c=${s:1}
+		case $c in
+		n)	_yc_v=10 ;;
+		t)	_yc_v=9 ;;
+		r)	_yc_v=13 ;;
+		f)	_yc_v=12 ;;
+		v)	_yc_v=11 ;;
+		b)	_yc_v=8 ;;
+		a)	_yc_v=7 ;;
+		'\')	_yc_v=92 ;;
+		"'")	_yc_v=39 ;;
+		'"')	_yc_v=34 ;;
+		'?')	_yc_v=63 ;;
+		[0-7]*)	_yc_v=$(( 8#$c )) ;;
+		*)	printf -v _yc_v '%d' "'${c:0:1}" ;;
+		esac
+	else
+		printf -v _yc_v '%d' "'${s:0:1}"
+	fi
+	return 0
+}
+
+# Read the declarations and the rules.
+_bt_yacc_parse() {
+	local tag= level=0 name num lhs rhs act prec i s j mid
+	local -a rhslist=()
+	# the symbols every grammar has
+	_bt_yacc_sym '$end' t
+	_yc_code[_yc_s]=0
+	_bt_yacc_sym error t
+	_yc_code[_yc_s]=256
+	_bt_yacc_sym '$undefined' t
+	_yc_code[_yc_s]=2
+
+	_yc_i=0
+	# the declarations
+	while :; do
+		_bt_yacc_next
+		case $_yc_tk in
+		end)	break ;;
+		pct)	case $_yc_tv in
+			'%%')	break ;;
+			'%{')	# raw C up to %}
+				j=$_yc_i
+				while [ "$j" -lt "${#_yc_txt}" ]; do
+					if [ "${_yc_txt:j:2}" = '%}' ]; then break; fi
+					j=$(( j + 1 ))
+				done
+				_yc_decl=$_yc_decl${_yc_txt:_yc_i:j-_yc_i}
+				_yc_i=$(( j + 2 ))
+				continue ;;
+			'%union')
+				_bt_yacc_next
+				_yc_union=$_yc_tv
+				continue ;;
+			'%token'|'%left'|'%right'|'%nonassoc'|'%type')
+				name=$_yc_tv
+				tag=
+				case $name in
+				'%left'|'%right'|'%nonassoc')	level=$(( level + 1 )) ;;
+				esac
+				while :; do
+					j=$_yc_i
+					_bt_yacc_next
+					case $_yc_tk in
+					punct)	if [ "$_yc_tv" = '<' ]; then
+							_bt_yacc_next
+							tag=$_yc_tv
+							_bt_yacc_next
+							continue
+						fi
+						_yc_i=$j
+						break ;;
+					name)	if [ "$name" = '%type' ]; then
+							_bt_yacc_sym "$_yc_tv"
+						else
+							_bt_yacc_sym "$_yc_tv" t
+							[ "${_yc_code[_yc_s]}" = -1 ] && {
+								_yc_code[_yc_s]=$_yc_ntok
+								_yc_ntok=$(( _yc_ntok + 1 ))
+							}
+						fi
+						s=$_yc_s
+						[ -n "$tag" ] && _yc_tag[s]=$tag
+						case $name in
+						'%left')	_yc_prec[s]=$level; _yc_assoc[s]=l ;;
+						'%right')	_yc_prec[s]=$level; _yc_assoc[s]=r ;;
+						'%nonassoc')	_yc_prec[s]=$level; _yc_assoc[s]=n ;;
+						esac
+						# a number after a token name sets its code
+						j=$_yc_i
+						_bt_yacc_next
+						if [ "$_yc_tk" = num ]; then
+							_yc_code[s]=$_yc_tv
+						else
+							_yc_i=$j
+						fi
+						continue ;;
+					lit)	_bt_yacc_litval "$_yc_tv"
+						_bt_yacc_sym "$_yc_tv" t
+						_yc_code[_yc_s]=$_yc_v
+						s=$_yc_s
+						case $name in
+						'%left')	_yc_prec[s]=$level; _yc_assoc[s]=l ;;
+						'%right')	_yc_prec[s]=$level; _yc_assoc[s]=r ;;
+						'%nonassoc')	_yc_prec[s]=$level; _yc_assoc[s]=n ;;
+						esac
+						continue ;;
+					*)	_yc_i=$j
+						break ;;
+					esac
+				done
+				continue ;;
+			'%start')
+				_bt_yacc_next
+				_yc_start=$_yc_tv
+				continue ;;
+			'%expect'|'%pure_parser'|'%debug')
+				continue ;;
+			*)	_bt_err "yacc: unknown declaration $_yc_tv"
+				continue ;;
+			esac ;;
+		*)	_bt_err "yacc: unexpected $_yc_tv in the declarations"
+			continue ;;
+		esac
+	done
+
+	# the rules
+	lhs=
+	while :; do
+		j=$_yc_i
+		_bt_yacc_next
+		case $_yc_tk in
+		end)	break ;;
+		pct)	if [ "$_yc_tv" = '%%' ]; then
+				_yc_progs=${_yc_txt:_yc_i}
+				break
+			fi
+			_bt_err "yacc: unexpected $_yc_tv in the rules"
+			continue ;;
+		name)	name=$_yc_tv
+			j=$_yc_i
+			_bt_yacc_next
+			if [ "$_yc_tk" = punct ] && [ "$_yc_tv" = ':' ]; then
+				_bt_yacc_sym "$name"
+				lhs=$_yc_s
+				[ -z "$_yc_firstlhs" ] && _yc_firstlhs=$name
+				_bt_yacc_rhs "$lhs"
+				continue
+			fi
+			_bt_err "yacc: rule for $name has no colon"
+			_yc_i=$j
+			continue ;;
+		*)	_bt_err "yacc: unexpected ${_yc_tv:-end of file} in the rules"
+			continue ;;
+		esac
+	done
+	return 0
+}
+
+# The right hand sides of the rule whose left hand side is $1.
+_bt_yacc_rhs() {
+	local lhs=$1 rhs= act= prec=0 j s n mid
+	while :; do
+		j=$_yc_i
+		_bt_yacc_next
+		case $_yc_tk in
+		name)	_bt_yacc_sym "$_yc_tv"
+			s=$_yc_s
+			# an action that is not the last thing becomes a rule of
+			# its own, so that it runs where it was written
+			if [ -n "$act" ]; then
+				_bt_yacc_mid "$act" "$rhs"
+				rhs="$rhs $_yc_s"
+				act=
+			fi
+			rhs="$rhs $s"
+			continue ;;
+		lit)	_bt_yacc_litval "$_yc_tv"
+			_bt_yacc_sym "$_yc_tv" t
+			[ "${_yc_code[_yc_s]}" = -1 ] && _yc_code[_yc_s]=$_yc_v
+			s=$_yc_s
+			if [ -n "$act" ]; then
+				_bt_yacc_mid "$act" "$rhs"
+				rhs="$rhs $_yc_s"
+				act=
+			fi
+			rhs="$rhs $s"
+			prec=$s
+			continue ;;
+		code)	if [ -n "$act" ]; then
+				_bt_yacc_mid "$act" "$rhs"
+				rhs="$rhs $_yc_s"
+			fi
+			act=$_yc_tv
+			continue ;;
+		pct)	case $_yc_tv in
+			'%prec')
+				_bt_yacc_next
+				if [ "$_yc_tk" = lit ]; then
+					_bt_yacc_litval "$_yc_tv"
+					_bt_yacc_sym "$_yc_tv" t
+				else
+					_bt_yacc_sym "$_yc_tv" t
+				fi
+				prec=$_yc_s
+				continue ;;
+			'%%')	_yc_i=$j
+				break ;;
+			esac
+			_yc_i=$j
+			break ;;
+		punct)	case $_yc_tv in
+			'|')	_bt_yacc_add "$lhs" "$rhs" "$act" "$prec"
+				rhs= act= prec=0
+				continue ;;
+			';')	_bt_yacc_add "$lhs" "$rhs" "$act" "$prec"
+				return 0 ;;
+			esac
+			_bt_err "yacc: unexpected $_yc_tv in a rule"
+			continue ;;
+		end)	break ;;
+		esac
+		# a name followed by a colon starts the next rule
+		break
+	done
+	_bt_yacc_add "$lhs" "$rhs" "$act" "$prec"
+	_yc_i=$j
+	return 0
+}
+
+# Add the production $1 -> $2 with action $3 and precedence from $4.
+_bt_yacc_add() {
+	local lhs=$1 rhs=$2 act=$3 prec=$4 s last=0
+	_yc_np=$(( _yc_np + 1 ))
+	_yc_plhs[_yc_np]=$lhs
+	_yc_prhs[_yc_np]=${rhs# }
+	_yc_pact[_yc_np]=$act
+	if [ "$prec" != 0 ]; then
+		_yc_pprec[_yc_np]=${_yc_prec[prec]}
+		_yc_passoc[_yc_np]=${_yc_assoc[prec]}
+	else
+		# otherwise the precedence of the last terminal in the rule
+		for s in $rhs; do
+			[ "${_yc_isterm[s]}" = 1 ] && last=$s
+		done
+		if [ "$last" != 0 ]; then
+			_yc_pprec[_yc_np]=${_yc_prec[last]}
+			_yc_passoc[_yc_np]=${_yc_assoc[last]}
+		else
+			_yc_pprec[_yc_np]=0
+			_yc_passoc[_yc_np]=
+		fi
+	fi
+	_yc_prods[$lhs]="${_yc_prods[$lhs]-} $_yc_np"
+	return 0
+}
+
+# An action in the middle of a rule becomes an empty rule of its own.
+_bt_yacc_mid() {
+	local act=$1 sofar=$2 name
+	_yc_nmid=$(( _yc_nmid + 1 ))
+	name="\$@$_yc_nmid"
+	_bt_yacc_sym "$name"
+	set -- $sofar
+	_yc_midlen[_yc_s]=$#
+	_bt_yacc_add "$_yc_s" '' "$act" 0
+	_yc_s=${_yc_symid[$name]}
+	return 0
+}
+
+# Which symbols can begin what, and which can vanish altogether.
+_bt_yacc_first() {
+	local changed=1 p s t first rest sym n i
+	for (( s = 0; s < _yc_nsym; s++ )); do
+		if [ "${_yc_isterm[s]}" = 1 ]; then
+			_yc_first[s]=" $s "
+			_yc_null[s]=0
+		else
+			_yc_first[s]=' '
+			_yc_null[s]=0
+		fi
+	done
+	while [ "$changed" = 1 ]; do
+		changed=0
+		for (( p = 1; p <= _yc_np; p++ )); do
+			s=${_yc_plhs[p]}
+			n=0
+			for sym in ${_yc_prhs[p]}; do
+				n=1
+				for t in ${_yc_first[sym]}; do
+					case ${_yc_first[s]} in
+					*" $t "*)	continue ;;
+					esac
+					_yc_first[s]="${_yc_first[s]}$t "
+					changed=1
+				done
+				[ "${_yc_null[sym]}" = 1 ] || break
+			done
+			if [ "$n" = 0 ] || _bt_yacc_allnull "${_yc_prhs[p]}"; then
+				if [ "${_yc_null[s]}" = 0 ]; then
+					_yc_null[s]=1
+					changed=1
+				fi
+			fi
+		done
+	done
+	return 0
+}
+
+# Can every symbol in $1 vanish?
+_bt_yacc_allnull() {
+	local sym
+	for sym in $1; do
+		[ "${_yc_null[sym]}" = 1 ] || return 1
+	done
+	return 0
+}
+
+# What can begin the string of symbols $1 followed by the terminal $2, into
+# _yc_set.
+_bt_yacc_firstof() {
+	local sym t out=' ' allnull=1
+	for sym in $1; do
+		for t in ${_yc_first[sym]}; do
+			case $out in
+			*" $t "*)	continue ;;
+			esac
+			out=$out$t' '
+		done
+		if [ "${_yc_null[sym]}" = 0 ]; then
+			allnull=0
+			break
+		fi
+	done
+	if [ "$allnull" = 1 ] && [ -n "$2" ]; then
+		case $out in
+		*" $2 "*)	;;
+		*)		out=$out$2' ' ;;
+		esac
+	fi
+	_yc_set=$out
+	return 0
+}
+
+# Write down, once, what follows every position of every production, so that
+# walking an item is a lookup rather than a loop.
+_bt_yacc_index() {
+	local p i sym tail
+	local -a syms=()
+	for (( p = 0; p <= _yc_np; p++ )); do
+		syms=(${_yc_prhs[p]})
+		_yc_plen[p]=${#syms[@]}
+		for (( i = 0; i < ${#syms[@]}; i++ )); do
+			_yc_psym[$p,$i]=${syms[i]}
+		done
+		tail=
+		_yc_ptail[$p,${#syms[@]}]=
+		for (( i = ${#syms[@]} - 1; i >= 0; i-- )); do
+			_yc_ptail[$p,$i]=$tail
+			tail="${syms[i]} $tail"
+		done
+	done
+	return 0
+}
+
+# The symbol after the dot of item $1 (written p.d), into _yc_dotsym; -1 when
+# the dot is at the end.  The rest after it goes into _yc_rest.
+_bt_yacc_dot() {
+	local p=${1%%.*} d=${1#*.}
+	_yc_dotsym=${_yc_psym[$p,$d]--1}
+	_yc_rest=${_yc_ptail[$p,$d]-}
+	return 0
+}
+
+# The LR(0) closure of the items in $1, into _yc_close.
+_bt_yacc_closure0() {
+	local -a stack=()
+	local -A in=()
+	local it i p q sym
+	for it in $1; do
+		[ -n "${in[$it]+x}" ] && continue
+		in[$it]=1
+		stack+=("$it")
+	done
+	i=0
+	while [ "$i" -lt "${#stack[@]}" ]; do
+		it=${stack[i]}
+		i=$(( i + 1 ))
+		_bt_yacc_dot "$it"
+		[ "$_yc_dotsym" = -1 ] && continue
+		[ "${_yc_isterm[_yc_dotsym]}" = 1 ] && continue
+		for q in ${_yc_prods[$_yc_dotsym]-}; do
+			[ -n "${in[$q.0]+x}" ] && continue
+			in[$q.0]=1
+			stack+=("$q.0")
+		done
+	done
+	_yc_close=${stack[*]}
+	return 0
+}
+
+# Sort the items in $1 so that a set of them always looks the same, into
+# _yc_key.
+_bt_yacc_sortitems() {
+	local -a a=()
+	local x i j tmp
+	for x in $1; do a+=("$x"); done
+	for (( i = 1; i < ${#a[@]}; i++ )); do
+		tmp=${a[i]}
+		j=$(( i - 1 ))
+		while [ "$j" -ge 0 ] &&
+		      [ $(( ${a[j]%%.*} * 1000 + ${a[j]#*.} )) -gt $(( ${tmp%%.*} * 1000 + ${tmp#*.} )) ]; do
+			a[j+1]=${a[j]}
+			j=$(( j - 1 ))
+		done
+		a[j+1]=$tmp
+	done
+	_yc_key=${a[*]-}
+	return 0
+}
+
+# The state whose kernel is $1, making it if it is new; its number in _yc_st.
+_bt_yacc_state() {
+	_bt_yacc_sortitems "$1"
+	if [ -n "${_yc_stid[k$_yc_key]+x}" ]; then
+		_yc_st=${_yc_stid[k$_yc_key]}
+		return 0
+	fi
+	_yc_st=$_yc_ns
+	_yc_stid[k$_yc_key]=$_yc_st
+	_yc_kernel[_yc_st]=$_yc_key
+	_bt_yacc_closure0 "$_yc_key"
+	_yc_items[_yc_st]=$_yc_close
+	_yc_ns=$(( _yc_ns + 1 ))
+	_yc_todo+=("$_yc_st")
+	return 0
+}
+
+# Build the machine of item sets.
+_bt_yacc_build() {
+	local i s it sym next d p
+	local -A moves=()
+	_yc_ns=0
+	_yc_todo=()
+	_bt_yacc_state '0.0'
+	i=0
+	while [ "$i" -lt "${#_yc_todo[@]}" ]; do
+		s=${_yc_todo[i]}
+		i=$(( i + 1 ))
+		moves=()
+		for it in ${_yc_items[s]}; do
+			_bt_yacc_dot "$it"
+			[ "$_yc_dotsym" = -1 ] && continue
+			p=${it%%.*}
+			d=${it#*.}
+			moves[$_yc_dotsym]="${moves[$_yc_dotsym]-} $p.$(( d + 1 ))"
+		done
+		for sym in "${!moves[@]}"; do
+			_bt_yacc_state "${moves[$sym]}"
+			_yc_gotos[$s,$sym]=$_yc_st
+			_yc_gsyms[$s]="${_yc_gsyms[$s]-} $sym"
+		done
+	done
+	return 0
+}
+
+# The LR(1) closure of the item $1 with each of the lookaheads in $2, into
+# _yc_c1 as a list of item:lookahead pairs.
+_bt_yacc_closure1() {
+	local -a stack=()
+	local -A in=()
+	local i=0 it la p q b
+	for la in $2; do
+		[ -n "${in[$1:$la]+x}" ] && continue
+		in[$1:$la]=1
+		stack+=("$1:$la")
+	done
+	while [ "$i" -lt "${#stack[@]}" ]; do
+		it=${stack[i]%:*}
+		la=${stack[i]##*:}
+		i=$(( i + 1 ))
+		_bt_yacc_dot "$it"
+		[ "$_yc_dotsym" = -1 ] && continue
+		[ "${_yc_isterm[_yc_dotsym]}" = 1 ] && continue
+		_bt_yacc_firstof "$_yc_rest" "$la"
+		for b in $_yc_set; do
+			for q in ${_yc_prods[$_yc_dotsym]-}; do
+				[ -n "${in[$q.0:$b]+x}" ] && continue
+				in[$q.0:$b]=1
+				stack+=("$q.0:$b")
+			done
+		done
+	done
+	_yc_c1=${stack[*]}
+	return 0
+}
+
+# Work out the lookaheads that make the machine LALR(1): which are generated
+# where, and which are handed on from one item to another.
+_bt_yacc_lalr() {
+	local s it la p d sym t it2 x target changed b key need
+	local -a queue=()
+	local qi=0
+	for (( s = 0; s < _yc_ns; s++ )); do
+		for it in ${_yc_kernel[s]}; do
+			_yc_lah[$s,$it]=' '
+			_yc_prop[$s,$it]=
+		done
+	done
+	_yc_lah[0,0.0]=' 0 '
+	for (( s = 0; s < _yc_ns; s++ )); do
+		for it in ${_yc_kernel[s]}; do
+			_bt_yacc_closure1 "$it" '#'
+			for x in $_yc_c1; do
+				la=${x##*:}
+				it2=${x%:*}
+				_bt_yacc_dot "$it2"
+				[ "$_yc_dotsym" = -1 ] && continue
+				t=${_yc_gotos[$s,$_yc_dotsym]-}
+				[ -z "$t" ] && continue
+				p=${it2%%.*}
+				d=${it2#*.}
+				target="$t,$p.$(( d + 1 ))"
+				if [ "$la" = '#' ]; then
+					case " ${_yc_prop[$s,$it]} " in
+					*" $target "*)	;;
+					*)	_yc_prop[$s,$it]="${_yc_prop[$s,$it]} $target" ;;
+					esac
+				else
+					case ${_yc_lah[$target]-' '} in
+					*" $la "*)	;;
+					*)	_yc_lah[$target]="${_yc_lah[$target]- } $la " ;;
+					esac
+				fi
+			done
+		done
+	done
+	# hand the lookaheads on until nothing moves
+	for (( s = 0; s < _yc_ns; s++ )); do
+		for it in ${_yc_kernel[s]}; do
+			[ -n "${_yc_prop[$s,$it]}" ] && queue+=("$s,$it")
+		done
+	done
+	while [ "$qi" -lt "${#queue[@]}" ]; do
+		key=${queue[qi]}
+		qi=$(( qi + 1 ))
+		for target in ${_yc_prop[$key]}; do
+			changed=0
+			for la in ${_yc_lah[$key]}; do
+				case ${_yc_lah[$target]-' '} in
+				*" $la "*)	continue ;;
+				esac
+				_yc_lah[$target]="${_yc_lah[$target]- } $la "
+				changed=1
+			done
+			if [ "$changed" = 1 ] && [ -n "${_yc_prop[$target]-}" ]; then
+				queue+=("$target")
+			fi
+		done
+	done
+	# a completed item that is not in the kernel can only be an empty rule,
+	# so the closure is only needed in the states that hold one
+	for (( s = 0; s < _yc_ns; s++ )); do
+		need=0
+		for it in ${_yc_items[s]}; do
+			case " ${_yc_kernel[s]} " in
+			*" $it "*)	continue ;;
+			esac
+			_bt_yacc_dot "$it"
+			if [ "$_yc_dotsym" = -1 ]; then
+				need=1
+				break
+			fi
+		done
+		[ "$need" = 0 ] && continue
+		for it in ${_yc_kernel[s]}; do
+			_bt_yacc_closure1 "$it" "${_yc_lah[$s,$it]}"
+			for x in $_yc_c1; do
+				b=${x##*:}
+				it2=${x%:*}
+				[ "$b" = '#' ] && continue
+				case ${_yc_ila[$s,$it2]-' '} in
+				*" $b "*)	continue ;;
+				esac
+				_yc_ila[$s,$it2]="${_yc_ila[$s,$it2]- } $b "
+			done
+		done
+	done
+	return 0
+}
+
+# Fill in the tables, settling the arguments as yacc settles them.
+_bt_yacc_tables() {
+	local s it sym t p d la i j idx old act key las
+	_yc_srconf=0
+	_yc_rrconf=0
+	# columns for the terminals, and rows for everything
+	_yc_nterm=0
+	_yc_nnonterm=0
+	for (( i = 0; i < _yc_nsym; i++ )); do
+		if [ "${_yc_isterm[i]}" = 1 ]; then
+			_yc_tindex[i]=$_yc_nterm
+			_yc_termsym[_yc_nterm]=$i
+			_yc_nterm=$(( _yc_nterm + 1 ))
+		else
+			_yc_nindex[i]=$_yc_nnonterm
+			_yc_nonsym[_yc_nnonterm]=$i
+			_yc_nnonterm=$(( _yc_nnonterm + 1 ))
+		fi
+	done
+	for (( s = 0; s < _yc_ns; s++ )); do
+		for (( i = 0; i < _yc_nterm; i++ )); do
+			_yc_act[s * _yc_nterm + i]=0
+		done
+		for (( i = 0; i < _yc_nnonterm; i++ )); do
+			_yc_gt[s * _yc_nnonterm + i]=0
+		done
+	done
+	for (( s = 0; s < _yc_ns; s++ )); do
+		# shifts and gotos
+		for sym in ${_yc_gsyms[$s]-}; do
+			t=${_yc_gotos[$s,$sym]}
+			if [ "${_yc_isterm[sym]}" = 1 ]; then
+				_yc_act[s * _yc_nterm + _yc_tindex[sym]]=$(( t + 1 ))
+			else
+				_yc_gt[s * _yc_nnonterm + _yc_nindex[sym]]=$(( t + 1 ))
+			fi
+		done
+		# reductions
+		for it in ${_yc_items[s]}; do
+			_bt_yacc_dot "$it"
+			[ "$_yc_dotsym" = -1 ] || continue
+			p=${it%%.*}
+			[ "$p" = 0 ] && continue
+			case " ${_yc_kernel[s]} " in
+			*" $it "*)	las=${_yc_lah[$s,$it]-} ;;
+			*)		las=${_yc_ila[$s,$it]-} ;;
+			esac
+			for la in $las; do
+				[ "$la" = '#' ] && continue
+				idx=$(( s * _yc_nterm + _yc_tindex[la] ))
+				old=${_yc_act[idx]}
+				if [ "$old" = 0 ]; then
+					_yc_act[idx]=$(( -p ))
+					continue
+				fi
+				if [ "$old" -gt 0 ]; then
+					_bt_yacc_srconflict "$s" "$la" "$p" "$idx"
+					continue
+				fi
+				# two reductions: the rule written first wins
+				if [ "$p" -lt $(( -old )) ]; then
+					_yc_act[idx]=$(( -p ))
+				fi
+				_yc_rrconf=$(( _yc_rrconf + 1 ))
+			done
+		done
+		# accepting: the dot sits in front of the end marker
+		case " ${_yc_items[s]} " in
+		*' 0.1 '*)	_yc_act[s * _yc_nterm + _yc_tindex[0]]=$_YC_ACCEPT ;;
+		esac
+	done
+	# a state with nothing to do but one reduction does it without looking
+	# at the next token, which is what every yacc does and what lets the
+	# actions of a rule run before an error further on is noticed
+	for (( s = 0; s < _yc_ns; s++ )); do
+		_yc_defact[s]=0
+		p=0
+		i=0
+		while [ "$i" -lt "$_yc_nterm" ]; do
+			la=${_yc_act[s * _yc_nterm + i]}
+			i=$(( i + 1 ))
+			[ "$la" = 0 ] && continue
+			if [ "$la" -gt 0 ]; then
+				p=0
+				break
+			fi
+			if [ "$p" = 0 ]; then
+				p=$(( -la ))
+			elif [ "$p" != $(( -la )) ]; then
+				p=0
+				break
+			fi
+		done
+		_yc_defact[s]=$p
+	done
+	return 0
+}
+
+# A shift and a reduction want the same square: precedence decides, and
+# without precedence the shift wins and the conflict is counted.
+_bt_yacc_srconflict() {
+	local s=$1 la=$2 p=$3 idx=$4 tp=${_yc_prec[$2]} pp=${_yc_pprec[$3]}
+	if [ "$tp" != 0 ] && [ "$pp" != 0 ]; then
+		if [ "$pp" -gt "$tp" ]; then
+			_yc_act[idx]=$(( -p ))
+			return 0
+		fi
+		if [ "$pp" -lt "$tp" ]; then
+			return 0
+		fi
+		case ${_yc_assoc[$2]} in
+		l)	_yc_act[idx]=$(( -p )); return 0 ;;
+		r)	return 0 ;;
+		n)	_yc_act[idx]=0; return 0 ;;
+		esac
+	fi
+	_yc_srconf=$(( _yc_srconf + 1 ))
+	return 0
+}
+
+# Turn $$ and $N in the action of production $1 into stack references.
+_bt_yacc_action() {
+	local p=$1 s=${_yc_pact[$1]} n i=0 out= c d num tag len sym j k
+	set -- ${_yc_prhs[p]}
+	len=$#
+	# inside an action written in the middle of a rule, the numbers count
+	# from the start of the rule it was written in
+	case ${_yc_symname[${_yc_plhs[p]}]} in
+	'$@'*)	len=${_yc_midlen[${_yc_plhs[p]}]-0} ;;
+	esac
+	n=${#s}
+	while [ "$i" -lt "$n" ]; do
+		c=${s:i:1}
+		if [ "$c" != '$' ]; then
+			out=$out$c
+			i=$(( i + 1 ))
+			continue
+		fi
+		i=$(( i + 1 ))
+		tag=
+		if [ "${s:i:1}" = '<' ]; then
+			tag=${s:i+1}
+			tag=${tag%%>*}
+			i=$(( i + ${#tag} + 2 ))
+		fi
+		if [ "${s:i:1}" = '$' ]; then
+			i=$(( i + 1 ))
+			if [ -z "$tag" ]; then
+				tag=${_yc_tag[${_yc_plhs[p]}]}
+			fi
+			if [ -n "$_yc_union" ] && [ -n "$tag" ]; then
+				out=$out"yyval.$tag"
+			else
+				out=$out'yyval'
+			fi
+			continue
+		fi
+		num=
+		d=$i
+		if [ "${s:d:1}" = '-' ]; then
+			num='-'
+			d=$(( d + 1 ))
+		fi
+		while [ "$d" -lt "$n" ]; do
+			case ${s:d:1} in
+			[0-9])	num=$num${s:d:1}; d=$(( d + 1 )) ;;
+			*)	break ;;
+			esac
+		done
+		if [ -z "$num" ] || [ "$num" = '-' ]; then
+			out=$out'$'
+			continue
+		fi
+		i=$d
+		if [ -z "$tag" ] && [ -n "$_yc_union" ]; then
+			k=0
+			for sym in ${_yc_prhs[p]}; do
+				k=$(( k + 1 ))
+				[ "$k" = "$num" ] && tag=${_yc_tag[sym]}
+			done
+		fi
+		if [ -n "$_yc_union" ] && [ -n "$tag" ]; then
+			out=$out"yyvs[yytop - $len + ($num)].$tag"
+		else
+			out=$out"yyvs[yytop - $len + ($num)]"
+		fi
+	done
+	_yc_str=$out
+	return 0
+}
+
+# Write the parser.
+_bt_yacc_emit() {
+	local out=$1 i j s p sym n line sep code
+	{
+	printf '/* %s, written by bashtrash yacc */\n' "$out"
+	if [ -n "$_yc_pfx" ]; then
+		for n in parse lex error lval char debug nerrs; do
+			printf '#define yy%s %s%s\n' "$n" "$_yc_pfx" "$n"
+		done
+	fi
+	printf '#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n'
+	printf '%s\n' "$_yc_defines"
+	if [ -n "$_yc_union" ]; then
+		printf '#ifndef YYSTYPE_IS_DECLARED\n'
+		printf 'typedef union %s YYSTYPE;\n' "$_yc_union"
+		printf '#define YYSTYPE_IS_DECLARED 1\n#endif\n'
+	else
+		printf '#ifndef YYSTYPE\n#define YYSTYPE int\n#endif\n'
+	fi
+	[ -n "$_yc_decl" ] && printf '%s\n' "$_yc_decl"
+	cat <<'SKEL'
+
+#define YYEMPTY (-1)
+#define YYEOF 0
+#define YYERRCODE 256
+#define YYACCEPT goto yyaccept
+#define YYABORT goto yyabort
+#define YYERROR goto yyerrlab
+#define yyerrok (yyerrstatus = 0)
+#define yyclearin (yychar = YYEMPTY)
+#define YYRECOVERING() (yyerrstatus != 0)
+
+YYSTYPE yylval;
+int yychar;
+int yynerrs;
+int yydebug;
+
+extern int yylex(void);
+extern void yyerror(const char *);
+SKEL
+	printf '\n#define YYNTERM %d\n#define YYNNONTERM %d\n' "$_yc_nterm" "$_yc_nnonterm"
+	printf '#define YYNSTATES %d\n#define YYNRULES %d\n' "$_yc_ns" "$_yc_np"
+	printf '#define YYACCEPTVAL %d\n\n' "$_YC_ACCEPT"
+
+	printf 'static const short yytranslate[] = {'
+	sep=
+	for (( i = 0; i <= _yc_maxcode; i++ )); do
+		printf '%s%d' "$sep" "${_yc_trans[i]-1}"
+		sep=,
+	done
+	printf '};\n'
+	printf '#define YYMAXCODE %d\n\n' "$_yc_maxcode"
+
+	printf 'static const short yyaction[] = {\n'
+	for (( s = 0; s < _yc_ns; s++ )); do
+		line= sep=
+		for (( i = 0; i < _yc_nterm; i++ )); do
+			line=$line$sep${_yc_act[s * _yc_nterm + i]}
+			sep=,
+		done
+		printf '%s,\n' "$line"
+	done
+	printf '};\n\n'
+
+	printf 'static const short yygotot[] = {\n'
+	for (( s = 0; s < _yc_ns; s++ )); do
+		line= sep=
+		for (( i = 0; i < _yc_nnonterm; i++ )); do
+			line=$line$sep${_yc_gt[s * _yc_nnonterm + i]}
+			sep=,
+		done
+		printf '%s,\n' "$line"
+	done
+	printf '};\n\n'
+
+	printf 'static const short yydefact[] = {'
+	sep=
+	for (( s = 0; s < _yc_ns; s++ )); do
+		printf '%s%d' "$sep" "${_yc_defact[s]-0}"
+		sep=,
+	done
+	printf '};\n\n'
+
+	printf 'static const short yyr1[] = {0'
+	for (( p = 1; p <= _yc_np; p++ )); do
+		printf ',%d' "${_yc_nindex[${_yc_plhs[p]}]}"
+	done
+	printf '};\n'
+	printf 'static const short yyr2[] = {0'
+	for (( p = 1; p <= _yc_np; p++ )); do
+		set -- ${_yc_prhs[p]}
+		printf ',%d' "$#"
+	done
+	printf '};\n\n'
+
+	cat <<'SKEL'
+int yyparse(void)
+{
+	int yystate, yyn, yylen, yyi, yytop, yystacksize, yyerrstatus;
+	int *yyss;
+	YYSTYPE *yyvs;
+	YYSTYPE yyval;
+
+	yystacksize = 200;
+	yyss = (int *) malloc(yystacksize * sizeof(int));
+	yyvs = (YYSTYPE *) malloc(yystacksize * sizeof(YYSTYPE));
+	if (yyss == NULL || yyvs == NULL)
+		return 2;
+	yytop = 0;
+	yyss[0] = 0;
+	yystate = 0;
+	yychar = YYEMPTY;
+	yynerrs = 0;
+	yyerrstatus = 0;
+	for (;;) {
+		if (yytop + 1 >= yystacksize) {
+			yystacksize *= 2;
+			yyss = (int *) realloc(yyss, yystacksize * sizeof(int));
+			yyvs = (YYSTYPE *) realloc(yyvs, yystacksize * sizeof(YYSTYPE));
+			if (yyss == NULL || yyvs == NULL)
+				return 2;
+		}
+		yyn = yydefact[yystate];
+		if (yyn != 0) {
+			yyn = -yyn;
+		} else {
+			if (yychar == YYEMPTY) {
+				yychar = yylex();
+				if (yychar < 0)
+					yychar = 0;
+			}
+			if (yychar < 0 || yychar > YYMAXCODE)
+				yyi = yytranslate[2];
+			else
+				yyi = yytranslate[yychar];
+			yyn = yyaction[yystate * YYNTERM + yyi];
+		}
+		if (yyn == YYACCEPTVAL)
+			goto yyaccept;
+		if (yyn > 0) {
+			yystate = yyn - 1;
+			yytop++;
+			yyss[yytop] = yystate;
+			yyvs[yytop] = yylval;
+			yychar = YYEMPTY;
+			if (yyerrstatus)
+				yyerrstatus--;
+			continue;
+		}
+		if (yyn < 0) {
+			yyn = -yyn;
+			yylen = yyr2[yyn];
+			if (yylen > 0)
+				yyval = yyvs[yytop - yylen + 1];
+			else
+				memset(&yyval, 0, sizeof(yyval));
+			switch (yyn) {
+SKEL
+	for (( p = 1; p <= _yc_np; p++ )); do
+		[ -z "${_yc_pact[p]}" ] && continue
+		_bt_yacc_action "$p"
+		code=$_yc_str
+		code=${code#\{}
+		code=${code%\}}
+		printf 'case %d:\n%s\nbreak;\n' "$p" "$code"
+	done
+	cat <<'SKEL'
+			default:
+				break;
+			}
+			yytop -= yylen;
+			yystate = yyss[yytop];
+			yytop++;
+			yyss[yytop] = yygotot[yystate * YYNNONTERM + yyr1[yyn]] - 1;
+			yystate = yyss[yytop];
+			yyvs[yytop] = yyval;
+			continue;
+		}
+		/* no action: an error */
+		if (yyerrstatus == 0) {
+			yynerrs++;
+			yyerror("syntax error");
+		}
+	yyerrlab:
+		if (yyerrstatus == 3) {
+			if (yychar == 0)
+				goto yyabort;
+			yychar = YYEMPTY;
+			continue;
+		}
+		yyerrstatus = 3;
+		for (;;) {
+			yyn = yyaction[yystate * YYNTERM + yytranslate[YYERRCODE]];
+			if (yyn > 0) {
+				yystate = yyn - 1;
+				yytop++;
+				yyss[yytop] = yystate;
+				yyvs[yytop] = yylval;
+				break;
+			}
+			if (yytop == 0)
+				goto yyabort;
+			yytop--;
+			yystate = yyss[yytop];
+		}
+		continue;
+	yyaccept:
+		free(yyss);
+		free(yyvs);
+		return 0;
+	yyabort:
+		free(yyss);
+		free(yyvs);
+		return 1;
+	}
+}
+SKEL
+	[ -n "$_yc_progs" ] && printf '%s\n' "$_yc_progs"
+	} > "$out"
+	return 0
+}
+
+# The header file -d asks for: the token numbers, and the value type.
+_bt_yacc_header() {
+	{
+	printf '%s\n' "$_yc_defines"
+	if [ -n "$_yc_union" ]; then
+		printf '#ifndef YYSTYPE_IS_DECLARED\n'
+		printf 'typedef union %s YYSTYPE;\n' "$_yc_union"
+		printf '#define YYSTYPE_IS_DECLARED 1\n#endif\n'
+	else
+		printf '#ifndef YYSTYPE\n#define YYSTYPE int\n#endif\n'
+	fi
+	printf 'extern YYSTYPE %slval;\n' "${_yc_pfx:-yy}"
+	} > "$1"
+	return 0
+}
+
+# The description -v asks for: the states, what is in them and what they do.
+_bt_yacc_describe() {
+	local s it p d i sym name act
+	{
+	printf 'Grammar\n\n'
+	for (( p = 1; p <= _yc_np; p++ )); do
+		printf '%4d  %s:' "$p" "${_yc_symname[${_yc_plhs[p]}]}"
+		for sym in ${_yc_prhs[p]}; do
+			printf ' %s' "${_yc_symname[sym]}"
+		done
+		printf '\n'
+	done
+	printf '\n'
+	for (( s = 0; s < _yc_ns; s++ )); do
+		printf 'state %d\n\n' "$s"
+		for it in ${_yc_items[s]}; do
+			p=${it%%.*}
+			d=${it#*.}
+			printf '    %s:' "${_yc_symname[${_yc_plhs[p]}]}"
+			i=0
+			for sym in ${_yc_prhs[p]}; do
+				[ "$i" = "$d" ] && printf ' .'
+				printf ' %s' "${_yc_symname[sym]}"
+				i=$(( i + 1 ))
+			done
+			[ "$i" = "$d" ] && printf ' .'
+			printf '   (rule %d)\n' "$p"
+		done
+		printf '\n'
+		for (( i = 0; i < _yc_nterm; i++ )); do
+			act=${_yc_act[s * _yc_nterm + i]}
+			[ "$act" = 0 ] && continue
+			name=${_yc_symname[${_yc_termsym[i]}]}
+			if [ "$act" = "$_YC_ACCEPT" ]; then
+				printf '    %-16s accept\n' "$name"
+			elif [ "$act" -gt 0 ]; then
+				printf '    %-16s shift, and go to state %d\n' "$name" "$(( act - 1 ))"
+			else
+				printf '    %-16s reduce using rule %d\n' "$name" "$(( -act ))"
+			fi
+		done
+		for (( i = 0; i < _yc_nnonterm; i++ )); do
+			act=${_yc_gt[s * _yc_nnonterm + i]}
+			[ "$act" = 0 ] && continue
+			printf '    %-16s go to state %d\n' "${_yc_symname[${_yc_nonsym[i]}]}" "$(( act - 1 ))"
+		done
+		printf '\n'
+	done
+	} > "$1"
+	return 0
+}
+
+yacc () {
+	local LC_ALL=C
+	local arg opt f fd line status=0 header=0 verbose=0 nolines=0 debug=0
+	local prefix=y i j p s sym code name out
+	local _YC_ACCEPT=32767
+	local _yc_txt= _yc_i=0 _yc_tk= _yc_tv= _yc_v=0 _yc_s=0 _yc_nsym=0
+	local _yc_np=0 _yc_ns=0 _yc_nmid=0 _yc_ntok=257 _yc_nterm=0 _yc_nnonterm=0
+	local _yc_decl= _yc_union= _yc_progs= _yc_start= _yc_defines= _yc_pfx=
+	local _yc_firstlhs=
+	local _yc_close= _yc_key= _yc_c1= _yc_set= _yc_dotsym=-1 _yc_rest=
+	local _yc_st=0 _yc_str= _yc_maxcode=256 _yc_srconf=0 _yc_rrconf=0
+	local -a _yc_symname=() _yc_isterm=() _yc_prec=() _yc_assoc=() _yc_code=()
+	local -a _yc_tag=() _yc_plhs=() _yc_prhs=() _yc_pact=() _yc_pprec=()
+	local -a _yc_passoc=() _yc_first=() _yc_null=() _yc_kernel=() _yc_items=()
+	local -a _yc_todo=() _yc_act=() _yc_gt=() _yc_tindex=() _yc_nindex=()
+	local -a _yc_termsym=() _yc_nonsym=() _yc_trans=() _yc_midlen=()
+	local -a _yc_defact=() _yc_plen=()
+	local -A _yc_psym=() _yc_ptail=()
+	local -A _yc_symid=() _yc_prods=() _yc_stid=() _yc_gotos=() _yc_gsyms=()
+	local -A _yc_lah=() _yc_prop=() _yc_ila=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-b)	shift
+			[ "$#" = 0 ] && { _bt_err "yacc: -b wants a prefix"; return 1; }
+			prefix=$1; shift ;;
+		-b*)	prefix=${1#-b}; shift ;;
+		-p)	shift
+			[ "$#" = 0 ] && { _bt_err "yacc: -p wants a prefix"; return 1; }
+			_yc_pfx=$1; shift ;;
+		-p*)	_yc_pfx=${1#-p}; shift ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				d)	header=1 ;;
+				l)	nolines=1 ;;
+				t)	debug=1 ;;
+				v)	verbose=1 ;;
+				b)	if [ -n "$arg" ]; then prefix=$arg; arg=
+					elif [ "$#" -gt 0 ]; then prefix=$1; shift
+					else _bt_err "yacc: -b wants a prefix"; return 1; fi ;;
+				p)	if [ -n "$arg" ]; then _yc_pfx=$arg; arg=
+					elif [ "$#" -gt 0 ]; then _yc_pfx=$1; shift
+					else _bt_err "yacc: -p wants a prefix"; return 1; fi ;;
+				*)	_bt_err "yacc: illegal option -- $opt"
+					_bt_err "usage: yacc [-dltv] [-b file_prefix] [-p sym_prefix] grammar"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" != 1 ]; then
+		_bt_err "usage: yacc [-dltv] [-b file_prefix] [-p sym_prefix] grammar"
+		return 1
+	fi
+	if [ "$1" = - ]; then
+		line=
+		while IFS= read -r line; do _yc_txt=$_yc_txt$line$'\n'; line=; done
+		[ -n "$line" ] && _yc_txt=$_yc_txt$line
+	elif { exec {fd}<"$1"; } 2>/dev/null; then
+		line=
+		while IFS= read -r line <&"$fd"; do _yc_txt=$_yc_txt$line$'\n'; line=; done
+		[ -n "$line" ] && _yc_txt=$_yc_txt$line
+		exec {fd}<&-
+	else
+		_bt_err "yacc: cannot open $1"
+		return 1
+	fi
+
+	_bt_yacc_parse
+	if [ "$_yc_np" = 0 ]; then
+		_bt_err "yacc: the grammar has no rules"
+		return 1
+	fi
+	[ -z "$_yc_start" ] && _yc_start=$_yc_firstlhs
+	if [ -z "${_yc_symid[$_yc_start]+x}" ]; then
+		_bt_err "yacc: the start symbol $_yc_start has no rules"
+		return 1
+	fi
+	# the rule that says when to stop
+	_bt_yacc_sym '$accept'
+	_yc_plhs[0]=$_yc_s
+	_yc_prhs[0]="${_yc_symid[$_yc_start]} 0"
+	_yc_pact[0]=
+	_yc_pprec[0]=0
+	_yc_passoc[0]=
+	_yc_prods[$_yc_s]=0
+
+	# every symbol that is not a terminal has to have a rule
+	for (( i = 0; i < _yc_nsym; i++ )); do
+		[ "${_yc_isterm[i]}" = 1 ] && continue
+		[ -n "${_yc_prods[$i]+x}" ] && continue
+		_bt_err "yacc: the symbol ${_yc_symname[i]} is used but never defined"
+		status=1
+	done
+	[ "$status" != 0 ] && return "$status"
+
+	# the numbers the tokens are known by
+	_yc_maxcode=256
+	for (( i = 0; i < _yc_nsym; i++ )); do
+		[ "${_yc_isterm[i]}" = 1 ] || continue
+		if [ "${_yc_code[i]}" = -1 ]; then
+			_yc_code[i]=$_yc_ntok
+			_yc_ntok=$(( _yc_ntok + 1 ))
+		fi
+		[ "${_yc_code[i]}" -gt "$_yc_maxcode" ] && _yc_maxcode=${_yc_code[i]}
+	done
+
+	_bt_yacc_index
+	_bt_yacc_first
+	_bt_yacc_build
+	_bt_yacc_lalr
+	_bt_yacc_tables
+
+	# the translation from what yylex says to a column of the table
+	for (( i = 0; i <= _yc_maxcode; i++ )); do
+		_yc_trans[i]=${_yc_tindex[2]}
+	done
+	for (( i = 0; i < _yc_nsym; i++ )); do
+		[ "${_yc_isterm[i]}" = 1 ] || continue
+		_yc_trans[${_yc_code[i]}]=${_yc_tindex[i]}
+	done
+
+	# the names the actions and the lexer share
+	out=
+	for (( i = 0; i < _yc_nsym; i++ )); do
+		[ "${_yc_isterm[i]}" = 1 ] || continue
+		name=${_yc_symname[i]}
+		case $name in
+		'$'*|"'"*)	continue ;;
+		error)		continue ;;
+		esac
+		out=$out"#define $name ${_yc_code[i]}"$'\n'
+	done
+	_yc_defines=$out
+
+	if [ "$_yc_srconf" != 0 ] || [ "$_yc_rrconf" != 0 ]; then
+		[ "$_yc_srconf" != 0 ] &&
+			_bt_err "yacc: $_yc_srconf shift/reduce conflict$( [ "$_yc_srconf" = 1 ] || echo s )"
+		[ "$_yc_rrconf" != 0 ] &&
+			_bt_err "yacc: $_yc_rrconf reduce/reduce conflict$( [ "$_yc_rrconf" = 1 ] || echo s )"
+	fi
+
+	_bt_yacc_emit "$prefix.tab.c"
+	[ "$header" = 1 ] && _bt_yacc_header "$prefix.tab.h"
+	[ "$verbose" = 1 ] && _bt_yacc_describe "$prefix.output"
+	return 0
+}

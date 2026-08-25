@@ -28,7 +28,7 @@ for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          nohup pr dd sed who logname diff cal fuser ipcs patch tput \
          what uuencode uudecode write ps ed m4 iconv ar locale nm \
          admin delta get prs rmdel sact sccs unget val \
-         compress uncompress zcat bc make awk gencat ctags cflow cxref file lex; do
+         compress uncompress zcat bc make awk gencat ctags cflow cxref file lex yacc; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -3556,6 +3556,253 @@ CEOF
 	a=$( . "$BT"; lex nosuch.l 2>/dev/null; echo "rc=$?" )
 	if [ "$a" = "rc=1" ]; then pass=$((pass + 1))
 	else note_fail "lex with a missing file: [$a]"; fi
+
+	cd .. || exit 1
+fi
+
+# --- yacc -------------------------------------------------------------------
+# What yacc writes is a C program, so the test compiles it and runs it against
+# input the grammar describes.
+echo "### yacc"
+if command -v cc > /dev/null 2>&1; then
+	CC=$(real_of cc)
+	mkdir -p yct
+	cd yct || exit 1
+
+	yaccrun() {	# yaccrun description grammar input expected [args...]
+		local desc=$1 gr=$2 in=$3 want=$4 got
+		shift 4
+		rm -f y.tab.c y.tab.h a.out
+		if ! ( . "$BT"; yacc "$@" "$gr" ) > /dev/null 2>&1; then
+			note_fail "yacc $desc: yacc itself failed"
+			return
+		fi
+		if ! "$CC" -o a.out y.tab.c > /dev/null 2>&1; then
+			note_fail "yacc $desc: the C it wrote does not compile"
+			return
+		fi
+		got=$( printf '%s' "$in" | ./a.out 2>/dev/null )
+		if [ "$got" = "$want" ]; then pass=$((pass + 1))
+		else note_fail "yacc $desc: [$got] not [$want]"; fi
+	}
+
+	cat > calc.y <<'GEOF'
+%{
+#include <stdio.h>
+#include <ctype.h>
+int yylex(void);
+void yyerror(const char *s);
+%}
+%token NUMBER
+%left '+' '-'
+%left '*' '/'
+%%
+input	: /* empty */
+	| input line
+	;
+line	: '\n'
+	| expr '\n'	{ printf("%d\n", $1); }
+	;
+expr	: NUMBER		{ $$ = $1; }
+	| expr '+' expr		{ $$ = $1 + $3; }
+	| expr '-' expr		{ $$ = $1 - $3; }
+	| expr '*' expr		{ $$ = $1 * $3; }
+	| expr '/' expr		{ $$ = $1 / $3; }
+	| '(' expr ')'		{ $$ = $2; }
+	| '-' expr		{ $$ = -$2; }
+	;
+%%
+int yylex(void)
+{
+	int c;
+	do { c = getchar(); } while (c == ' ' || c == '\t');
+	if (c == EOF) return 0;
+	if (isdigit(c)) {
+		int v = 0;
+		while (isdigit(c)) { v = v * 10 + (c - '0'); c = getchar(); }
+		ungetc(c, stdin);
+		yylval = v;
+		return NUMBER;
+	}
+	return c;
+}
+void yyerror(const char *s) { fprintf(stderr, "%s\n", s); }
+int main(void) { return yyparse(); }
+GEOF
+	yaccrun "precedence and grouping" calc.y '1+2*3
+(1+2)*3
+10/2-3
+-5+1
+2*-3
+' '7
+9
+2
+-4
+-6'
+
+	# error recovery with the error token
+	cat > err.y <<'GEOF'
+%{
+#include <stdio.h>
+#include <ctype.h>
+int yylex(void);
+void yyerror(const char *s);
+%}
+%token NUM
+%%
+list	: /* empty */
+	| list stmt
+	;
+stmt	: NUM ';'	{ printf("ok %d\n", $1); }
+	| error ';'	{ printf("recovered\n"); yyerrok; }
+	;
+%%
+int yylex(void)
+{
+	int c;
+	do { c = getchar(); } while (c == ' ' || c == '\n');
+	if (c == EOF) return 0;
+	if (isdigit(c)) { yylval = c - '0'; return NUM; }
+	return c;
+}
+void yyerror(const char *s) { fprintf(stderr, "error: %s\n", s); }
+int main(void) { return yyparse(); }
+GEOF
+	yaccrun "error recovery" err.y '1; x y; 2;
+' 'ok 1
+recovered
+ok 2'
+
+	# a value type of one's own, and the header that goes with it
+	cat > un.y <<'GEOF'
+%{
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+int yylex(void);
+void yyerror(const char *s);
+%}
+%union {
+	int num;
+	char *str;
+}
+%token <num> NUM
+%token <str> WORD
+%type <num> expr
+%%
+input	: /* empty */
+	| input line
+	;
+line	: expr '\n'		{ printf("= %d\n", $1); }
+	| WORD '\n'		{ printf("word %s\n", $1); free($1); }
+	;
+expr	: NUM			{ $$ = $1; }
+	| expr '+' NUM		{ $$ = $1 + $3; }
+	;
+%%
+int yylex(void)
+{
+	int c;
+	do { c = getchar(); } while (c == ' ');
+	if (c == EOF) return 0;
+	if (isdigit(c)) { yylval.num = c - '0'; return NUM; }
+	if (isalpha(c)) {
+		char buf[64]; int i = 0;
+		while (isalpha(c)) { buf[i++] = c; c = getchar(); }
+		ungetc(c, stdin); buf[i] = 0;
+		yylval.str = strdup(buf);
+		return WORD;
+	}
+	return c;
+}
+void yyerror(const char *s) { fprintf(stderr, "%s\n", s); }
+int main(void) { return yyparse(); }
+GEOF
+	yaccrun "a union for the values" un.y '1+2+3
+hello
+' '= 6
+word hello' -d
+	if [ -f y.tab.h ] &&
+	   "$(real_of grep)" -q '#define NUM' y.tab.h &&
+	   "$(real_of grep)" -q 'YYSTYPE' y.tab.h; then
+		pass=$((pass + 1))
+	else note_fail "yacc -d header"; fi
+
+	# an action written in the middle of a rule
+	cat > mid.y <<'GEOF'
+%{
+#include <stdio.h>
+#include <ctype.h>
+int yylex(void);
+void yyerror(const char *s);
+%}
+%token NUM
+%%
+s	: NUM { printf("[saw %d]", $1); } NUM '\n'	{ printf("both %d %d\n", $1, $3); }
+	;
+%%
+int yylex(void) { int c; do { c = getchar(); } while (c == ' '); if (c == EOF) return 0;
+	if (isdigit(c)) { yylval = c - '0'; return NUM; } return c; }
+void yyerror(const char *s) { fprintf(stderr, "%s\n", s); }
+int main(void) { return yyparse(); }
+GEOF
+	yaccrun "an action in the middle of a rule" mid.y '4 7
+' '[saw 4]both 4 7'
+
+	# a grammar with something to sort out, and the report that goes with it
+	cat > ifel.y <<'GEOF'
+%{
+#include <stdio.h>
+#include <ctype.h>
+int yylex(void);
+void yyerror(const char *s);
+%}
+%token IF THEN ELSE STMT
+%%
+prog	: stmt '\n'	{ printf("parsed\n"); }
+	;
+stmt	: STMT
+	| IF stmt THEN stmt
+	| IF stmt THEN stmt ELSE stmt
+	;
+%%
+int yylex(void) { int c; do { c = getchar(); } while (c == ' ');
+	if (c == EOF) return 0;
+	switch (c) { case 'i': return IF; case 't': return THEN; case 'e': return ELSE; case 's': return STMT; }
+	return c; }
+void yyerror(const char *s) { fprintf(stderr, "%s\n", s); }
+int main(void) { return yyparse(); }
+GEOF
+	out=$( . "$BT"; yacc ifel.y 2>&1 >/dev/null )
+	case $out in
+	*'1 shift/reduce conflict'*)	pass=$((pass + 1)) ;;
+	*)				note_fail "yacc conflict report: [$out]" ;;
+	esac
+	yaccrun "the dangling else" ifel.y 'i s t i s t s e s
+' 'parsed'
+
+	# -b names the files, -p names the symbols
+	rm -f pre.tab.c pre.tab.h pre.output
+	( . "$BT"; yacc -b pre -d -v calc.y ) > /dev/null 2>&1
+	if [ -f pre.tab.c ] && [ -f pre.tab.h ] && [ -f pre.output ]; then
+		pass=$((pass + 1))
+	else note_fail "yacc -b"; fi
+	rm -f y.tab.c
+	( . "$BT"; yacc -p zz calc.y ) > /dev/null 2>&1
+	if "$(real_of grep)" -q 'define yyparse zzparse' y.tab.c &&
+	   "$(real_of grep)" -q 'define yylval zzlval' y.tab.c; then
+		pass=$((pass + 1))
+	else note_fail "yacc -p"; fi
+
+	# a grammar that is not there, and one with nothing in it
+	a=$( . "$BT"; yacc nosuch.y 2>/dev/null; echo "rc=$?" )
+	if [ "$a" = "rc=1" ]; then pass=$((pass + 1))
+	else note_fail "yacc with a missing file: [$a]"; fi
+	printf '%%%%\n' > empty.y
+	a=$( . "$BT"; yacc empty.y 2>/dev/null; echo "rc=$?" )
+	if [ "$a" = "rc=1" ]; then pass=$((pass + 1))
+	else note_fail "yacc with an empty grammar: [$a]"; fi
 
 	cd .. || exit 1
 fi
