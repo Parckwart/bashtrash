@@ -61,9 +61,9 @@ Run the test suite with:
 | `cut` | `cut -b list [-n] [file...]` · `cut -c list [file...]` · `cut -f list [-d delim] [-s] [file...]` |
 | `date` | `date [-u] [+format]` |
 | `dirname` | `dirname string` |
-| `expr` | `expr operand...` |
 | `env` | `env [-i] [name=value]... [utility [argument...]]` |
 | `expand` | `expand [-t tablist] [file...]` |
+| `expr` | `expr operand...` |
 | `fold` | `fold [-bs] [-w width] [file...]` |
 | `head` | `head [-n number] [file...]` |
 | `id` | `id [user]` · `id -G [-n] [user]` · `id -g [-nr] [user]` · `id -u [-nr] [user]` |
