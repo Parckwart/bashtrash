@@ -25,7 +25,7 @@ fi
 for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          fold head id nl od paste pathchk sleep sort split strings tabs \
          tail tee tr tsort tty uname unexpand uniq wc join csplit grep xargs \
-         nohup pr dd sed; do
+         nohup pr dd sed who logname diff; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -960,6 +960,121 @@ sedchk s1 -n '/five/q;p'
 sedchk s1 's/\t/TAB/'
 chk "sed missing" sed 's/a/b/' no-such-file
 chks "sed stdin" s1 sed 's/o/0/'
+
+# --- who, logname, diff ---------------------------------------------------
+echo "### who logname diff"
+
+# There is no utmp in most containers, so a synthetic one is built and both
+# implementations are pointed at it -- who takes the file as an operand.
+mkutmp() { # type pid line id user host tv_sec
+	printf "$(printf '\\%03o\\%03o\\000\\000' $(( $1 & 255 )) $(( $1 >> 8 )))"
+	printf "$(printf '\\%03o\\%03o\\%03o\\%03o' $(( $2 & 255 )) $(( $2 >> 8 & 255 )) $(( $2 >> 16 & 255 )) $(( $2 >> 24 & 255 )))"
+	printf '%s' "$3"; head -c $(( 32 - ${#3} )) /dev/zero
+	printf '%s' "$4"; head -c $(( 4 - ${#4} )) /dev/zero
+	printf '%s' "$5"; head -c $(( 32 - ${#5} )) /dev/zero
+	printf '%s' "$6"; head -c $(( 256 - ${#6} )) /dev/zero
+	head -c 8 /dev/zero
+	printf "$(printf '\\%03o\\%03o\\%03o\\%03o' $(( $7 & 255 )) $(( $7 >> 8 & 255 )) $(( $7 >> 16 & 255 )) $(( $7 >> 24 & 255 )))"
+	head -c 4 /dev/zero
+	head -c 36 /dev/zero
+}
+{ mkutmp 7 1234 pts/0 ts/0 alice host1 1700000000
+  mkutmp 7 1235 pts/1 ts/1 bob '' 1700003600
+  mkutmp 8 1200 pts/9 ts/9 old '' 1699000000; } > utmp.syn
+for o in "" -u; do
+	# shellcheck disable=SC2086
+	a=$( . "$BT"; who $o utmp.syn 2>&1 )
+	# shellcheck disable=SC2086
+	b=$( "$(real_of who)" $o utmp.syn 2>&1 )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "who $o"; fi
+done
+a=$( . "$BT"; who 2>&1; echo "rc=$?" )
+b=$( "$(real_of who)" 2>&1; echo "rc=$?" )
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "who with no utmp"; fi
+# Same argv[0] artifact as dd: the reference is invoked by path.
+a=$( . "$BT"; logname 2>&1; echo "rc=$?" )
+b=$( "$(real_of logname)" 2>&1; echo "rc=$?" | sed "s|^.*/logname:|logname:|" )
+b=$(printf '%s\n' "$b" | sed "s|^.*/logname:|logname:|")
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "logname"; fi
+
+printf 'a\nb\nc\nd\ne\n' > df1
+printf 'a\nB\nc\ne\nf\n' > df2
+printf 'a\nb\n'          > df3
+printf 'a\nb\nc\n'       > df4
+printf 'x\ny\n'          > df5
+printf 'a  b\n'          > df6
+printf 'a b\n'           > df7
+printf 'ABC\n'           > df8
+printf 'abc\n'           > df9
+for o in "" -e; do
+	for pair in "df1 df2" "df2 df1" "df1 df1" "df3 df4" "df4 df3" "df3 df5" \
+	            "empty df3" "df3 empty"; do
+		# shellcheck disable=SC2086
+		set -- $pair
+		# shellcheck disable=SC2086
+		chk "diff $o $pair" diff $o "$1" "$2"
+	done
+done
+chk "diff -b"  diff -b df6 df7
+chk "diff -i"  diff -i df8 df9
+chk "diff -b files" diff -b df1 df2
+chk "diff missing" diff df1 no-such-file
+# -u and -c are not offered at all (they need file timestamps), so
+# this is not compared against the reference -- only that it says so.
+( . "$BT"; diff -u df1 df2 ) > /dev/null 2>&1
+if [ "$?" -eq 2 ]; then pass=$((pass + 1)); else note_fail "diff -u should be refused"; fi
+
+# When several edit scripts are equally short, which one comes out is not
+# fixed by the standard and this one does not always pick the same as GNU.
+# What is checked instead: the script is as short as the reference's, and
+# applying it really does turn the first file into the second.
+applyed() {
+	awk '
+		NR==FNR { orig[FNR]=$0; nl=FNR; next }
+		{ script[++sn]=$0 }
+		END {
+			n=nl; i=1
+			while (i<=sn) {
+				cmd=script[i++]
+				if (cmd ~ /^[0-9]+(,[0-9]+)?[acd]$/) {
+					op=substr(cmd,length(cmd),1)
+					rng=substr(cmd,1,length(cmd)-1)
+					if (index(rng,",")) { split(rng,r,","); a=r[1]+0; b=r[2]+0 }
+					else { a=rng+0; b=a }
+					textn=0
+					if (op=="a" || op=="c") {
+						while (i<=sn && script[i]!=".") text[++textn]=script[i++]
+						i++
+					}
+					if (op=="d" || op=="c") { for (k=a;k<=b;k++) del[k]=1 }
+					if (op=="a") { for (k=1;k<=textn;k++) add[a]=add[a] (add[a]==""?"":"\n") text[k] }
+					if (op=="c") { for (k=1;k<=textn;k++) add[a-1]=add[a-1] (add[a-1]==""?"":"\n") text[k] }
+				}
+			}
+			if (add[0]!="") print add[0]
+			for (i=1;i<=nl;i++) { if (!del[i]) print orig[i]; if (add[i]!="") print add[i] }
+		}' "$1" "$2"
+}
+i=0
+while [ "$i" -lt 40 ]; do
+	i=$(( i + 1 ))
+	: > r1
+	: > r2
+	j=0
+	while [ "$j" -lt $(( i % 9 + 1 )) ]; do printf '%s\n' $(( (i * j * 7) % 5 )) >> r1; j=$(( j + 1 )); done
+	j=0
+	while [ "$j" -lt $(( (i * 3) % 9 + 1 )) ]; do printf '%s\n' $(( (i + j * 3) % 5 )) >> r2; j=$(( j + 1 )); done
+	( . "$BT"; diff r1 r2 ) > m.o 2>/dev/null
+	"$(real_of diff)" r1 r2 > g.o 2>/dev/null
+	md=$(grep -c '^[<>]' m.o); gd=$(grep -c '^[<>]' g.o)
+	( . "$BT"; diff -e r1 r2 ) > e.o 2>/dev/null
+	applyed r1 e.o > rebuilt 2>/dev/null
+	if [ "$md" = "$gd" ] && cmp -s rebuilt r2; then
+		pass=$((pass + 1))
+	else
+		note_fail "diff property (case $i): distance $md vs $gd, rebuild $(cmp -s rebuilt r2 && echo ok || echo bad)"
+	fi
+done
 
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"

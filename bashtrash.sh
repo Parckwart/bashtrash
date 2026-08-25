@@ -6151,3 +6151,382 @@ sed () {
 	done
 	return "$status"
 }
+
+# ---------------------------------------------------------------------------
+# who / logname -- POSIX.1-2017:
+#	who [-mTu] [file]
+#	logname
+#
+# Both read the login records database.  There is no getutent() to call, so
+# the binary records are parsed directly: on Linux each is 384 bytes, with
+# ut_type at 0, ut_pid at 4, ut_line at 8, ut_user at 44, ut_host at 76 and
+# ut_tv.tv_sec at 340.
+# ---------------------------------------------------------------------------
+_BT_UTMP=/var/run/utmp
+
+# Read every byte of $1 into the _bt_b array as numbers.
+_bt_utmp_bytes() {
+	local fd i len rc
+	local _bt_buf _bt_nul v
+	_bt_b=()
+	{ exec {fd}<"$1"; } 2>/dev/null || return 1
+	while :; do
+		if _bt_read "$fd"; then rc=0; else rc=1; fi
+		len=${#_bt_buf}
+		for (( i = 0; i < len; i++ )); do
+			printf -v v '%d' "'${_bt_buf:i:1}"
+			_bt_b+=("$v")
+		done
+		[ "$rc" = 0 ] && [ "$_bt_nul" = 1 ] && _bt_b+=(0)
+		[ "$rc" = 1 ] && break
+	done
+	exec {fd}<&-
+	return 0
+}
+
+# The NUL terminated string of $2 bytes starting at offset $1 of _bt_b.
+_bt_utmp_str() {
+	local off=$1 max=$2 i out= _bt_c
+	for (( i = 0; i < max; i++ )); do
+		[ "${_bt_b[off+i]}" -eq 0 ] && break
+		_bt_chr "${_bt_b[off+i]}"
+		out=$out$_bt_c
+	done
+	_bt_str=$out
+	return 0
+}
+
+# The little-endian 32-bit number at offset $1.
+_bt_utmp_int() {
+	_bt_int=$(( _bt_b[$1] | _bt_b[$1+1] << 8 | _bt_b[$1+2] << 16 | _bt_b[$1+3] << 24 ))
+	return 0
+}
+
+who () {
+	local LC_ALL=C
+	local arg opt file=$_BT_UTMP mine=0 idle=0 showpid=0 status=0
+	local n r off type pid line user host sec when me
+	local -a _bt_b=()
+	local _bt_str _bt_int _bt_c
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-*)	[ "$1" = - ] && break
+			arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				m)	mine=1 ;;
+				u)	idle=1 showpid=1 ;;
+				T)	;;	# the terminal's writability needs its mode
+				*)	_bt_err "who: illegal option -- $opt"
+					_bt_err "usage: who [-mTu] [file]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	[ "$#" -ge 1 ] && file=$1
+
+	if [ "$mine" = 1 ]; then
+		me=
+		for r in /dev/pts/[0-9]* /dev/tty[0-9]* /dev/console; do
+			[ -c "$r" ] || continue
+			if [ "$r" -ef /proc/self/fd/0 ] 2>/dev/null; then
+				me=${r#/dev/}
+				break
+			fi
+		done
+		[ -n "$me" ] || return 0
+	fi
+
+	_bt_utmp_bytes "$file" || return 0
+	n=$(( ${#_bt_b[@]} / 384 ))
+	for (( r = 0; r < n; r++ )); do
+		off=$(( r * 384 ))
+		type=$(( _bt_b[off] | _bt_b[off+1] << 8 ))
+		# USER_PROCESS only
+		[ "$type" -eq 7 ] || continue
+		_bt_utmp_str $(( off + 8 )) 32;  line=$_bt_str
+		_bt_utmp_str $(( off + 44 )) 32; user=$_bt_str
+		_bt_utmp_str $(( off + 76 )) 256; host=$_bt_str
+		_bt_utmp_int $(( off + 340 ));   sec=$_bt_int
+		_bt_utmp_int $(( off + 4 ));     pid=$_bt_int
+		[ -n "$user" ] || continue
+		if [ "$mine" = 1 ] && [ "$line" != "$me" ]; then
+			continue
+		fi
+		printf -v when '%(%b %e %H:%M)T' "$sec"
+		if [ "$idle" = 1 ]; then
+			printf '%-8s %-12s %s   ?          %d' "$user" "$line" "$when" "$pid"
+		else
+			printf '%-8s %-12s %s' "$user" "$line" "$when"
+		fi
+		if [ -n "$host" ]; then
+			printf ' (%s)' "$host"
+		fi
+		printf '\n'
+	done
+	return "$status"
+}
+
+logname () {
+	local LC_ALL=C
+	local n r off type line user me
+	local -a _bt_b=()
+	local _bt_str _bt_int _bt_c
+
+	if [ "$#" -gt 0 ]; then
+		_bt_err "logname: extra operand: $1"
+		return 1
+	fi
+	me=
+	for r in /dev/pts/[0-9]* /dev/tty[0-9]* /dev/console; do
+		[ -c "$r" ] || continue
+		if [ "$r" -ef /proc/self/fd/0 ] 2>/dev/null; then
+			me=${r#/dev/}
+			break
+		fi
+	done
+	if [ -n "$me" ] && _bt_utmp_bytes "$_BT_UTMP"; then
+		n=$(( ${#_bt_b[@]} / 384 ))
+		for (( r = 0; r < n; r++ )); do
+			off=$(( r * 384 ))
+			type=$(( _bt_b[off] | _bt_b[off+1] << 8 ))
+			[ "$type" -eq 7 ] || continue
+			_bt_utmp_str $(( off + 8 )) 32; line=$_bt_str
+			[ "$line" = "$me" ] || continue
+			_bt_utmp_str $(( off + 44 )) 32; user=$_bt_str
+			if [ -n "$user" ]; then
+				printf '%s\n' "$user"
+				return 0
+			fi
+		done
+	fi
+	# getlogin() would fail here too, and this is what it prints.
+	_bt_err "logname: no login name"
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+# diff -- POSIX.1-2017: diff [-bi] [-e] file1 file2
+#
+# The -c and -u formats put the files' modification times in their headers,
+# and stat() is not reachable from a builtin, so they are not offered.
+# ---------------------------------------------------------------------------
+
+# The key a line is compared by, honouring -b and -i.
+_bt_diff_key() {
+	local s=$1
+	if [ "$_bt_d_blank" = 1 ]; then
+		s=${s//$'\t'/ }
+		while :; do
+			case $s in
+			*'  '*)	s=${s//  / } ;;
+			*)	break ;;
+			esac
+		done
+		s=${s%"${s##*[![:blank:]]}"}
+	fi
+	[ "$_bt_d_icase" = 1 ] && s=${s,,}
+	_bt_key=$s
+	return 0
+}
+
+# A line range as the normal format writes it.
+_bt_diff_range() {
+	if [ "$1" -eq "$2" ]; then
+		_bt_rng=$1
+	else
+		_bt_rng=$1,$2
+	fi
+	return 0
+}
+
+diff () {
+	local LC_ALL=C
+	local arg opt f1 f2 fd status=0 edscript=0 _bt_reason
+	local _bt_d_blank=0 _bt_d_icase=0 _bt_key _bt_rng
+	local -a A=() B=() KA=() KB=() L=() rev=() ops=() hunks=()
+	local i j k n m w best ai bi as ae bs be dela addb r1 r2
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				b)	_bt_d_blank=1 ;;
+				i)	_bt_d_icase=1 ;;
+				e)	edscript=1 ;;
+				c|u)	_bt_err "diff: -$opt needs the files' modification times, which no builtin can read"
+					return 2 ;;
+				*)	_bt_err "diff: illegal option -- $opt"
+					_bt_err "usage: diff [-bi] [-e] file1 file2"
+					return 2 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -ne 2 ]; then
+		_bt_err "usage: diff [-bi] [-e] file1 file2"
+		return 2
+	fi
+	f1=$1 f2=$2
+
+	for i in 1 2; do
+		if [ "$i" = 1 ]; then w=$f1; else w=$f2; fi
+		if [ "$w" = - ]; then
+			fd=0
+		elif [ -d "$w" ] || ! { exec {fd}<"$w"; } 2>/dev/null; then
+			_bt_why "$w"
+			_bt_err "diff: $w: $_bt_reason"
+			return 2
+		fi
+		w=
+		while IFS= read -r w <&"$fd" || [ -n "$w" ]; do
+			_bt_diff_key "$w"
+			if [ "$i" = 1 ]; then
+				A+=("$w"); KA+=("$_bt_key")
+			else
+				B+=("$w"); KB+=("$_bt_key")
+			fi
+			w=
+		done
+		[ "$fd" = 0 ] || exec {fd}<&-
+	done
+	n=${#A[@]} m=${#B[@]}
+
+	# Myers' algorithm, so that when several edit scripts are equally
+	# short the one produced is the one diff itself settles on; walking an
+	# LCS table back gives a different, equally minimal, answer.
+	local maxd=$(( n + m )) d x y kk px py pk
+	local -a V=() trace=() Vp=()
+	for (( i = 0; i <= 2 * maxd + 1; i++ )); do V[i]=0; done
+	local found=-1
+	for (( d = 0; d <= maxd; d++ )); do
+		trace[d]=${V[*]}
+		for (( k = -d; k <= d; k += 2 )); do
+			if [ "$k" -eq $(( -d )) ] ||
+			   { [ "$k" -ne "$d" ] && [ "${V[maxd+k-1]}" -lt "${V[maxd+k+1]}" ]; }; then
+				x=${V[maxd+k+1]}
+			else
+				x=$(( V[maxd+k-1] + 1 ))
+			fi
+			y=$(( x - k ))
+			while [ "$x" -lt "$n" ] && [ "$y" -lt "$m" ] && [ "${KA[x]}" = "${KB[y]}" ]; do
+				x=$(( x + 1 )); y=$(( y + 1 ))
+			done
+			V[maxd+k]=$x
+			if [ "$x" -ge "$n" ] && [ "$y" -ge "$m" ]; then
+				found=$d
+				break
+			fi
+		done
+		[ "$found" -ge 0 ] && break
+	done
+
+	x=$n y=$m
+	for (( d = found; d > 0; d-- )); do
+		read -ra Vp <<< "${trace[d]}"
+		kk=$(( x - y ))
+		if [ "$kk" -eq $(( -d )) ] ||
+		   { [ "$kk" -ne "$d" ] && [ "${Vp[maxd+kk-1]}" -lt "${Vp[maxd+kk+1]}" ]; }; then
+			pk=$(( kk + 1 ))
+		else
+			pk=$(( kk - 1 ))
+		fi
+		px=${Vp[maxd+pk]}
+		py=$(( px - pk ))
+		while [ "$x" -gt "$px" ] && [ "$y" -gt "$py" ]; do
+			rev+=('='); x=$(( x - 1 )); y=$(( y - 1 ))
+		done
+		if [ "$x" -gt "$px" ]; then
+			rev+=('-'); x=$(( x - 1 ))
+		else
+			rev+=('+'); y=$(( y - 1 ))
+		fi
+	done
+	while [ "$x" -gt 0 ] && [ "$y" -gt 0 ]; do
+		rev+=('='); x=$(( x - 1 )); y=$(( y - 1 ))
+	done
+	for (( k = ${#rev[@]} - 1; k >= 0; k-- )); do ops+=("${rev[k]}"); done
+
+	# group runs of changes into hunks
+	ai=0 bi=0 k=0
+	while [ "$k" -lt "${#ops[@]}" ]; do
+		if [ "${ops[k]}" = '=' ]; then
+			ai=$(( ai + 1 )); bi=$(( bi + 1 )); k=$(( k + 1 ))
+			continue
+		fi
+		as=$(( ai + 1 )); bs=$(( bi + 1 )); dela=0; addb=0
+		while [ "$k" -lt "${#ops[@]}" ] && [ "${ops[k]}" != '=' ]; do
+			if [ "${ops[k]}" = '-' ]; then
+				ai=$(( ai + 1 )); dela=$(( dela + 1 ))
+			else
+				bi=$(( bi + 1 )); addb=$(( addb + 1 ))
+			fi
+			k=$(( k + 1 ))
+		done
+		hunks+=("$as $ai $bs $bi $dela $addb")
+	done
+
+	[ "${#hunks[@]}" -eq 0 ] && return 0
+	status=1
+
+	if [ "$edscript" = 1 ]; then
+		# an ed script is applied back to front
+		for (( k = ${#hunks[@]} - 1; k >= 0; k-- )); do
+			set -- ${hunks[k]}
+			as=$1 ae=$2 bs=$3 be=$4 dela=$5 addb=$6
+			if [ "$dela" -eq 0 ]; then
+				printf '%da\n' $(( as - 1 ))
+			elif [ "$addb" -eq 0 ]; then
+				_bt_diff_range "$as" "$ae"
+				printf '%sd\n' "$_bt_rng"
+			else
+				_bt_diff_range "$as" "$ae"
+				printf '%sc\n' "$_bt_rng"
+			fi
+			if [ "$addb" -gt 0 ]; then
+				for (( i = bs; i <= be; i++ )); do
+					printf '%s\n' "${B[i-1]}"
+				done
+				printf '.\n'
+			fi
+		done
+		return "$status"
+	fi
+
+	for (( k = 0; k < ${#hunks[@]}; k++ )); do
+		set -- ${hunks[k]}
+		as=$1 ae=$2 bs=$3 be=$4 dela=$5 addb=$6
+		if [ "$dela" -eq 0 ]; then
+			_bt_diff_range "$bs" "$be"
+			printf '%da%s\n' $(( as - 1 )) "$_bt_rng"
+			for (( i = bs; i <= be; i++ )); do printf '> %s\n' "${B[i-1]}"; done
+		elif [ "$addb" -eq 0 ]; then
+			_bt_diff_range "$as" "$ae"
+			r1=$_bt_rng
+			printf '%sd%d\n' "$r1" $(( bs - 1 ))
+			for (( i = as; i <= ae; i++ )); do printf '< %s\n' "${A[i-1]}"; done
+		else
+			_bt_diff_range "$as" "$ae"; r1=$_bt_rng
+			_bt_diff_range "$bs" "$be"; r2=$_bt_rng
+			printf '%sc%s\n' "$r1" "$r2"
+			for (( i = as; i <= ae; i++ )); do printf '< %s\n' "${A[i-1]}"; done
+			printf -- '---\n'
+			for (( i = bs; i <= be; i++ )); do printf '> %s\n' "${B[i-1]}"; done
+		fi
+	done
+	return "$status"
+}

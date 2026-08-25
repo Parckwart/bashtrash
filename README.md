@@ -28,7 +28,7 @@ $ cat README.md | head -n 3 | wc -l
 
 This is a toy, and it is meant to be one. It is also a real conformance
 exercise: every utility is checked against GNU coreutils, byte for byte on
-stdout and on exit status, over 6075 comparisons.
+stdout and on exit status, over 6140 comparisons.
 
 ## Use it
 
@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-41 of the 160 utilities in POSIX.1-2017, as of now.
+44 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -62,6 +62,7 @@ Run the test suite with:
 | `cut` | `cut -b list [-n] [file...]` · `cut -c list [file...]` · `cut -f list [-d delim] [-s] [file...]` |
 | `date` | `date [-u] [+format]` |
 | `dd` | `dd [operand...]` (`if` `of` `bs` `ibs` `obs` `count` `skip` `conv`) |
+| `diff` | `diff [-bi] [-e] file1 file2` |
 | `dirname` | `dirname string` |
 | `env` | `env [-i] [name=value]... [utility [argument...]]` |
 | `expand` | `expand [-t tablist] [file...]` |
@@ -71,6 +72,7 @@ Run the test suite with:
 | `head` | `head [-n number] [file...]` |
 | `id` | `id [user]` · `id -G [-n] [user]` · `id -g [-nr] [user]` · `id -u [-nr] [user]` |
 | `join` | `join [-a n] [-e s] [-o list] [-t c] [-v n] [-1 f] [-2 f] file1 file2` |
+| `logname` | `logname` |
 | `nl` | `nl [-p] [-b type] [-d delim] [-f type] [-h type] [-i incr] [-l num] [-n format] [-s sep] [-v start] [-w width] [file]` |
 | `nohup` | `nohup utility [argument...]` |
 | `od` | `od [-v] [-A base] [-j skip] [-N count] [-t type]... [file...]` |
@@ -92,6 +94,7 @@ Run the test suite with:
 | `unexpand` | `unexpand [-a] [-t tablist] [file...]` |
 | `uniq` | `uniq [-c\|-d\|-u] [-f fields] [-s chars] [input [output]]` |
 | `wc` | `wc [-c\|-m] [-lw] [file...]` |
+| `who` | `who [-mTu] [file]` |
 | `xargs` | `xargs [-t] [-E eof] [-I repl] [-L n] [-n n] [-s size] [utility [arg...]]` |
 
 Including the parts that are easy to forget: `--` ends the options and a lone
@@ -142,7 +145,7 @@ $ ./test.sh
 ### fuzz
 ### id
 ...
-==== pass=6075 fail=0 ====
+==== pass=6140 fail=0 ====
 ```
 
 Every case runs twice — once through the bash function, once through the system
@@ -192,16 +195,16 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 41 |
+| implemented here | 44 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **40** |
-| reachable, not yet written | 57 |
+| reachable, not yet written | 54 |
 
 **The ceiling is 98 of 160**, or about 61% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 57 that remain are wildly uneven, too. `true`, `false`, `logname` and
+The 54 that remain are wildly uneven, too. `true`, `false`, `logname` and
 `printf` are afternoons. `awk`, `sed`, `m4`, `bc`, `make`, `lex` and `yacc` are
 interpreters and compilers, each larger than everything here put together,
 written in a language with no arrays of structs and no way to turn a character
@@ -215,6 +218,12 @@ into an integer except `printf '%d' "'$c"`.
 * `cmp -l` uses the `"%d %o %o"` the standard specifies; GNU pads the byte number.
 * `tty` identifies the terminal by comparing device and inode against
   `/proc/self/fd/0`, rather than calling `ttyname()`.
+* `diff` produces a minimal edit script, but when several are equally
+  short the standard does not say which one to emit, and this one does not
+  always choose the same as GNU. `-c` and `-u` are not offered at all:
+  their headers carry the files' modification times.
+* `who` and `logname` parse the login records themselves, there being no
+  `getutent()` to call: on Linux each record is 384 bytes at fixed offsets.
 * `id` and `logname` can't see users served only by NSS (LDAP, SSSD) — reading
   `/etc/passwd` and `/etc/group` is the only lookup available without `getent`.
 * `id` takes one operand, as POSIX specifies; GNU accepts several.
