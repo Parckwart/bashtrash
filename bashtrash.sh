@@ -3335,3 +3335,758 @@ pathchk () {
 	done
 	return "$status"
 }
+# ---------------------------------------------------------------------------
+# strings -- POSIX.1-2017: strings [-a] [-t format] [-n number] [file...]
+# ---------------------------------------------------------------------------
+strings () {
+	local LC_ALL=C
+	local arg opt val minlen=4 tfmt= file fd status=0
+	local i c run runoff off len rc _bt_reason
+	local _bt_buf _bt_nul
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				a)	;;	# whole file is scanned either way here
+				n|t)	if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "strings: option requires an argument -- $opt"
+						return 1
+					fi
+					if [ "$opt" = n ]; then
+						_bt_isnum "$val" || { _bt_err "strings: invalid number: $val"; return 1; }
+						minlen=$(( 10#$val ))
+					else
+						case $val in
+						d|o|x)	tfmt=$val ;;
+						*)	_bt_err "strings: invalid radix: $val"; return 1 ;;
+						esac
+					fi ;;
+				[0-9])	minlen=$opt$arg; arg=
+					_bt_isnum "$minlen" || { _bt_err "strings: invalid number"; return 1; }
+					minlen=$(( 10#$minlen )) ;;
+				*)	_bt_err "strings: illegal option -- $opt"
+					_bt_err "usage: strings [-a] [-t format] [-n number] [file...]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	[ "$minlen" -ge 1 ] || minlen=1
+
+	[ "$#" -eq 0 ] && set -- -
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			fd=0
+		elif [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_why "$file"
+			_bt_err "strings: $file: $_bt_reason"
+			status=1
+			continue
+		fi
+		run= runoff=0 off=0
+		while :; do
+			if _bt_read "$fd"; then rc=0; else rc=1; fi
+			len=${#_bt_buf}
+			for (( i = 0; i < len; i++ )); do
+				c=${_bt_buf:i:1}
+				case $c in
+				# A tab counts as part of a string, as it does elsewhere.
+				[[:print:]]|$'\t')
+					[ -z "$run" ] && runoff=$(( off + i ))
+					run=$run$c ;;
+				*)	if [ "${#run}" -ge "$minlen" ]; then
+						_bt_strings_emit
+					fi
+					run= ;;
+				esac
+			done
+			off=$(( off + len ))
+			# the separating NUL ends any run
+			if [ "$rc" = 0 ] && [ "$_bt_nul" = 1 ]; then
+				if [ "${#run}" -ge "$minlen" ]; then
+					_bt_strings_emit
+				fi
+				run=
+				off=$(( off + 1 ))
+			fi
+			[ "$rc" = 1 ] && break
+		done
+		if [ "${#run}" -ge "$minlen" ]; then
+			_bt_strings_emit
+		fi
+		[ "$fd" = 0 ] || exec {fd}<&-
+	done
+	return "$status"
+}
+
+_bt_strings_emit() {
+	case $tfmt in
+	d)	printf '%7d %s\n' "$runoff" "$run" ;;
+	o)	printf '%7o %s\n' "$runoff" "$run" ;;
+	x)	printf '%7x %s\n' "$runoff" "$run" ;;
+	*)	printf '%s\n' "$run" ;;
+	esac
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# tabs -- POSIX.1-2017: tabs [-n] [+m[n]] / tabs [-T type] n1[,n2,...]
+#
+# The escape sequences are the ANSI ones; a terminfo database is a binary file
+# this could parse, but not one worth parsing.
+# ---------------------------------------------------------------------------
+tabs () {
+	local LC_ALL=C
+	local arg every=8 margin=0 out i col stop
+	local -a stops=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-[0-9]*)	every=${1#-}; stops=(); shift ;;
+		+m*)	margin=${1#+m}; [ -n "$margin" ] || margin=10; shift ;;
+		-T)	shift; [ "$#" -gt 0 ] && shift ;;
+		-T*)	shift ;;
+		-a)	stops=(1 10 16 36 72); every=0; shift ;;
+		-c)	stops=(1 8 12 16 20 55); every=0; shift ;;
+		-f)	stops=(1 7 11 15 19 23); every=0; shift ;;
+		-p)	stops=(1 5 9 13 17 21 25 29 33 37 41 45 49 53 57 61); every=0; shift ;;
+		-s)	stops=(1 10 55); every=0; shift ;;
+		-u)	stops=(1 12 20 44); every=0; shift ;;
+		-*)	_bt_err "tabs: illegal option -- ${1#-}"
+			_bt_err "usage: tabs [-n] [+m[n]] [n1[,n2,...]]"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -gt 0 ]; then
+		if ! _bt_ranges "$1"; then
+			_bt_err "tabs: invalid tab stop: $1"
+			return 1
+		fi
+		stops=(${_bt_lo[@]+"${_bt_lo[@]}"})
+		every=0
+	fi
+
+	# Clear every stop, return to the left margin, then walk right setting
+	# one at each position.
+	printf '\033[3g\r'
+	col=1
+	if [ "${#stops[@]}" -gt 0 ]; then
+		for stop in "${stops[@]}"; do
+			[ "$stop" -ge "$col" ] || continue
+			printf -v out '%*s' $(( stop - col )) ''
+			printf '%s\033H' "$out"
+			col=$stop
+		done
+	else
+		[ "$every" -ge 1 ] || every=8
+		stop=1
+		while [ "$stop" -le 80 ]; do
+			printf -v out '%*s' $(( stop - col )) ''
+			printf '%s\033H' "$out"
+			col=$stop
+			stop=$(( stop + every ))
+		done
+		# Finish at the right-hand edge, as the real one does.
+		if [ "$col" -lt 80 ]; then
+			printf -v out '%*s' $(( 80 - col )) ''
+			printf '%s' "$out"
+		fi
+	fi
+	printf '\r'
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# expr -- POSIX.1-2017: expr operand...
+# ---------------------------------------------------------------------------
+
+# Is $1 a decimal integer, optionally signed?
+_bt_expr_int() {
+	case $1 in
+	''|-|+)		return 1 ;;
+	[-+]*)		case ${1#[-+]} in *[!0-9]*|'') return 1 ;; esac ;;
+	*)		case $1 in *[!0-9]*) return 1 ;; esac ;;
+	esac
+	return 0
+}
+
+# The standard's `:` operand is a BRE; bash's =~ is an ERE, so the metacharacters
+# that differ are swapped over.
+_bt_bre2ere() {
+	local s=$1 out= i c
+	for (( i = 0; i < ${#s}; i++ )); do
+		c=${s:i:1}
+		if [ "$c" = '\' ] && [ $(( i + 1 )) -lt "${#s}" ]; then
+			case ${s:i+1:1} in
+			'('|')'|'{'|'}')	out=$out${s:i+1:1} ;;
+			*)			out=$out'\'${s:i+1:1} ;;
+			esac
+			i=$(( i + 1 ))
+		else
+			case $c in
+			'('|')'|'{'|'}'|'+'|'?'|'|')	out=$out'\'$c ;;
+			*)				out=$out$c ;;
+			esac
+		fi
+	done
+	_bt_re=$out
+}
+
+_bt_expr_peek() {
+	if [ "$_bt_i" -lt "$_bt_n" ]; then
+		_bt_tok=${_bt_A[_bt_i]}
+		return 0
+	fi
+	_bt_tok=
+	return 1
+}
+
+_bt_expr_primary() {
+	if ! _bt_expr_peek; then
+		_bt_err "expr: syntax error"
+		_bt_bad=2
+		return 1
+	fi
+	case $_bt_tok in
+	'+')	# "+ token" is the historical way to hand expr a
+		# string that would otherwise read as an operator.
+		_bt_i=$(( _bt_i + 1 ))
+		if [ "$_bt_i" -ge "$_bt_n" ]; then
+			_bt_err "expr: syntax error: missing argument after '+'"
+			_bt_bad=2
+			return 1
+		fi
+		_bt_val=${_bt_A[_bt_i]}
+		_bt_i=$(( _bt_i + 1 ))
+		return 0 ;;
+	'(')	_bt_i=$(( _bt_i + 1 ))
+		_bt_expr_or || return 1
+		if ! _bt_expr_peek || [ "$_bt_tok" != ')' ]; then
+			_bt_err "expr: syntax error: expected )"
+			_bt_bad=2
+			return 1
+		fi
+		_bt_i=$(( _bt_i + 1 ))
+		return 0 ;;
+	length)	_bt_i=$(( _bt_i + 1 ))
+		_bt_expr_primary || return 1
+		_bt_val=${#_bt_val}
+		return 0 ;;
+	substr)	_bt_i=$(( _bt_i + 1 ))
+		local s p l
+		_bt_expr_primary || return 1; s=$_bt_val
+		_bt_expr_primary || return 1; p=$_bt_val
+		_bt_expr_primary || return 1; l=$_bt_val
+		if ! _bt_expr_int "$p" || ! _bt_expr_int "$l" || [ "$p" -lt 1 ] || [ "$l" -lt 1 ]; then
+			_bt_val=
+		else
+			_bt_val=${s:p-1:l}
+		fi
+		return 0 ;;
+	index)	_bt_i=$(( _bt_i + 1 ))
+		local str chars k j
+		_bt_expr_primary || return 1; str=$_bt_val
+		_bt_expr_primary || return 1; chars=$_bt_val
+		_bt_val=0
+		for (( k = 0; k < ${#str}; k++ )); do
+			for (( j = 0; j < ${#chars}; j++ )); do
+				if [ "${str:k:1}" = "${chars:j:1}" ]; then
+					_bt_val=$(( k + 1 ))
+					return 0
+				fi
+			done
+		done
+		return 0 ;;
+	match)	_bt_i=$(( _bt_i + 1 ))
+		local a b
+		_bt_expr_primary || return 1; a=$_bt_val
+		_bt_expr_primary || return 1; b=$_bt_val
+		_bt_expr_match "$a" "$b"
+		return 0 ;;
+	*)	_bt_val=$_bt_tok
+		_bt_i=$(( _bt_i + 1 ))
+		return 0 ;;
+	esac
+}
+
+# STRING : BRE -- the captured group if the pattern has one, otherwise the
+# number of characters matched.
+_bt_expr_match() {
+	local s=$1 re
+	_bt_bre2ere "$2"
+	re=$_bt_re
+	if [[ $s =~ ^$re ]]; then
+		if [ "${#BASH_REMATCH[@]}" -gt 1 ]; then
+			_bt_val=${BASH_REMATCH[1]}
+		else
+			_bt_val=${#BASH_REMATCH[0]}
+		fi
+	else
+		case $re in
+		*'('*)	_bt_val= ;;
+		*)	_bt_val=0 ;;
+		esac
+	fi
+	return 0
+}
+
+_bt_expr_colon() {
+	local lhs
+	_bt_expr_primary || return 1
+	while _bt_expr_peek && [ "$_bt_tok" = ':' ]; do
+		lhs=$_bt_val
+		_bt_i=$(( _bt_i + 1 ))
+		_bt_expr_primary || return 1
+		_bt_expr_match "$lhs" "$_bt_val"
+	done
+	return 0
+}
+
+_bt_expr_mul() {
+	local lhs op
+	_bt_expr_colon || return 1
+	while _bt_expr_peek; do
+		case $_bt_tok in
+		'*'|'/'|'%')	op=$_bt_tok ;;
+		*)		break ;;
+		esac
+		lhs=$_bt_val
+		_bt_i=$(( _bt_i + 1 ))
+		_bt_expr_colon || return 1
+		if ! _bt_expr_int "$lhs" || ! _bt_expr_int "$_bt_val"; then
+			_bt_err "expr: non-integer argument"
+			_bt_bad=2
+			return 1
+		fi
+		if [ "$op" != '*' ] && [ "$_bt_val" -eq 0 ]; then
+			_bt_err "expr: division by zero"
+			_bt_bad=2
+			return 1
+		fi
+		case $op in
+		'*')	_bt_val=$(( lhs * _bt_val )) ;;
+		'/')	_bt_val=$(( lhs / _bt_val )) ;;
+		'%')	_bt_val=$(( lhs % _bt_val )) ;;
+		esac
+	done
+	return 0
+}
+
+_bt_expr_add() {
+	local lhs op
+	_bt_expr_mul || return 1
+	while _bt_expr_peek; do
+		case $_bt_tok in
+		'+'|'-')	op=$_bt_tok ;;
+		*)		break ;;
+		esac
+		lhs=$_bt_val
+		_bt_i=$(( _bt_i + 1 ))
+		_bt_expr_mul || return 1
+		if ! _bt_expr_int "$lhs" || ! _bt_expr_int "$_bt_val"; then
+			_bt_err "expr: non-integer argument"
+			_bt_bad=2
+			return 1
+		fi
+		if [ "$op" = '+' ]; then
+			_bt_val=$(( lhs + _bt_val ))
+		else
+			_bt_val=$(( lhs - _bt_val ))
+		fi
+	done
+	return 0
+}
+
+_bt_expr_cmp() {
+	local lhs op r
+	_bt_expr_add || return 1
+	while _bt_expr_peek; do
+		case $_bt_tok in
+		'='|'>'|'>='|'<'|'<='|'!=')	op=$_bt_tok ;;
+		*)				break ;;
+		esac
+		lhs=$_bt_val
+		_bt_i=$(( _bt_i + 1 ))
+		_bt_expr_add || return 1
+		if _bt_expr_int "$lhs" && _bt_expr_int "$_bt_val"; then
+			case $op in
+			'=')	[ "$lhs" -eq "$_bt_val" ] && r=1 || r=0 ;;
+			'!=')	[ "$lhs" -ne "$_bt_val" ] && r=1 || r=0 ;;
+			'>')	[ "$lhs" -gt "$_bt_val" ] && r=1 || r=0 ;;
+			'>=')	[ "$lhs" -ge "$_bt_val" ] && r=1 || r=0 ;;
+			'<')	[ "$lhs" -lt "$_bt_val" ] && r=1 || r=0 ;;
+			'<=')	[ "$lhs" -le "$_bt_val" ] && r=1 || r=0 ;;
+			esac
+		else
+			case $op in
+			'=')	[ "$lhs" = "$_bt_val" ] && r=1 || r=0 ;;
+			'!=')	[ "$lhs" != "$_bt_val" ] && r=1 || r=0 ;;
+			'>')	[[ $lhs > $_bt_val ]] && r=1 || r=0 ;;
+			'>=')	[[ ! $lhs < $_bt_val ]] && r=1 || r=0 ;;
+			'<')	[[ $lhs < $_bt_val ]] && r=1 || r=0 ;;
+			'<=')	[[ ! $lhs > $_bt_val ]] && r=1 || r=0 ;;
+			esac
+		fi
+		_bt_val=$r
+	done
+	return 0
+}
+
+_bt_expr_and() {
+	local lhs
+	_bt_expr_cmp || return 1
+	while _bt_expr_peek && [ "$_bt_tok" = '&' ]; do
+		lhs=$_bt_val
+		_bt_i=$(( _bt_i + 1 ))
+		_bt_expr_cmp || return 1
+		if [ -z "$lhs" ] || [ "$lhs" = 0 ] || [ -z "$_bt_val" ] || [ "$_bt_val" = 0 ]; then
+			_bt_val=0
+		else
+			_bt_val=$lhs
+		fi
+	done
+	return 0
+}
+
+_bt_expr_or() {
+	local lhs
+	_bt_expr_and || return 1
+	while _bt_expr_peek && [ "$_bt_tok" = '|' ]; do
+		lhs=$_bt_val
+		_bt_i=$(( _bt_i + 1 ))
+		_bt_expr_and || return 1
+		if [ -n "$lhs" ] && [ "$lhs" != 0 ]; then
+			_bt_val=$lhs
+		fi
+	done
+	return 0
+}
+
+expr () {
+	local LC_ALL=C
+	local -a _bt_A=("$@")
+	local _bt_i=0 _bt_n=$# _bt_val= _bt_tok _bt_re _bt_bad=0
+
+	if [ "$#" -eq 0 ]; then
+		_bt_err "usage: expr operand..."
+		return 2
+	fi
+	if ! _bt_expr_or; then
+		return "$_bt_bad"
+	fi
+	if [ "$_bt_i" -lt "$_bt_n" ]; then
+		_bt_err "expr: syntax error: unexpected ${_bt_A[_bt_i]}"
+		return 2
+	fi
+	printf '%s\n' "$_bt_val"
+	case $_bt_val in
+	''|0)	return 1 ;;
+	esac
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# od -- POSIX.1-2017:
+#	od [-v] [-A address_base] [-j skip] [-N count] [-t type_string]...
+#	   [file...]
+# ---------------------------------------------------------------------------
+
+_BT_OD_NAMES=(nul soh stx etx eot enq ack bel bs ht nl vt ff cr so si
+	      dle dc1 dc2 dc3 dc4 nak syn etb can em sub esc fs gs rs us sp)
+
+# Field width for a type letter and size, matching every other od.
+_bt_od_width() {
+	case $1$2 in
+	o1)	_bt_w=3 ;;	o2)	_bt_w=6 ;;	o4)	_bt_w=11 ;;	o8)	_bt_w=22 ;;
+	x1)	_bt_w=2 ;;	x2)	_bt_w=4 ;;	x4)	_bt_w=8 ;;	x8)	_bt_w=16 ;;
+	d1)	_bt_w=4 ;;	d2)	_bt_w=6 ;;	d4)	_bt_w=11 ;;	d8)	_bt_w=20 ;;
+	u1)	_bt_w=3 ;;	u2)	_bt_w=5 ;;	u4)	_bt_w=10 ;;	u8)	_bt_w=20 ;;
+	*)	_bt_w=3 ;;
+	esac
+	return 0
+}
+
+# Render _bt_ngroup byte values from _bt_vals as type $1 of size $2, with the
+# type's own width $3 and the shared column width $4, into _bt_line.
+_bt_od_group() {
+	local t=$1 sz=$2 w=$3 col=$4 i k v val neg f
+	for (( i = 0; i + sz <= _bt_ngroup; i += sz )); do
+		if [ "$sz" -eq 1 ]; then
+			v=${_bt_vals[i]}
+			case $t in
+			c)	case $v in
+				0)	f='\0' ;;
+				7)	f='\a' ;;
+				8)	f='\b' ;;
+				9)	f='\t' ;;
+				10)	f='\n' ;;
+				11)	f='\v' ;;
+				12)	f='\f' ;;
+				13)	f='\r' ;;
+				*)	if [ "$v" -ge 32 ] && [ "$v" -le 126 ]; then
+						_bt_chr "$v"; f=$_bt_c
+					else
+						printf -v f '%03o' "$v"
+					fi ;;
+				esac
+				printf -v f '%*s' "$col" "$f"
+				_bt_line=$_bt_line' '$f
+				continue ;;
+			a)	k=$(( v & 0x7f ))
+				if [ "$k" -le 32 ]; then
+					f=${_BT_OD_NAMES[k]}
+				elif [ "$k" -eq 127 ]; then
+					f=del
+				else
+					_bt_chr "$k"; f=$_bt_c
+				fi
+				printf -v f '%*s' "$col" "$f"
+				_bt_line=$_bt_line' '$f
+				continue ;;
+			esac
+		fi
+		# little-endian assembly
+		val=0
+		for (( k = sz - 1; k >= 0; k-- )); do
+			val=$(( (val << 8) | _bt_vals[i+k] ))
+		done
+		case $t in
+		d)	neg=$(( 1 << (sz * 8 - 1) ))
+			[ "$val" -ge "$neg" ] && val=$(( val - (neg << 1) ))
+			printf -v f '%*d' "$w" "$val" ;;
+		u)	printf -v f '%*u' "$w" "$val" ;;
+		x)	printf -v f '%0*x' "$w" "$val" ;;
+		*)	printf -v f '%0*o' "$w" "$val" ;;
+		esac
+		# The value keeps its own zero padding; the column is what
+		# lines several -t outputs up with each other.
+		printf -v f '%*s' "$col" "$f"
+		_bt_line=$_bt_line' '$f
+	done
+	# a trailing partial unit still shows the bytes that are there
+	if [ "$sz" -gt 1 ] && [ $(( _bt_ngroup % sz )) -ne 0 ]; then
+		val=0
+		for (( k = _bt_ngroup - 1; k >= i; k-- )); do
+			val=$(( (val << 8) | _bt_vals[k] ))
+		done
+		case $t in
+		d|u)	printf -v f '%*u' "$w" "$val" ;;
+		x)	printf -v f '%0*x' "$w" "$val" ;;
+		*)	printf -v f '%0*o' "$w" "$val" ;;
+		esac
+		printf -v f '%*s' "$col" "$f"
+		_bt_line=$_bt_line' '$f
+	fi
+	return 0
+}
+
+# Write the group currently at the front of _bt_vals.
+_bt_od_emit() {
+	local k first=1 sig
+	if [ "$_bt_verbose" = 0 ] && [ "$_bt_ngroup" -eq 16 ]; then
+		sig=${_bt_vals[*]:0:16}
+		if [ "$sig" = "$_bt_prev" ]; then
+			[ "$_bt_star" = 0 ] && { printf '*\n'; _bt_star=1; }
+			_bt_off=$(( _bt_off + _bt_ngroup ))
+			return 0
+		fi
+		_bt_prev=$sig
+	fi
+	_bt_star=0
+	for (( k = 0; k < ${#_bt_types[@]}; k++ )); do
+		_bt_line=
+		_bt_od_group "${_bt_types[k]}" "${_bt_sizes[k]}" "${_bt_widths[k]}" "${_bt_cols[k]}"
+		if [ "$_bt_abase" = n ]; then
+			printf '%s\n' "$_bt_line"
+		elif [ "$first" = 1 ]; then
+			_bt_od_addr "$_bt_off"
+			printf '%s%s\n' "$_bt_addr" "$_bt_line"
+			first=0
+		else
+			printf '%*s%s\n' "${#_bt_addr}" '' "$_bt_line"
+		fi
+	done
+	_bt_off=$(( _bt_off + _bt_ngroup ))
+	return 0
+}
+
+_bt_od_addr() {
+	case $_bt_abase in
+	d)	printf -v _bt_addr '%07d' "$1" ;;
+	x)	printf -v _bt_addr '%06x' "$1" ;;
+	*)	printf -v _bt_addr '%07o' "$1" ;;
+	esac
+	return 0
+}
+
+od () {
+	local LC_ALL=C
+	local arg opt val file fd status=0 opened=0
+	local i j n b rc len v skip=0 remaining=-1
+	local _bt_w _bt_c _bt_line _bt_ngroup _bt_addr _bt_reason
+	local _bt_buf _bt_nul
+	local _bt_abase=o _bt_verbose=0 _bt_off=0 _bt_prev= _bt_star=0
+	local -a _bt_types=() _bt_sizes=() _bt_widths=() _bt_cols=() _bt_vals=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				v)	_bt_verbose=1 ;;
+				b)	_bt_types+=(o); _bt_sizes+=(1) ;;
+				c)	_bt_types+=(c); _bt_sizes+=(1) ;;
+				d)	_bt_types+=(u); _bt_sizes+=(2) ;;
+				o)	_bt_types+=(o); _bt_sizes+=(2) ;;
+				s)	_bt_types+=(d); _bt_sizes+=(2) ;;
+				x)	_bt_types+=(x); _bt_sizes+=(2) ;;
+				A|j|N|t)
+					if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "od: option requires an argument -- $opt"
+						return 1
+					fi
+					case $opt in
+					A)	case $val in
+						d|o|x|n)	_bt_abase=$val ;;
+						*)	_bt_err "od: invalid address base: $val"; return 1 ;;
+						esac ;;
+					j)	_bt_isnum "$val" || { _bt_err "od: invalid skip: $val"; return 1; }
+						skip=$(( 10#$val )) ;;
+					N)	_bt_isnum "$val" || { _bt_err "od: invalid count: $val"; return 1; }
+						remaining=$(( 10#$val )) ;;
+					t)	i=0
+						while [ "$i" -lt "${#val}" ]; do
+							case ${val:i:1} in
+							a|c)	_bt_types+=("${val:i:1}"); _bt_sizes+=(1); i=$(( i + 1 )) ;;
+							d|o|u|x)
+								opt=${val:i:1}
+								i=$(( i + 1 ))
+								n=
+								while [ "$i" -lt "${#val}" ]; do
+									case ${val:i:1} in
+									[0-9])	n=$n${val:i:1}; i=$(( i + 1 )) ;;
+									C)	n=1; i=$(( i + 1 )); break ;;
+									S)	n=2; i=$(( i + 1 )); break ;;
+									I|L)	n=4; i=$(( i + 1 )); break ;;
+									*)	break ;;
+									esac
+								done
+								[ -n "$n" ] || n=4
+								_bt_types+=("$opt"); _bt_sizes+=("$n") ;;
+							*)	_bt_err "od: invalid type string: $val"; return 1 ;;
+							esac
+						done ;;
+					esac ;;
+				*)	_bt_err "od: illegal option -- $opt"
+					_bt_err "usage: od [-v] [-A base] [-j skip] [-N count] [-t type]... [file...]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "${#_bt_types[@]}" -eq 0 ]; then
+		_bt_types=(o); _bt_sizes=(2)
+	fi
+	# Several -t specs are printed one under the other, so every line
+	# has to come out the same width: each byte gets the same number of
+	# columns, whatever the type covering it.
+	b=1
+	for (( i = 0; i < ${#_bt_types[@]}; i++ )); do
+		_bt_od_width "${_bt_types[i]}" "${_bt_sizes[i]}"
+		_bt_widths[i]=$_bt_w
+		j=$(( (_bt_w + 1 + _bt_sizes[i] - 1) / _bt_sizes[i] ))
+		[ "$j" -gt "$b" ] && b=$j
+	done
+	for (( i = 0; i < ${#_bt_types[@]}; i++ )); do
+		if [ "${#_bt_types[@]}" -eq 1 ]; then
+			# On its own a type just uses its own width.
+			_bt_cols[i]=${_bt_widths[i]}
+		else
+			_bt_cols[i]=$(( b * _bt_sizes[i] - 1 ))
+		fi
+	done
+
+	[ "$#" -eq 0 ] && set -- -
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			fd=0
+		elif [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_why "$file"
+			_bt_err "od: $file: $_bt_reason"
+			status=1
+			continue
+		fi
+		opened=1
+		while :; do
+			if _bt_read "$fd"; then rc=0; else rc=1; fi
+			len=${#_bt_buf}
+			for (( i = 0; i <= len; i++ )); do
+				if [ "$i" -eq "$len" ]; then
+					# the separating NUL, if there was one
+					[ "$rc" = 0 ] && [ "$_bt_nul" = 1 ] || break
+					v=0
+				else
+					printf -v v '%d' "'${_bt_buf:i:1}"
+				fi
+				# -j is applied here so that groups still start on
+				# a sixteen byte boundary from the skip point.
+				if [ "$skip" -gt 0 ]; then
+					skip=$(( skip - 1 ))
+					_bt_off=$(( _bt_off + 1 ))
+					continue
+				fi
+				[ "$remaining" -eq 0 ] && break
+				_bt_vals+=("$v")
+				[ "$remaining" -gt 0 ] && remaining=$(( remaining - 1 ))
+				if [ "${#_bt_vals[@]}" -eq 16 ]; then
+					_bt_ngroup=16
+					_bt_od_emit
+					_bt_vals=()
+				fi
+			done
+			[ "$rc" = 1 ] && break
+			[ "$remaining" -eq 0 ] && break
+		done
+		[ "$fd" = 0 ] || exec {fd}<&-
+		[ "$remaining" -eq 0 ] && break
+	done
+	if [ "${#_bt_vals[@]}" -gt 0 ]; then
+		_bt_ngroup=${#_bt_vals[@]}
+		_bt_od_emit
+	fi
+	# Skipping past the end of the input is an error, as it is
+	# everywhere else.
+	if [ "$skip" -gt 0 ] && [ "$opened" = 1 ]; then
+		_bt_err "od: cannot skip past end of input"
+		return 1
+	fi
+	if [ "$_bt_abase" != n ] && [ "$opened" = 1 ]; then
+		_bt_od_addr "$_bt_off"
+		printf '%s\n' "$_bt_addr"
+	fi
+	return "$status"
+}

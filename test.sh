@@ -567,6 +567,69 @@ if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "asa carriage contro
 a=$( . "$BT"; asa < empty | od -An -c )
 if [ -z "$(printf '%s' "$a" | tr -d ' \n')" ]; then pass=$((pass + 1)); else note_fail "asa empty"; fi
 
+# --- strings, tabs, expr, od ----------------------------------------------
+echo "### strings tabs expr od"
+printf 'ab\000hello world\000\001\002longenough\000x\n' > stin
+for o in "" "-n 4" "-n 2" "-n 20" "-t d" "-t o" "-t x" "-a" "-n 5 -t d"; do
+	# shellcheck disable=SC2086
+	if [ -z "$o" ]; then chk "strings" strings stin; else chk "strings $o" strings $o stin; fi
+done
+chk "strings binary"  strings binary
+chk "strings rand"    strings rand.bin
+chk "strings missing" strings no-such-file
+
+for o in -8 -4 -16 "1,10,20" "1,5,9,13" -a -c -f -p -s -u ""; do
+	# shellcheck disable=SC2086
+	a=$( . "$BT"; tabs $o 2>/dev/null | od -An -c )
+	# shellcheck disable=SC2086
+	b=$( "$(real_of tabs)" $o 2>/dev/null | od -An -c )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "tabs $o"; fi
+done
+
+exprchk() {
+	( . "$BT"; expr "$@" ) > bt.out 2>/dev/null; local a=$?
+	"$(real_of expr)" "$@" > re.out 2>/dev/null; local b=$?
+	if cmp -s bt.out re.out && [ "$a" = "$b" ]; then pass=$((pass + 1))
+	else note_fail "expr $* ($a vs $b)"; fi
+}
+exprchk 1 + 2;         exprchk 5 - 8;          exprchk 3 '*' 4
+exprchk 10 / 3;        exprchk 10 % 3;         exprchk 2 + 3 '*' 4
+exprchk '(' 2 + 3 ')' '*' 4
+exprchk abc = abc;     exprchk abc = abd;      exprchk 5 = 5
+exprchk 5 '<' 10;      exprchk 5 '>' 10;       exprchk a '<' b
+exprchk 10 '<' 9;      exprchk 3 '!=' 4;       exprchk 3 '>=' 3
+exprchk length abcdef; exprchk substr abcdef 2 3
+exprchk index abcdef cd; exprchk index abcdef zz
+exprchk abc : 'a.c';   exprchk abcdef : 'abc'; exprchk abc : 'x'
+exprchk 'abc123' : '[a-z]*\([0-9]*\)'
+exprchk match abcdef abc
+exprchk 1 '|' 2;       exprchk 0 '|' 2;        exprchk '' '|' 5
+exprchk 1 '&' 2;       exprchk 0 '&' 2
+exprchk 0;             exprchk '';             exprchk abc
+exprchk 1 +;           exprchk +;              exprchk + 1
+exprchk + abc;         exprchk 1 / 0
+
+printf 'abc\n' > odin
+printf 'abcdefghijklmnopqrstuvwxyz0123456789\n' > odw
+head -c 64 /dev/zero > odz
+printf 'A\000B\000\000C\n' > odn
+for f in odin odw odz odn empty binary; do
+	for o in "" -c -b -x -o -d -s "-An -c" "-Ad -c" "-Ax -c" \
+	         "-t x1" "-t o1" "-t d1" "-t u1" "-t x2" "-t d2" "-t u4" "-t o4" \
+	         "-t a" "-t c" "-v -t x1" "-t x4"; do
+		# shellcheck disable=SC2086
+		if [ -z "$o" ]; then chk "od $f" od "$f"; else chk "od $o $f" od $o "$f"; fi
+	done
+done
+for o in "-j 3 -t x1" "-j 1 -c" "-j 20 -t x1" "-j 100 -c" "-N 5 -t x1" "-N 1 -c" \
+         "-N 100 -c" "-N 0 -c" "-j 2 -N 4 -c" "-t x1 -t c" "-t x1c" "-c -x" \
+         "-t d1 -t c" "-t x1 -t x2" "-b -c -x" "-t c -t a"; do
+	# shellcheck disable=SC2086
+	chk "od $o" od $o odw
+done
+chk "od missing"  od no-such-file
+chk "od two"      od -t x1 odin odw
+
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"
 out=$(env -i PATH= "$BASH" --noprofile --norc -c '

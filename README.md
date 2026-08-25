@@ -28,7 +28,7 @@ $ cat README.md | head -n 3 | wc -l
 
 This is a toy, and it is meant to be one. It is also a real conformance
 exercise: every utility is checked against GNU coreutils, byte for byte on
-stdout and on exit status, over 5465 comparisons.
+stdout and on exit status, over 5677 comparisons.
 
 ## Use it
 
@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-28 of the 160 utilities in POSIX.1-2017, as of now.
+32 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -61,16 +61,20 @@ Run the test suite with:
 | `cut` | `cut -b list [-n] [file...]` · `cut -c list [file...]` · `cut -f list [-d delim] [-s] [file...]` |
 | `date` | `date [-u] [+format]` |
 | `dirname` | `dirname string` |
+| `expr` | `expr operand...` |
 | `env` | `env [-i] [name=value]... [utility [argument...]]` |
 | `expand` | `expand [-t tablist] [file...]` |
 | `fold` | `fold [-bs] [-w width] [file...]` |
 | `head` | `head [-n number] [file...]` |
 | `id` | `id [user]` · `id -G [-n] [user]` · `id -g [-nr] [user]` · `id -u [-nr] [user]` |
 | `nl` | `nl [-p] [-b type] [-d delim] [-f type] [-h type] [-i incr] [-l num] [-n format] [-s sep] [-v start] [-w width] [file]` |
+| `od` | `od [-v] [-A base] [-j skip] [-N count] [-t type]... [file...]` |
 | `paste` | `paste [-s] [-d list] file...` |
 | `pathchk` | `pathchk [-p] pathname...` |
 | `sleep` | `sleep time` |
 | `split` | `split [-l line_count] [-a suffix_length] [file [name]]` · `split -b n[k\|m] ...` |
+| `strings` | `strings [-a] [-t format] [-n number] [file...]` |
+| `tabs` | `tabs [-n] [+m[n]] [n1[,n2,...]]` |
 | `tail` | `tail [-f] [-c number \| -n number] [file]` |
 | `tee` | `tee [-ai] [file...]` |
 | `tr` | `tr [-c\|-C] [-s] string1 string2` · `tr -d [-c\|-C] string1` · `tr -s ...` · `tr -ds ...` |
@@ -129,7 +133,7 @@ $ ./test.sh
 ### fuzz
 ### id
 ...
-==== pass=5465 fail=0 ====
+==== pass=5677 fail=0 ====
 ```
 
 Every case runs twice — once through the bash function, once through the system
@@ -167,6 +171,7 @@ So these are permanently out of reach, not merely unfinished:
 | `nice` `renice` `newgrp` `ipcrm` `logger` | `setpriority()`, `setgid()`, SysV IPC, `AF_UNIX` — bash only speaks TCP/UDP |
 | `at` `batch` `crontab` `lp` `uucp` `uustat` `uux` | need a daemon or a mode-protected spool |
 | `c99` `fort77` `strip` | must produce an executable, which needs the exec bit |
+| `time` | `time` is a bash reserved word: `time() { ... }` will not even parse |
 | `getconf` | `sysconf()` values are compile-time constants, readable nowhere |
 
 Some of those are only *partly* dead: `cp` copies contents fine and fails POSIX
@@ -178,16 +183,16 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 28 |
+| implemented here | 32 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
-| **unreachable from a builtin** | **39** |
-| reachable, not yet written | 71 |
+| **unreachable from a builtin** | **40** |
+| reachable, not yet written | 66 |
 
-**The ceiling is 99 of 160**, or about 62% of the standard. Getting past that
+**The ceiling is 98 of 160**, or about 61% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 71 that remain are wildly uneven, too. `true`, `false`, `logname` and
+The 66 that remain are wildly uneven, too. `true`, `false`, `logname` and
 `printf` are afternoons. `awk`, `sed`, `m4`, `bc`, `make`, `lex` and `yacc` are
 interpreters and compilers, each larger than everything here put together,
 written in a language with no arrays of structs and no way to turn a character
