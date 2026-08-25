@@ -17753,3 +17753,392 @@ _bt_awk_shut() {
 	return 0
 }
 
+
+# ---------------------------------------------------------------------------
+# gencat -- POSIX.1-2017:  gencat catfile msgfile...
+#
+# The catalogue written here is the one the C library reads: a magic number,
+# then a hash table taking a set and a message number to a place in a pool of
+# strings, then the pool itself.  The hash is (set + 1) * message modulo the
+# table size, collisions go into further planes of the same table, and the
+# table is written twice, once in each byte order, so either end can read it.
+# ---------------------------------------------------------------------------
+
+# Make sure set $1 is known, and say what it is called inside the file: one
+# more than its number, since zero marks an empty slot.  A set not seen before
+# goes to the front of the list, which is what decides the order of the
+# strings in the pool.
+_bt_gencat_set() {
+	_gc_set=$(( $1 + 1 ))
+	unset '_gc_dead[$_gc_set]'
+	case " $_gc_order " in
+	*" $_gc_set "*)	return 0 ;;
+	esac
+	_gc_order="$_gc_set $_gc_order"
+	return 0
+}
+
+# Put message $2 of set $1 in place, keeping the numbers in order.  A message
+# with no text takes the message away, which is what the standard asks for.
+_bt_gencat_put() {
+	local set=$1 num=$2 text=$3 out= n placed=0
+	if [ -z "$text" ]; then
+		for n in ${_gc_nums[$set]-}; do
+			[ "$n" = "$num" ] && continue
+			out="$out $n"
+		done
+		_gc_nums[$set]=${out# }
+		unset '_gc_msg[$set,$num]'
+		_gc_gone[$set,$num]=1
+		return 0
+	fi
+	unset '_gc_gone[$set,$num]'
+	if [ -n "${_gc_msg[$set,$num]+x}" ]; then
+		_gc_msg[$set,$num]=$text
+		return 0
+	fi
+	_gc_msg[$set,$num]=$text
+	for n in ${_gc_nums[$set]-}; do
+		if [ "$placed" = 0 ] && [ "$n" -gt "$num" ]; then
+			out="$out $num"
+			placed=1
+		fi
+		out="$out $n"
+	done
+	[ "$placed" = 0 ] && out="$out $num"
+	_gc_nums[$set]=${out# }
+	return 0
+}
+
+# Take set $1 away, messages and all.
+_bt_gencat_delset() {
+	local set=$(( $1 + 1 )) n out=
+	for n in $_gc_order; do
+		[ "$n" = "$set" ] && continue
+		out="$out $n"
+	done
+	_gc_order=${out# }
+	for n in ${_gc_nums[$set]-}; do
+		unset '_gc_msg[$set,$n]'
+	done
+	unset '_gc_nums[$set]'
+	_gc_dead[$set]=1
+	return 0
+}
+
+# Strip the quotes off $1 and turn its escapes into the characters they stand
+# for, into _bt_str.
+_bt_gencat_norm() {
+	local s=$1 n=${#1} i=0 out= c d v q=$_gc_quote
+	if [ -n "$q" ] && [ "${s:0:1}" = "$q" ]; then
+		i=1
+	fi
+	while [ "$i" -lt "$n" ]; do
+		c=${s:i:1}
+		if [ -n "$q" ] && [ "$c" = "$q" ]; then
+			break
+		fi
+		if [ "$c" != '\' ]; then
+			out=$out$c
+			i=$(( i + 1 ))
+			continue
+		fi
+		i=$(( i + 1 ))
+		d=${s:i:1}
+		if [ -n "$q" ] && [ "$d" = "$q" ]; then
+			out=$out$d
+			i=$(( i + 1 ))
+			continue
+		fi
+		case $d in
+		n)	out=$out$'\n'; i=$(( i + 1 )) ;;
+		t)	out=$out$'\t'; i=$(( i + 1 )) ;;
+		v)	out=$out$'\v'; i=$(( i + 1 )) ;;
+		b)	out=$out$'\b'; i=$(( i + 1 )) ;;
+		r)	out=$out$'\r'; i=$(( i + 1 )) ;;
+		f)	out=$out$'\f'; i=$(( i + 1 )) ;;
+		[0-7])	v=0
+			while [ "$v" -le 31 ]; do
+				case ${s:i:1} in
+				[0-7])	v=$(( v * 8 + ${s:i:1} )); i=$(( i + 1 )) ;;
+				*)	break ;;
+				esac
+			done
+			if [ "$v" != 0 ]; then
+				_bt_chr "$v"
+				out=$out$_bt_c
+			fi ;;
+		'\')	out=$out'\'; i=$(( i + 1 )) ;;
+		esac
+		# any other escape simply loses its backslash
+	done
+	_bt_str=$out
+	return 0
+}
+
+# Read one message source file.
+_bt_gencat_read() {
+	local fd line acc more=1 t nb num text word rest
+	if [ "$1" = - ] || [ "$1" = /dev/stdin ]; then
+		fd=0
+		_gc_any=1
+	elif { exec {fd}<"$1"; } 2>/dev/null; then
+		_gc_any=1
+	else
+		_bt_err "gencat: cannot open input file \`$1'"
+		_gc_status=1
+		return 1
+	fi
+	while [ "$more" = 1 ]; do
+		acc=
+		while :; do
+			line=
+			IFS= read -r line <&"$fd" || more=0
+			# an odd number of backslashes at the end of a line
+			# carries it on to the next
+			t=$line
+			nb=0
+			while [ "${t%\\}" != "$t" ]; do
+				t=${t%\\}
+				nb=$(( nb + 1 ))
+			done
+			if [ "$more" = 1 ] && [ $(( nb % 2 )) = 1 ]; then
+				acc=$acc${line%?}
+				continue
+			fi
+			acc=$acc$line
+			break
+		done
+		[ "$more" = 0 ] && [ -z "$acc" ] && break
+		case $acc in
+		'$'[' 	']*)	;;			# a comment
+		'$set'*)
+			rest=${acc#'$set'}
+			rest=${rest#"${rest%%[![:space:]]*}"}
+			case $rest in
+			[0-9]*)	num=${rest%%[!0-9]*}
+				_bt_gencat_set "$(( 10#$num ))"
+				_gc_cur=$_gc_set ;;
+			*)	_bt_err "gencat: illegal set number"
+				_gc_status=1 ;;
+			esac ;;
+		'$delset'*)
+			rest=${acc#'$delset'}
+			rest=${rest#"${rest%%[![:space:]]*}"}
+			case $rest in
+			[0-9]*)	num=${rest%%[!0-9]*}
+				_bt_gencat_delset "$(( 10#$num ))" ;;
+			*)	_bt_err "gencat: illegal set number"
+				_gc_status=1 ;;
+			esac ;;
+		'$quote'*)
+			rest=${acc#'$quote'}
+			rest=${rest#"${rest%%[![:space:]]*}"}
+			_gc_quote=${rest:0:1} ;;
+		'$'*)	word=${acc%%[[:space:]]*}
+			_bt_err "gencat: unknown directive \`${word#?}': line ignored"
+			_gc_status=1 ;;
+		[0-9]*)
+			num=${acc%%[!0-9]*}
+			text=${acc#"$num"}
+			case $text in
+			[' 	']*)	text=${text#?} ;;
+			esac
+			_bt_gencat_norm "$text"
+			num=$(( 10#$num ))
+			# the first definition of a number is the one that
+			# stands; a second is an error
+			if [ -n "${_gc_msg[$_gc_cur,$num]+x}" ]; then
+				_bt_err "gencat: duplicated message number"
+				_gc_status=1
+			else
+				_bt_gencat_put "$_gc_cur" "$num" "$_bt_str"
+			fi
+			_gc_total=$(( _gc_total + 1 )) ;;
+		*[![:space:]]*)
+			_bt_err "gencat: invalid line"
+			_gc_status=1 ;;
+		esac
+	done
+	[ "$fd" != 0 ] && exec {fd}<&-
+	return 0
+}
+
+# Read the catalogue that is already there, if any, and keep whatever the new
+# messages do not replace.
+_bt_gencat_old() {
+	local f=$1 i n size depth off end s m p text b
+	[ -e "$f" ] || return 0
+	_bt_file_bytes "$f" || return 0
+	n=${#_bt_b[@]}
+	[ "$n" -lt 12 ] && return 0
+	# the header is in the byte order of whoever wrote it
+	if [ "${_bt_b[0]}" = 222 ] && [ "${_bt_b[1]}" = 8 ] &&
+	   [ "${_bt_b[2]}" = 4 ] && [ "${_bt_b[3]}" = 150 ]; then
+		:
+	else
+		_bt_err "gencat: $f is not a message catalogue"
+		_gc_status=1
+		return 1
+	fi
+	size=$(( _bt_b[4] | _bt_b[5] << 8 | _bt_b[6] << 16 | _bt_b[7] << 24 ))
+	depth=$(( _bt_b[8] | _bt_b[9] << 8 | _bt_b[10] << 16 | _bt_b[11] << 24 ))
+	end=$(( 12 + size * depth * 3 * 4 ))
+	off=$(( end + size * depth * 3 * 4 ))
+	for (( i = 0; i < size * depth; i++ )); do
+		p=$(( 12 + i * 12 ))
+		s=$(( _bt_b[p] | _bt_b[p+1] << 8 | _bt_b[p+2] << 16 | _bt_b[p+3] << 24 ))
+		[ "$s" = 0 ] && continue
+		m=$(( _bt_b[p+4] | _bt_b[p+5] << 8 | _bt_b[p+6] << 16 | _bt_b[p+7] << 24 ))
+		b=$(( _bt_b[p+8] | _bt_b[p+9] << 8 | _bt_b[p+10] << 16 | _bt_b[p+11] << 24 ))
+		# a message the new source deleted stays deleted
+		[ -n "${_gc_gone[$s,$m]+x}" ] && continue
+		[ -n "${_gc_dead[$s]+x}" ] && continue
+		[ -n "${_gc_msg[$s,$m]+x}" ] && continue
+		text=
+		p=$(( off + b ))
+		while [ "$p" -lt "$n" ] && [ "${_bt_b[p]}" != 0 ]; do
+			_bt_chr "${_bt_b[p]}"
+			text=$text$_bt_c
+			p=$(( p + 1 ))
+		done
+		_bt_gencat_set "$(( s - 1 ))"
+		_bt_gencat_put "$s" "$m" "$text"
+		_gc_total=$(( _gc_total + 1 ))
+	done
+	_bt_b=()
+	return 0
+}
+
+# Add $1 to the run of bytes being built, four bytes at a time, smallest
+# first and then largest first.
+_bt_gencat_le() {
+	local v=$1
+	printf -v _gc_esc '%s\\0%03o\\0%03o\\0%03o\\0%03o' "$_gc_esc" \
+	       $(( v & 255 )) $(( (v >> 8) & 255 )) $(( (v >> 16) & 255 )) \
+	       $(( (v >> 24) & 255 ))
+	return 0
+}
+
+_bt_gencat_be() {
+	local v=$1
+	printf -v _gc_esc '%s\\0%03o\\0%03o\\0%03o\\0%03o' "$_gc_esc" \
+	       $(( (v >> 24) & 255 )) $(( (v >> 16) & 255 )) $(( (v >> 8) & 255 )) \
+	       $(( v & 255 ))
+	return 0
+}
+
+# Work out how big the table wants to be and write the whole thing out.
+_bt_gencat_write() {
+	local out=$1 fd s n i idx off act_size act_depth
+	local best_total=4294967295 best_size=4294967295 best_depth=4294967295
+	local -a deep=() t=()
+	act_size=$(( 1 + _gc_total / 5 ))
+	while [ "$act_size" -le "$best_total" ]; do
+		deep=()
+		act_depth=1
+		for s in $_gc_order; do
+			for n in ${_gc_nums[$s]-}; do
+				idx=$(( (n * s) % act_size ))
+				deep[idx]=$(( ${deep[idx]-0} + 1 ))
+				if [ "${deep[idx]}" -gt "$act_depth" ]; then
+					act_depth=${deep[idx]}
+					[ $(( act_depth * act_size )) -gt "$best_total" ] && break
+				fi
+			done
+		done
+		if [ $(( act_depth * act_size )) -le "$best_total" ]; then
+			best_total=$(( act_depth * act_size ))
+			best_size=$act_size
+			best_depth=$act_depth
+		fi
+		act_size=$(( act_size + 1 ))
+	done
+	if [ "$best_size" = 4294967295 ]; then
+		best_size=1
+		best_depth=1
+	fi
+
+	for (( i = 0; i < best_size * best_depth * 3; i++ )); do
+		t[i]=0
+	done
+	off=0
+	for s in $_gc_order; do
+		for n in ${_gc_nums[$s]-}; do
+			idx=$(( ((n * s) % best_size) * 3 ))
+			while [ "${t[idx]}" != 0 ]; do
+				idx=$(( idx + best_size * 3 ))
+			done
+			t[idx]=$s
+			t[idx+1]=$n
+			t[idx+2]=$off
+			off=$(( off + ${#_gc_msg[$s,$n]} + 1 ))
+		done
+	done
+
+	if [ "$out" = - ] || [ "$out" = /dev/stdout ]; then
+		fd=1
+	elif ! { exec {fd}>"$out"; } 2>/dev/null; then
+		_bt_err "gencat: cannot open output file \`$out'"
+		return 1
+	fi
+	_gc_esc=
+	_bt_gencat_le 2516846814
+	_bt_gencat_le "$best_size"
+	_bt_gencat_le "$best_depth"
+	for (( i = 0; i < best_size * best_depth * 3; i++ )); do
+		_bt_gencat_le "${t[i]}"
+	done
+	for (( i = 0; i < best_size * best_depth * 3; i++ )); do
+		_bt_gencat_be "${t[i]}"
+	done
+	printf '%b' "$_gc_esc" >&"$fd"
+	for s in $_gc_order; do
+		for n in ${_gc_nums[$s]-}; do
+			printf '%s\0' "${_gc_msg[$s,$n]}" >&"$fd"
+		done
+	done
+	[ "$fd" != 1 ] && exec {fd}>&-
+	return 0
+}
+
+gencat () {
+	local LC_ALL=C
+	local catfile f _bt_str _bt_c _gc_esc=
+	local _gc_order= _gc_cur=2 _gc_quote= _gc_total=0 _gc_status=0 _gc_set=0
+	local _gc_any=0
+	local -A _gc_msg=() _gc_nums=() _gc_gone=() _gc_dead=()
+	local -a _bt_b=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	_bt_err "gencat: unknown option $1"
+			_bt_err "usage: gencat catfile msgfile..."
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -lt 2 ]; then
+		_bt_err "usage: gencat catfile msgfile..."
+		return 1
+	fi
+	catfile=$1
+	shift
+	# a message with no set of its own belongs to set 1, which is on the
+	# list from the start whether anything is put in it or not
+	_bt_gencat_set 1
+	_gc_cur=$_gc_set
+	for f in "$@"; do
+		_bt_gencat_read "$f"
+	done
+	# with nothing read at all there is nothing to write, and the
+	# catalogue that was there is left alone
+	if [ "$_gc_any" = 0 ]; then
+		return 1
+	fi
+	_bt_gencat_old "$catfile" || return 1
+	_bt_gencat_write "$catfile" || return 1
+	return "$_gc_status"
+}

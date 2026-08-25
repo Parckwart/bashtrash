@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-75 of the 160 utilities in POSIX.1-2017, as of now.
+76 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -77,6 +77,7 @@ Run the test suite with:
 | `expr` | `expr operand...` |
 | `fold` | `fold [-bs] [-w width] [file...]` |
 | `fuser` | `fuser [-cfu] file...` |
+| `gencat` | `gencat catfile msgfile...` |
 | `get` | `get [-e] [-k] [-p] [-s] [-g] [-r SID] s.file...` |
 | `grep` | `grep [-E\|-F] [-c\|-l\|-q] [-insvx] [-e pattern] [-f file] [file...]` |
 | `head` | `head [-n number] [file...]` |
@@ -215,6 +216,16 @@ more digits than a double has. Whether a comparison is done on numbers or on
 text follows the standard's rule about where the value came from, so `$1 == 0`
 is true for a field holding `0.0` and false for one holding `x`.
 
+**`gencat` writes a hash table, and picks its shape the way gencat does.**
+A message catalogue is a table taking a set and a message number to a place in
+a pool of strings; the hash is `(set + 1) * message` modulo the table's width,
+collisions go into further planes of the same table, and the whole table is
+written twice, once in each byte order, so either end can read it. The width
+and the number of planes are chosen by trying widths from `1 + messages / 5`
+upwards and keeping the one whose width times depth is smallest, which is
+exactly the search the C library's own gencat makes — get it wrong and the
+file is still readable but no longer byte for byte the same.
+
 **`m4` puts what a macro expanded to back in front of the cursor** and reads it
 again, which is m4's whole model and the reason a macro can call itself. The
 arguments of a call are collected with their quoting intact and expanded on
@@ -306,16 +317,16 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 75 |
+| implemented here | 76 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **52** |
-| reachable, not yet written | 11 |
+| reachable, not yet written | 10 |
 
 **The ceiling is 86 of 160**, or about 54% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 11 that remain are wildly uneven. `lex` and `yacc` are compilers whose
+The 10 that remain are wildly uneven. `lex` and `yacc` are compilers whose
 output is C, and `sh` would be a shell written in a shell.
 
 ### Smaller deviations, all deliberate
@@ -364,6 +375,12 @@ output is C, and `sh` would be a shell written in a shell.
   does and not what mawk does; a `printf` given fewer arguments than
   conversions treats the missing ones as empty, as the standard says, rather
   than stopping.
+* `gencat` writes the catalogue with the low byte first, as every machine
+  this is likely to run on does; the table it writes second is the big endian
+  one, which is what the C library reads on a big endian machine. `$delset`
+  takes the set away, and a message line with no text takes the message away,
+  both as the standard says; the C library's gencat quietly ignores the first
+  and leaves an empty message behind for the second.
 * `make` hands each command line to a subshell of the shell it is running in,
   rather than to `/bin/sh`, so a recipe can use anything this library defines
   and nothing it does not. Whether a target is out of date is decided with the

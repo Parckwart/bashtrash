@@ -28,7 +28,7 @@ for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          nohup pr dd sed who logname diff cal fuser ipcs patch tput \
          what uuencode uudecode write ps ed m4 iconv ar locale nm \
          admin delta get prs rmdel sact sccs unget val \
-         compress uncompress zcat bc make awk; do
+         compress uncompress zcat bc make awk gencat; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -2742,6 +2742,108 @@ read y'
 	awkis 'a ' 'BEGIN { printf "%s %s\n", "a" }'
 	awkis '1' 'BEGIN { print 0.1 + 0.2 == 0.3 }'
 	awkis '-1' 'BEGIN { print system("true") }'
+
+	cd .. || exit 1
+fi
+
+# --- gencat -----------------------------------------------------------------
+# The catalogue is a binary file with a hash table in it, so the test is a
+# byte for byte comparison with the system gencat.
+echo "### gencat"
+if command -v gencat > /dev/null 2>&1; then
+	RGEN=$(real_of gencat)
+	mkdir -p gct
+	cd gct || exit 1
+
+	gcchk() {	# gcchk description msgfile...
+		local desc=$1 a b
+		shift
+		rm -f ga.cat gb.cat
+		"$RGEN" ga.cat "$@" > /dev/null 2>&1; a=$?
+		( . "$BT"; gencat gb.cat "$@" ) > /dev/null 2>&1; b=$?
+		if [ "$a" = "$b" ] &&
+		   { cmp -s ga.cat gb.cat ||
+		     { [ ! -e ga.cat ] && [ ! -e gb.cat ]; }; }; then
+			pass=$((pass + 1))
+		else note_fail "gencat $desc ($a vs $b)"; fi
+	}
+
+	printf '$set 1\n1 Hello\n2 World\n' > g1.msg
+	printf '1 no set given\n2 second message\n' > g2.msg
+	printf '$set 1\n1 A\n2 B\n$set 2\n1 C\n' > g3.msg
+	printf '$set 5\n1 five\n$set 2\n7 two\n$set 9\n3 nine\n$set 1\n4 one\n' > g4.msg
+	printf '$set 1\n1 tab\\there\n2 newline\\nhere\n3 octal\\101\\102\n4 back\\\\slash\n5 unknown \\q escape\n' > g5.msg
+	printf '$quote "\n$set 1\n1 "quoted text"\n2 "with \\"inner\\" quotes"\n$quote\n3 "not quoted now"\n' > g6.msg
+	printf '$set 1\n1 first part \\\n and the rest\n2 plain\n' > g7.msg
+	printf '$ a comment\n$set 1\n1 A\n$ another comment\n2 B\n' > g8.msg
+	printf '$set 1\n1 first\n1 second definition\n' > g9.msg
+	printf '' > g10.msg
+	printf '$set 3\n1 m1\n7 m7\n55 m55\n100 m100\n1000 m1000\n' > g11.msg
+	: > g12.msg
+	i=1
+	{ echo '$set 1'; while [ "$i" -le 60 ]; do echo "$i message number $i"; i=$((i + 1)); done; } > g12.msg
+
+	gcchk "a small catalogue" g1.msg
+	gcchk "messages with no set of their own" g2.msg
+	gcchk "two sets" g3.msg
+	gcchk "sets out of order" g4.msg
+	gcchk "escape sequences" g5.msg
+	gcchk "quoted messages" g6.msg
+	gcchk "a continued line" g7.msg
+	gcchk "comments" g8.msg
+	gcchk "a repeated message number" g9.msg
+	gcchk "an empty source file" g10.msg
+	gcchk "sparse message numbers" g11.msg
+	gcchk "sixty messages" g12.msg
+	gcchk "two source files" g1.msg g3.msg
+	gcchk "a source file that is not there" nosuch.msg
+	gcchk "one good source and one missing" g1.msg nosuch.msg
+
+	# merging into a catalogue that is already there
+	gcmerge() {	# gcmerge description msgfile...
+		local desc=$1 a b
+		shift
+		rm -f ga.cat gb.cat
+		for f in "$@"; do
+			"$RGEN" ga.cat "$f" > /dev/null 2>&1
+			( . "$BT"; gencat gb.cat "$f" ) > /dev/null 2>&1
+		done
+		if cmp -s ga.cat gb.cat; then pass=$((pass + 1))
+		else note_fail "gencat merging $desc"; fi
+	}
+	printf '$set 2\n1 C\n2 D\n' > gm1.msg
+	printf '$set 1\n3 added later\n' > gm2.msg
+	printf '$set 1\n1 replaced\n' > gm3.msg
+	gcmerge "a new set" g1.msg gm1.msg
+	gcmerge "into the same set" g1.msg gm2.msg
+	gcmerge "replacing a message" g1.msg gm3.msg
+	gcmerge "three times over" g1.msg gm1.msg gm2.msg
+	gcmerge "a big one twice" g12.msg g11.msg
+
+	# reading back what was written proves the table can be walked
+	rm -f gb.cat
+	( . "$BT"; gencat gb.cat g4.msg ) > /dev/null 2>&1
+	printf '$set 7\n1 fresh\n' > gm4.msg
+	a=$( . "$BT"; gencat gb.cat gm4.msg > /dev/null 2>&1; echo $? )
+	rm -f ga.cat
+	"$RGEN" ga.cat g4.msg > /dev/null 2>&1
+	"$RGEN" ga.cat gm4.msg > /dev/null 2>&1
+	if [ "$a" = 0 ] && cmp -s ga.cat gb.cat; then pass=$((pass + 1))
+	else note_fail "gencat reading back its own catalogue"; fi
+
+	# where the standard and the system gencat part company
+	printf '$set 1\n1 A\n2 B\n$delset 1\n' > gd.msg
+	rm -f gb.cat
+	( . "$BT"; gencat gb.cat gd.msg ) > /dev/null 2>&1
+	if ! od -An -c gb.cat | grep -q '[AB]'; then pass=$((pass + 1))
+	else note_fail "gencat: \$delset should empty the set"; fi
+	printf '$set 1\n1 A\n2 B\n' > ge1.msg
+	printf '$set 1\n1\n' > ge2.msg
+	rm -f gb.cat
+	( . "$BT"; gencat gb.cat ge1.msg ) > /dev/null 2>&1
+	( . "$BT"; gencat gb.cat ge2.msg ) > /dev/null 2>&1
+	if od -An -c gb.cat | tr -d ' \n' | grep -q 'B\\0$'; then pass=$((pass + 1))
+	else note_fail "gencat: an empty message should take the message away"; fi
 
 	cd .. || exit 1
 fi
