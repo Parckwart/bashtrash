@@ -28,7 +28,7 @@ for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          nohup pr dd sed who logname diff cal fuser ipcs patch tput \
          what uuencode uudecode write ps ed m4 iconv ar locale nm \
          admin delta get prs rmdel sact sccs unget val \
-         compress uncompress zcat bc make awk gencat; do
+         compress uncompress zcat bc make awk gencat ctags; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -2847,6 +2847,167 @@ if command -v gencat > /dev/null 2>&1; then
 
 	cd .. || exit 1
 fi
+
+# --- ctags ------------------------------------------------------------------
+# There is no ctags on this system to compare against, so the objects it finds
+# in a file written for the purpose are checked one by one, and every search
+# pattern it writes has to find the line it points at.
+echo "### ctags"
+mkdir -p ctt
+cd ctt || exit 1
+
+cat > c1.c <<'CEOF'
+/* a sample file: braces in a comment { } */
+#include <stdio.h>
+
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
+#define LIMIT 100
+
+typedef struct node {
+	int value;
+	struct node *next;
+} node_t, *node_p;
+
+typedef int (*compare_fn)(const void *, const void *);
+
+static int counter = 0;
+static const char *table[] = { "a", "b" };
+char *s = "a string with { } and /* not a comment */";
+
+int add(int a, int b)
+{
+	return a + b;
+}
+
+static void
+helper(node_t *n)
+{
+	if (n != NULL) { counter++; }
+}
+
+int forward(int, int);
+
+int kr(a, b)
+	int a;
+	int b;
+{
+	return a;
+}
+
+struct node *make(int v)
+{
+	return NULL;
+}
+
+void outer(void)
+{
+	struct local { int x; };
+}
+
+int main(int argc, char **argv)
+{
+	printf("%d\n", add(1, 2));
+	return 0;
+}
+CEOF
+
+want='LIMIT
+MAX
+Mc1
+add
+compare_fn
+helper
+kr
+make
+node_p
+node_t
+outer'
+got=$( . "$BT"; ctags -f c1.tags c1.c && cut -f1 c1.tags )
+if [ "$got" = "$want" ]; then pass=$((pass + 1))
+else note_fail "ctags found [$got] not [$want]"; fi
+
+# the file must come out sorted, and in the format the standard gives
+a=$( "$(real_of sort)" c1.tags )
+b=$( "$(real_of cat)" c1.tags )
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "ctags output is not sorted"; fi
+if [ "$( "$(real_of awk)" -F'\t' 'NF != 3 || $3 !~ /^\/\^.*\$\/$/ { n++ } END { print n+0 }' c1.tags )" = 0 ]; then
+	pass=$((pass + 1))
+else note_fail "ctags wrote a line that is not name, file, pattern"; fi
+
+# every pattern has to find the line it points at
+bad=0
+while IFS=$'\t' read -r name file pat; do
+	pat=${pat#/^}
+	pat=${pat%\$/}
+	pat=$( printf '%s' "$pat" | "$(real_of sed)" 's/\\\(.\)/\1/g' )
+	"$(real_of grep)" -qxF -- "$pat" "$file" || { bad=1; note_fail "ctags pattern for $name does not match"; }
+done < c1.tags
+[ "$bad" = 0 ] && pass=$((pass + 1))
+
+# -x writes the same objects with their line numbers and the line itself
+x=$( . "$BT"; ctags -x c1.c )
+if [ "$( printf '%s\n' "$x" | cut -d' ' -f1 )" = "$want" ]; then pass=$((pass + 1))
+else note_fail "ctags -x listed [$( printf '%s\n' "$x" | cut -d' ' -f1 )]"; fi
+if [ "$( printf '%s\n' "$x" | "$(real_of grep)" '^add ' )" = "add 18 c1.c int add(int a, int b)" ]; then
+	pass=$((pass + 1))
+else note_fail "ctags -x line: [$( printf '%s\n' "$x" | "$(real_of grep)" '^add ' )]"; fi
+# -x writes nothing to a tags file
+rm -f tags
+( . "$BT"; ctags -x c1.c ) > /dev/null
+if [ ! -e tags ]; then pass=$((pass + 1)); else note_fail "ctags -x wrote a tags file"; fi
+
+# a header is C as well, and the default file is called tags
+cat > c2.h <<'CEOF'
+#define HDR 1
+typedef unsigned long ulong_t;
+int declared_only(void);
+CEOF
+rm -f tags
+( . "$BT"; ctags c2.h )
+if [ "$( cut -f1 tags | tr '\n' ' ' )" = "HDR ulong_t " ]; then pass=$((pass + 1))
+else note_fail "ctags on a header: [$( cut -f1 tags | tr '\n' ' ' )]"; fi
+
+# -a adds to what is there already, and the whole file stays sorted
+( . "$BT"; ctags -a -f c1.tags c2.h )
+if [ "$( cut -f1 c1.tags | tr '\n' ' ' )" = "HDR LIMIT MAX Mc1 add compare_fn helper kr make node_p node_t outer ulong_t " ]; then
+	pass=$((pass + 1))
+else note_fail "ctags -a: [$( cut -f1 c1.tags | tr '\n' ' ' )]"; fi
+
+# fortran, fixed form, with continuation lines and comments
+cat > f1.f <<'FEOF'
+C     a fortran sample
+      PROGRAM MAIN
+      CALL GREET
+      END
+      SUBROUTINE GREET
+      WRITE(*,*) 'hi'
+      END
+      INTEGER FUNCTION SQUARE(N)
+      INTEGER N
+      SQUARE = N * N
+      END
+      REAL FUNCTION AVG(A,
+     +                  B)
+      REAL A, B
+      AVG = (A + B) / 2.0
+      END
+FEOF
+got=$( . "$BT"; ctags -x f1.f | cut -d' ' -f1 | tr '\n' ' ' )
+if [ "$got" = "AVG GREET MAIN SQUARE " ]; then pass=$((pass + 1))
+else note_fail "ctags on fortran: [$got]"; fi
+
+# a file that is not there is an error, and the ones that are still get read
+a=$( . "$BT"; ctags -f c3.tags c1.c nosuch.c 2>/dev/null; echo "rc=$?" )
+if [ "$a" = "rc=1" ] && [ -s c3.tags ]; then pass=$((pass + 1))
+else note_fail "ctags with a missing file: [$a]"; fi
+
+# a slash in the line has to be spelt out in the pattern
+printf 'int div_it(int a) /* a / b */\n{\n\treturn a;\n}\n' > c4.c
+( . "$BT"; ctags -f c4.tags c4.c )
+if [ "$( cut -f3 c4.tags )" = '/^int div_it(int a) \/* a \/ b *\/$/' ]; then pass=$((pass + 1))
+else note_fail "ctags escaping: [$( cut -f3 c4.tags )]"; fi
+
+cd .. || exit 1
 
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"

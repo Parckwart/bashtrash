@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-76 of the 160 utilities in POSIX.1-2017, as of now.
+77 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -65,6 +65,7 @@ Run the test suite with:
 | `comm` | `comm [-123] file1 file2` |
 | `compress` | `compress [-cfv] [-b bits] [file...]` |
 | `csplit` | `csplit [-ks] [-f prefix] [-n number] file arg...` |
+| `ctags` | `ctags [-a] [-f tagsfile] pathname...`<br>`ctags -x pathname...` |
 | `cut` | `cut -b list [-n] [file...]` · `cut -c list [file...]` · `cut -f list [-d delim] [-s] [file...]` |
 | `date` | `date [-u] [+format]` |
 | `dd` | `dd [operand...]` (`if` `of` `bs` `ibs` `obs` `count` `skip` `conv`) |
@@ -216,6 +217,17 @@ more digits than a double has. Whether a comparison is done on numbers or on
 text follows the standard's rule about where the value came from, so `$1 == 0`
 is true for a field holding `0.0` and false for one holding `x`.
 
+**`ctags` reads C without a C compiler**, which the standard admits is the
+only way: it says ctags "attempts to" find what a file defines, because
+anything short of the real preprocessor can be fooled. This one walks the
+file a character at a time keeping track of comments, strings, brackets and
+braces, and takes a name to be a function when a bracketed list follows it at
+file scope and a brace follows that -- with the old style parameter
+declarations in between allowed, which is what tells a definition from a
+declaration. Braces inside strings and comments are counted by nobody, and
+the tag `main` is written out as `M` and the file's name, as the standard
+asks.
+
 **`gencat` writes a hash table, and picks its shape the way gencat does.**
 A message catalogue is a table taking a set and a message number to a place in
 a pool of strings; the hash is `(set + 1) * message` modulo the table's width,
@@ -317,16 +329,16 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 76 |
+| implemented here | 77 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **52** |
-| reachable, not yet written | 10 |
+| reachable, not yet written | 9 |
 
 **The ceiling is 86 of 160**, or about 54% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 10 that remain are wildly uneven. `lex` and `yacc` are compilers whose
+The 9 that remain are wildly uneven. `lex` and `yacc` are compilers whose
 output is C, and `sh` would be a shell written in a shell.
 
 ### Smaller deviations, all deliberate
@@ -375,6 +387,13 @@ output is C, and `sh` would be a shell written in a shell.
   does and not what mawk does; a `printf` given fewer arguments than
   conversions treats the missing ones as empty, as the standard says, rather
   than stopping.
+* `ctags` writes out function definitions, type definitions and macros, which
+  is what the standard requires, and nothing else; structures, unions, enums
+  and global variables are among the things it is allowed to leave out, and
+  does. `-x` uses the format the standard gives, one space between the
+  fields, where the historical ctags lines the columns up. `-a` reads what is
+  already in the tags file and sorts the lot, since the standard asks for the
+  file to be sorted; the historical one simply appends.
 * `gencat` writes the catalogue with the low byte first, as every machine
   this is likely to run on does; the table it writes second is the big endian
   one, which is what the C library reads on a big endian machine. `$delset`

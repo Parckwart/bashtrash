@@ -18142,3 +18142,451 @@ gencat () {
 	_bt_gencat_write "$catfile" || return 1
 	return "$_gc_status"
 }
+
+# ---------------------------------------------------------------------------
+# ctags -- POSIX.1-2017:
+#	ctags [-a] [-f tagsfile] pathname...
+#	ctags -x pathname...
+#
+# The standard is careful to say ctags "attempts to" find the objects it
+# names, because the only thing that really knows what a C file declares is a
+# C compiler.  This one walks the file a character at a time, keeping track of
+# comments, strings, brackets and braces, which is enough to find function
+# definitions, typedefs and macros without being fooled by the usual things.
+# ---------------------------------------------------------------------------
+
+# Is $1 a word C keeps for itself?  A keyword in front of a bracket is a
+# statement, not a function being defined.
+_bt_ctags_kw() {
+	case $1 in
+	if|while|for|switch|return|sizeof|do|else|case|goto|break|continue|\
+	defined|typedef|struct|union|enum|static|extern|const|volatile|\
+	register|inline|signed|unsigned|void|char|short|int|long|float|double|\
+	auto|typeof|__attribute__|__asm__|asm)	return 0 ;;
+	esac
+	return 1
+}
+
+# Remember one object: name $1, on line $2 of the file being read.
+_bt_ctags_add() {
+	local name=$1 line=$2 text
+	[ -z "$name" ] && return 0
+	# main is special: the tag is M and the file's name without the suffix
+	if [ "$name" = main ]; then
+		case $_ct_file in
+		*.c)	text=${_ct_file##*/}
+			name=M${text%.c} ;;
+		esac
+	fi
+	case " $_ct_seen " in
+	*" $name "*)	return 0 ;;
+	esac
+	_ct_seen="$_ct_seen $name"
+	text=${_ct_lines[line]}
+	_ct_name+=("$name")
+	_ct_where+=("$_ct_file")
+	_ct_line+=("$(( line + 1 ))")
+	_ct_text+=("$text")
+	return 0
+}
+
+# Walk a C file, one character at a time.
+_bt_ctags_c() {
+	local n=${#_ct_lines[@]} ln=0 s i len c d
+	local depth=0 paren=0 lastid= lastline=0 cand= candline=0 closed=0
+	local intypedef=0 tdname= word wline instr= incomment=0 bol=1 sawdecl=0
+	local pp=0 ppword= ppwant=0
+	for (( ln = 0; ln < n; ln++ )); do
+		s=${_ct_lines[ln]}
+		len=${#s}
+		i=0
+		bol=1
+		pp=0
+		while [ "$i" -lt "$len" ]; do
+			c=${s:i:1}
+			if [ "$incomment" = 1 ]; then
+				if [ "${s:i:2}" = '*/' ]; then
+					incomment=0
+					i=$(( i + 2 ))
+					continue
+				fi
+				i=$(( i + 1 ))
+				continue
+			fi
+			if [ -n "$instr" ]; then
+				if [ "$c" = '\' ]; then i=$(( i + 2 )); continue; fi
+				[ "$c" = "$instr" ] && instr=
+				i=$(( i + 1 ))
+				continue
+			fi
+			case $c in
+			' '|$'\t')	i=$(( i + 1 )); continue ;;
+			esac
+			if [ "${s:i:2}" = '/*' ]; then
+				incomment=1
+				i=$(( i + 2 ))
+				continue
+			fi
+			if [ "${s:i:2}" = '//' ]; then
+				break
+			fi
+			case $c in
+			'"'|"'")	instr=$c; i=$(( i + 1 )); bol=0; continue ;;
+			esac
+			if [ "$bol" = 1 ] && [ "$c" = '#' ]; then
+				# a line the preprocessor eats: only #define says
+				# anything about a name
+				pp=1
+				i=$(( i + 1 ))
+				bol=0
+				continue
+			fi
+			bol=0
+			case $c in
+			[A-Za-z_])
+				word=
+				while [ "$i" -lt "$len" ]; do
+					d=${s:i:1}
+					case $d in
+					[A-Za-z0-9_])	word=$word$d; i=$(( i + 1 )) ;;
+					*)		break ;;
+					esac
+				done
+				if [ "$pp" = 1 ]; then
+					if [ -z "$ppword" ]; then
+						ppword=$word
+						[ "$word" = define ] && ppwant=1
+					elif [ "$ppwant" = 1 ]; then
+						_bt_ctags_add "$word" "$ln"
+						ppwant=0
+					fi
+					continue
+				fi
+				if [ "$word" = typedef ] && [ "$depth" = 0 ] && [ "$paren" = 0 ]; then
+					intypedef=1
+					tdname=
+				fi
+				# an old style definition puts its parameter
+				# declarations between the bracket and the brace
+				[ "$closed" = 1 ] && [ "$paren" = 0 ] && sawdecl=1
+				lastid=$word
+				lastline=$ln
+				continue ;;
+			[0-9])	while [ "$i" -lt "$len" ]; do
+					case ${s:i:1} in
+					[0-9A-Za-z._])	i=$(( i + 1 )) ;;
+					*)		break ;;
+					esac
+				done
+				continue ;;
+			'(')	if [ "$depth" = 0 ] && [ "$paren" = 0 ] &&
+				   [ -n "$lastid" ] && ! _bt_ctags_kw "$lastid"; then
+					cand=$lastid
+					candline=$lastline
+					closed=0
+				fi
+				# a typedef of a pointer to a function names the
+				# thing between the brackets
+				if [ "$intypedef" = 1 ] && [ "${s:i+1:1}" = '*' ]; then
+					d=$(( i + 2 ))
+					word=
+					while [ "$d" -lt "$len" ]; do
+						case ${s:d:1} in
+						[A-Za-z0-9_])	word=$word${s:d:1}; d=$(( d + 1 )) ;;
+						*)		break ;;
+						esac
+					done
+					[ -n "$word" ] && [ "${s:d:1}" = ')' ] && tdname=$word
+				fi
+				paren=$(( paren + 1 ))
+				i=$(( i + 1 ))
+				continue ;;
+			')')	paren=$(( paren - 1 ))
+				[ "$paren" -lt 0 ] && paren=0
+				if [ "$paren" = 0 ] && [ -n "$cand" ]; then
+					closed=1
+					sawdecl=0
+				fi
+				i=$(( i + 1 ))
+				continue ;;
+			'{')	if [ "$depth" = 0 ] && [ "$closed" = 1 ] && [ "$intypedef" = 0 ]; then
+					_bt_ctags_add "$cand" "$candline"
+					cand= closed=0
+				fi
+				depth=$(( depth + 1 ))
+				i=$(( i + 1 ))
+				continue ;;
+			'}')	depth=$(( depth - 1 ))
+				[ "$depth" -lt 0 ] && depth=0
+				i=$(( i + 1 ))
+				continue ;;
+			';')	if [ "$depth" = 0 ] && [ "$intypedef" = 1 ]; then
+					if [ -n "$tdname" ]; then
+						_bt_ctags_add "$tdname" "$lastline"
+					else
+						_bt_ctags_add "$lastid" "$lastline"
+					fi
+				fi
+				if [ "$depth" = 0 ]; then
+					intypedef=0
+					tdname=
+					# a semicolon straight after the bracket
+					# ends a declaration; one after a
+					# parameter declaration does not
+					if [ "$closed" = 0 ] || [ "$sawdecl" = 0 ]; then
+						cand=
+						closed=0
+					fi
+				fi
+				i=$(( i + 1 ))
+				continue ;;
+			',')	if [ "$depth" = 0 ] && [ "$paren" = 0 ] && [ "$intypedef" = 1 ]; then
+					if [ -n "$tdname" ]; then
+						_bt_ctags_add "$tdname" "$lastline"
+						tdname=
+					else
+						_bt_ctags_add "$lastid" "$lastline"
+					fi
+				fi
+				[ "$depth" = 0 ] && [ "$paren" = 0 ] && { cand=; closed=0; }
+				i=$(( i + 1 ))
+				continue ;;
+			'=')	[ "$depth" = 0 ] && [ "$paren" = 0 ] && { cand=; closed=0; }
+				i=$(( i + 1 ))
+				continue ;;
+			esac
+			i=$(( i + 1 ))
+		done
+		# a preprocessor line carries on if it ends in a backslash
+		if [ "$pp" = 1 ]; then
+			case $s in
+			*\\)	;;
+			*)	pp=0; ppword=; ppwant=0 ;;
+			esac
+		fi
+		[ "$pp" = 0 ] && { ppword=; ppwant=0; }
+	done
+	return 0
+}
+
+# Walk a FORTRAN file.  Fixed form: a letter in the first column is a comment
+# and anything in the sixth carries the line before it on.
+_bt_ctags_f() {
+	local n=${#_ct_lines[@]} ln=0 s stmt start=0 word rest low
+	for (( ln = 0; ln < n; ln++ )); do
+		s=${_ct_lines[ln]}
+		case $s in
+		[cC*!]*)	continue ;;
+		'')		continue ;;
+		esac
+		case ${s:5:1} in
+		''|' '|0)	stmt=${s:6}; start=$ln ;;
+		*)		stmt=$stmt${s:6}; continue ;;
+		esac
+		stmt=${stmt%%[!	 ]*[	 ]#*}
+		low=${stmt,,}
+		low=${low//[	 ]/}
+		case $low in
+		program*|subroutine*|blockdata*)
+			word=${low%%(*}
+			case $low in
+			program*)	rest=${word#program} ;;
+			subroutine*)	rest=${word#subroutine} ;;
+			*)		rest=${word#blockdata} ;;
+			esac
+			_bt_ctags_fname "$rest" "$start" ;;
+		*function*)
+			rest=${low#*function}
+			rest=${rest%%(*}
+			_bt_ctags_fname "$rest" "$start" ;;
+		esac
+	done
+	return 0
+}
+
+# The name in $1, as it is spelt in the line it came from.
+_bt_ctags_fname() {
+	local want=$1 ln=$2 s=${_ct_lines[$2]} i len c word
+	[ -z "$want" ] && return 0
+	len=${#s}
+	for (( i = 0; i < len; i++ )); do
+		c=${s:i:1}
+		case $c in
+		[A-Za-z_])	;;
+		*)		continue ;;
+		esac
+		word=
+		while [ "$i" -lt "$len" ]; do
+			c=${s:i:1}
+			case $c in
+			[A-Za-z0-9_])	word=$word$c; i=$(( i + 1 )) ;;
+			*)		break ;;
+			esac
+		done
+		if [ "${word,,}" = "$want" ]; then
+			_bt_ctags_add "$word" "$ln"
+			return 0
+		fi
+	done
+	return 0
+}
+
+# Sort the lines of the array named $1 by everything up to the first tab, then
+# by the whole line: a merge sort, since a tags file can be long.
+_bt_ctags_sort() {
+	local -n _arr=$1
+	local n=${#_arr[@]} width lo mid hi i j k a b ka kb
+	local -a tmp=()
+	[ "$n" -lt 2 ] && return 0
+	width=1
+	while [ "$width" -lt "$n" ]; do
+		lo=0
+		while [ "$lo" -lt "$n" ]; do
+			mid=$(( lo + width ))
+			hi=$(( mid + width ))
+			[ "$mid" -gt "$n" ] && mid=$n
+			[ "$hi" -gt "$n" ] && hi=$n
+			i=$lo j=$mid k=$lo
+			while [ "$i" -lt "$mid" ] && [ "$j" -lt "$hi" ]; do
+				a=${_arr[i]} b=${_arr[j]}
+				ka=${a%%	*} kb=${b%%	*}
+				if [ "$ka" = "$kb" ]; then
+					if [[ $a > $b ]]; then
+						tmp[k]=$b; j=$(( j + 1 ))
+					else
+						tmp[k]=$a; i=$(( i + 1 ))
+					fi
+				elif [[ $ka > $kb ]]; then
+					tmp[k]=$b; j=$(( j + 1 ))
+				else
+					tmp[k]=$a; i=$(( i + 1 ))
+				fi
+				k=$(( k + 1 ))
+			done
+			while [ "$i" -lt "$mid" ]; do tmp[k]=${_arr[i]}; i=$(( i + 1 )); k=$(( k + 1 )); done
+			while [ "$j" -lt "$hi" ]; do tmp[k]=${_arr[j]}; j=$(( j + 1 )); k=$(( k + 1 )); done
+			lo=$hi
+		done
+		for (( i = 0; i < n; i++ )); do _arr[i]=${tmp[i]}; done
+		width=$(( width * 2 ))
+	done
+	return 0
+}
+
+# The search pattern for line $1, with the characters an editor would take to
+# mean something else spelt out.
+_bt_ctags_pattern() {
+	local s=$1 out= i len c
+	len=${#s}
+	for (( i = 0; i < len; i++ )); do
+		c=${s:i:1}
+		case $c in
+		'\'|'/')	out=$out'\'$c ;;
+		*)		out=$out$c ;;
+		esac
+	done
+	_bt_str=$out
+	return 0
+}
+
+ctags () {
+	local LC_ALL=C
+	local arg opt append=0 xref=0 tagsfile=tags f fd line status=0 i
+	local _ct_file= _ct_seen= _bt_str
+	local -a _ct_lines=() _ct_name=() _ct_where=() _ct_line=() _ct_text=()
+	local -a out=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				a)	append=1 ;;
+				x)	xref=1 ;;
+				f)	if [ -n "$arg" ]; then
+						tagsfile=$arg
+						arg=
+					elif [ "$#" -gt 0 ]; then
+						tagsfile=$1
+						shift
+					else
+						_bt_err "ctags: option requires an argument -- f"
+						return 1
+					fi ;;
+				*)	_bt_err "ctags: illegal option -- $opt"
+					_bt_err "usage: ctags [-a] [-f tagsfile] pathname..."
+					_bt_err "       ctags -x pathname..."
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	if [ "$#" = 0 ]; then
+		_bt_err "usage: ctags [-a] [-f tagsfile] pathname..."
+		_bt_err "       ctags -x pathname..."
+		return 1
+	fi
+
+	for f in "$@"; do
+		if ! { exec {fd}<"$f"; } 2>/dev/null; then
+			_bt_err "ctags: cannot open $f"
+			status=1
+			continue
+		fi
+		_ct_lines=()
+		line=
+		while IFS= read -r line; do
+			_ct_lines+=("$line")
+			line=
+		done <&"$fd"
+		[ -n "$line" ] && _ct_lines+=("$line")
+		exec {fd}<&-
+		_ct_file=$f
+		_ct_seen=
+		case $f in
+		*.f|*.F)	_bt_ctags_f ;;
+		*)		_bt_ctags_c ;;
+		esac
+	done
+
+	if [ "$xref" = 1 ]; then
+		for (( i = 0; i < ${#_ct_name[@]}; i++ )); do
+			out+=("${_ct_name[i]}	${_ct_line[i]} ${_ct_where[i]} ${_ct_text[i]}")
+		done
+		_bt_ctags_sort out
+		for line in ${out[@]+"${out[@]}"}; do
+			printf '%s %s\n' "${line%%	*}" "${line#*	}"
+		done
+		return "$status"
+	fi
+
+	for (( i = 0; i < ${#_ct_name[@]}; i++ )); do
+		_bt_ctags_pattern "${_ct_text[i]}"
+		out+=("${_ct_name[i]}	${_ct_where[i]}	/^$_bt_str\$/")
+	done
+	if [ "$append" = 1 ] && [ -f "$tagsfile" ]; then
+		line=
+		while IFS= read -r line; do
+			[ -n "$line" ] && out+=("$line")
+			line=
+		done < "$tagsfile"
+		[ -n "$line" ] && out+=("$line")
+	fi
+	_bt_ctags_sort out
+	if ! { exec {fd}>"$tagsfile"; } 2>/dev/null; then
+		_bt_err "ctags: cannot open $tagsfile"
+		return 1
+	fi
+	for line in ${out[@]+"${out[@]}"}; do
+		printf '%s\n' "$line" >&"$fd"
+	done
+	exec {fd}>&-
+	return "$status"
+}
