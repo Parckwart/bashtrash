@@ -2603,3 +2603,735 @@ cmp () {
 	[ "$fd2" = 0 ] || exec {fd2}<&-
 	return "$rc"
 }
+
+# ---------------------------------------------------------------------------
+# date -- POSIX.1-2017: date [-u] [+format]
+#
+# Setting the clock needs a syscall no builtin reaches, so only the display
+# form is implemented.  bash's printf has strftime built in.
+# ---------------------------------------------------------------------------
+date () {
+	local LC_ALL=C arg opt fmt='%a %b %e %H:%M:%S %Z %Y' out
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		+*)	break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				u)	local TZ=UTC0 ;;
+				*)	_bt_err "date: illegal option -- $opt"
+					_bt_err "usage: date [-u] [+format]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	if [ "$#" -gt 1 ]; then
+		_bt_err "date: extra operand: $2"
+		return 1
+	fi
+	if [ "$#" -eq 1 ]; then
+		case $1 in
+		+*)	fmt=${1#+} ;;
+		*)	_bt_err "date: setting the date requires a system call no builtin can make"
+			return 1 ;;
+		esac
+	fi
+	# -1 is "now"; printf -v keeps the result from being re-scanned.
+	printf -v out "%($fmt)T" -1
+	printf '%s\n' "$out"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# asa -- POSIX.1-2017: asa [file...]
+# Interprets FORTRAN carriage-control characters in column one.
+# ---------------------------------------------------------------------------
+asa () {
+	local LC_ALL=C file fd status=0 line ctl rest first=1 _bt_reason
+
+	[ "$#" -gt 0 ] && [ "$1" = -- ] && shift
+	[ "$#" -eq 0 ] && set -- -
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			fd=0
+		elif [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_why "$file"
+			_bt_err "asa: $file: $_bt_reason"
+			status=1
+			continue
+		fi
+		line=
+		while IFS= read -r line <&"$fd" || [ -n "$line" ]; do
+			ctl=${line:0:1}
+			rest=${line:1}
+			case $ctl in
+			'+')	# overprint: return to the start of the line
+				[ "$first" = 1 ] || printf '\r' ;;
+			0)	[ "$first" = 1 ] || printf '\n'
+				printf '\n' ;;
+			1)	[ "$first" = 1 ] || printf '\n'
+				printf '\f' ;;
+			*)	[ "$first" = 1 ] || printf '\n' ;;
+			esac
+			printf '%s' "$rest"
+			first=0
+			line=
+		done
+		[ "$fd" = 0 ] || exec {fd}<&-
+	done
+	[ "$first" = 0 ] && printf '\n'
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# cksum -- POSIX.1-2017: cksum [file...]
+# The CRC the standard specifies, polynomial 0x04C11DB7.
+# ---------------------------------------------------------------------------
+
+# Build the CRC table once, on first use.
+_bt_crc_init() {
+	local i k c
+	[ "${#_BT_CRC[@]}" -eq 256 ] && return 0
+	_BT_CRC=()
+	for (( i = 0; i < 256; i++ )); do
+		c=$(( i << 24 ))
+		for (( k = 0; k < 8; k++ )); do
+			if (( c & 0x80000000 )); then
+				c=$(( ((c << 1) ^ 0x04C11DB7) & 0xFFFFFFFF ))
+			else
+				c=$(( (c << 1) & 0xFFFFFFFF ))
+			fi
+		done
+		_BT_CRC+=("$c")
+	done
+	return 0
+}
+_BT_CRC=()
+
+# CRC and byte count of fd $1, into _bt_crc and _bt_len.
+_bt_cksum_fd() {
+	local fd=$1 i v rc crc=0 n=0 len
+	local _bt_buf _bt_nul _bt_n
+	while :; do
+		if _bt_read "$fd"; then rc=0; else rc=1; fi
+		len=${#_bt_buf}
+		for (( i = 0; i < len; i++ )); do
+			printf -v v '%d' "'${_bt_buf:i:1}"
+			crc=$(( ((crc << 8) & 0xFFFFFFFF) ^ _BT_CRC[ ((crc >> 24) ^ v) & 0xFF ] ))
+		done
+		n=$(( n + len ))
+		if [ "$rc" = 0 ] && [ "$_bt_nul" = 1 ]; then
+			crc=$(( ((crc << 8) & 0xFFFFFFFF) ^ _BT_CRC[ (crc >> 24) & 0xFF ] ))
+			n=$(( n + 1 ))
+		fi
+		[ "$rc" = 1 ] && break
+	done
+	# The length is folded in, low-order octet first.
+	len=$n
+	while [ "$len" -gt 0 ]; do
+		crc=$(( ((crc << 8) & 0xFFFFFFFF) ^ _BT_CRC[ ((crc >> 24) ^ (len & 0xFF)) & 0xFF ] ))
+		len=$(( len >> 8 ))
+	done
+	_bt_crc=$(( ~crc & 0xFFFFFFFF ))
+	_bt_len=$n
+	return 0
+}
+
+cksum () {
+	local LC_ALL=C file fd status=0 _bt_crc _bt_len _bt_reason
+
+	[ "$#" -gt 0 ] && [ "$1" = -- ] && shift
+	_bt_crc_init
+	if [ "$#" -eq 0 ]; then
+		_bt_cksum_fd 0
+		printf '%u %d\n' "$_bt_crc" "$_bt_len"
+		return 0
+	fi
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			_bt_cksum_fd 0
+			printf '%u %d %s\n' "$_bt_crc" "$_bt_len" "$file"
+			continue
+		fi
+		if [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_why "$file"
+			_bt_err "cksum: $file: $_bt_reason"
+			status=1
+			continue
+		fi
+		_bt_cksum_fd "$fd"
+		exec {fd}<&-
+		printf '%u %d %s\n' "$_bt_crc" "$_bt_len" "$file"
+	done
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# split -- POSIX.1-2017:
+#	split [-l line_count] [-a suffix_length] [file [name]]
+#	split -b n[k|m] [-a suffix_length] [file [name]]
+# ---------------------------------------------------------------------------
+
+# The $1'th suffix of length $2: aa, ab, ... zz.
+_bt_suffix() {
+	local n=$1 w=$2 i
+	_bt_sfx=
+	for (( i = 0; i < w; i++ )); do
+		_bt_chr $(( 97 + n % 26 ))
+		_bt_sfx=$_bt_c$_bt_sfx
+		n=$(( n / 26 ))
+	done
+	[ "$n" -eq 0 ] || return 1
+	return 0
+}
+
+split () {
+	local LC_ALL=C
+	local arg opt val mode=lines count=1000 width=2 file name=x fd out
+	local idx=0 left rc len _bt_sfx _bt_c _bt_n _bt_off _bt_reason
+	local _bt_buf _bt_nul
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-[0-9]*)	# obsolescent "split -500"
+			val=${1#-}
+			_bt_isnum "$val" || { _bt_err "split: invalid number: $val"; return 1; }
+			mode=lines count=$val
+			shift ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				l|b|a)	if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "split: option requires an argument -- $opt"
+						return 1
+					fi
+					case $opt in
+					l)	_bt_isnum "$val" || { _bt_err "split: invalid number of lines: $val"; return 1; }
+						mode=lines count=$(( 10#$val )) ;;
+					b)	case $val in
+						*k)	val=${val%k}
+							_bt_isnum "$val" || { _bt_err "split: invalid number of bytes: $val"; return 1; }
+							count=$(( 10#$val * 1024 )) ;;
+						*m)	val=${val%m}
+							_bt_isnum "$val" || { _bt_err "split: invalid number of bytes: $val"; return 1; }
+							count=$(( 10#$val * 1048576 )) ;;
+						*)	_bt_isnum "$val" || { _bt_err "split: invalid number of bytes: $val"; return 1; }
+							count=$(( 10#$val )) ;;
+						esac
+						mode=bytes ;;
+					a)	_bt_isnum "$val" || { _bt_err "split: invalid suffix length: $val"; return 1; }
+						width=$(( 10#$val )) ;;
+					esac ;;
+				*)	_bt_err "split: illegal option -- $opt"
+					_bt_err "usage: split [-l line_count] [-a suffix_length] [file [name]]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	if [ "$count" -lt 1 ]; then
+		_bt_err "split: invalid number: 0"
+		return 1
+	fi
+	if [ "$#" -gt 2 ]; then
+		_bt_err "split: extra operand: $3"
+		return 1
+	fi
+	file=-
+	[ "$#" -ge 1 ] && file=$1
+	[ "$#" -eq 2 ] && name=$2
+
+	if [ "$file" = - ]; then
+		fd=0
+	elif [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+		_bt_why "$file"
+		_bt_err "split: $file: $_bt_reason"
+		return 1
+	fi
+
+	out=
+	left=$count
+	while :; do
+		if _bt_read "$fd"; then rc=0; else rc=1; fi
+		while :; do
+			if [ -z "$out" ]; then
+				if [ -z "$_bt_buf" ] && { [ "$rc" = 1 ] || [ "$_bt_nul" = 0 ]; }; then
+					break
+				fi
+				if ! _bt_suffix "$idx" "$width"; then
+					_bt_err "split: output file suffixes exhausted"
+					[ "$fd" = 0 ] || exec {fd}<&-
+					return 1
+				fi
+				if ! { exec {out}>"$name$_bt_sfx"; } 2>/dev/null; then
+					_bt_err "split: cannot open $name$_bt_sfx"
+					[ "$fd" = 0 ] || exec {fd}<&-
+					return 1
+				fi
+				idx=$(( idx + 1 ))
+				left=$count
+			fi
+			if [ "$mode" = bytes ]; then
+				len=${#_bt_buf}
+				if [ "$len" -ge "$left" ]; then
+					printf '%s' "${_bt_buf:0:left}" >&"$out"
+					_bt_buf=${_bt_buf:left}
+					exec {out}>&-
+					out=
+					continue
+				fi
+				printf '%s' "$_bt_buf" >&"$out"
+				left=$(( left - len ))
+				_bt_buf=
+				if [ "$rc" = 0 ] && [ "$_bt_nul" = 1 ]; then
+					printf '\000' >&"$out"
+					_bt_nul=0
+					left=$(( left - 1 ))
+					if [ "$left" -le 0 ]; then
+						exec {out}>&-
+						out=
+					fi
+				fi
+				break
+			fi
+			_bt_count "$_bt_buf"
+			if [ "$_bt_n" -ge "$left" ]; then
+				_bt_after_nl "$_bt_buf" "$left"
+				printf '%s' "${_bt_buf:0:_bt_off}" >&"$out"
+				_bt_buf=${_bt_buf:_bt_off}
+				exec {out}>&-
+				out=
+				continue
+			fi
+			printf '%s' "$_bt_buf" >&"$out"
+			left=$(( left - _bt_n ))
+			_bt_buf=
+			if [ "$rc" = 0 ] && [ "$_bt_nul" = 1 ]; then
+				printf '\000' >&"$out"
+				_bt_nul=0
+			fi
+			break
+		done
+		[ "$rc" = 1 ] && break
+	done
+	[ -z "$out" ] || exec {out}>&-
+	[ "$fd" = 0 ] || exec {fd}<&-
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# env -- POSIX.1-2017: env [-i] [name=value]... [utility [argument...]]
+#
+# Running the named utility is the whole point, so that one execve is the
+# caller's, not this implementation's.
+# ---------------------------------------------------------------------------
+env () {
+	local LC_ALL=C ignore=0 arg n prog
+
+	local -a assigns=()
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-|-i)	ignore=1; shift ;;
+		-*)	_bt_err "env: illegal option -- ${1#-}"
+			_bt_err "usage: env [-i] [name=value]... [utility [argument...]]"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		*=*)	assigns+=("$1"); shift ;;
+		*)	break ;;
+		esac
+	done
+
+	if [ "$#" -eq 0 ]; then
+		(
+			if [ "$ignore" = 1 ]; then
+				for n in $(compgen -e); do unset "$n"; done
+			fi
+			for n in ${assigns[@]+"${assigns[@]}"}; do export "$n"; done
+			for n in $(compgen -e); do printf '%s=%s\n' "$n" "${!n}"; done
+		)
+		return 0
+	fi
+
+	# Resolve the utility while PATH is still there to resolve it with;
+	# execvp would have had the same chance.
+	prog=$1
+	case $prog in
+	*/*)	if [ ! -e "$prog" ]; then
+			_bt_err "env: '$prog': No such file or directory"
+			return 127
+		fi
+		if [ ! -x "$prog" ] || [ -d "$prog" ]; then
+			_bt_err "env: '$prog': Permission denied"
+			return 126
+		fi ;;
+	*)	prog=$(command -v "$1" 2>/dev/null)
+		if [ -z "$prog" ]; then
+			_bt_err "env: '$1': No such file or directory"
+			return 127
+		fi ;;
+	esac
+
+	if [ "$ignore" = 1 ] && [ "${#assigns[@]}" -eq 0 ]; then
+		# exec -c is the only way to hand a child a genuinely empty
+		# environment from inside bash.
+		( exec -c "$prog" "${@:2}" )
+		return $?
+	fi
+	(
+		if [ "$ignore" = 1 ]; then
+			for n in $(compgen -e); do unset "$n"; done
+		fi
+		for n in ${assigns[@]+"${assigns[@]}"}; do export "$n"; done
+		"$prog" "${@:2}"
+	)
+	return $?
+}
+
+# ---------------------------------------------------------------------------
+# nl -- POSIX.1-2017:
+#	nl [-p] [-b type] [-d delim] [-f type] [-h type] [-i incr] [-l num]
+#	   [-n format] [-s sep] [-v startnum] [-w width] [file]
+#
+# The -bp/-hp/-fp regular expression is matched with bash's =~, which is an
+# ERE where the standard asks for a BRE.
+# ---------------------------------------------------------------------------
+nl () {
+	local LC_ALL=C
+	local arg opt val file fd status=0
+	local btype=t htype=n ftype=n bre= hre= fre=
+	local delim='\:' sep=$'\t' fmt=rn width=6 start=1 incr=1 blank=1 renumber=1
+	local line num sect=body type re out pad blanks=0 newsect _bt_reason
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				p)	renumber=0 ;;
+				b|f|h|d|i|l|n|s|v|w)
+					if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "nl: option requires an argument -- $opt"
+						return 1
+					fi
+					case $opt in
+					b)	btype=${val:0:1}; bre=${val:1} ;;
+					f)	ftype=${val:0:1}; fre=${val:1} ;;
+					h)	htype=${val:0:1}; hre=${val:1} ;;
+					d)	delim=$val
+						[ "${#delim}" -eq 1 ] && delim=$delim: ;;
+					i)	incr=$val ;;
+					l)	blank=$val ;;
+					n)	fmt=$val ;;
+					s)	sep=$val ;;
+					v)	start=$val ;;
+					w)	width=$val ;;
+					esac ;;
+				*)	_bt_err "nl: illegal option -- $opt"
+					_bt_err "usage: nl [-p] [-b type] [-d delim] [-f type] [-h type] [file]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	case $fmt in
+	ln|rn|rz)	;;
+	*)	_bt_err "nl: invalid line numbering format: $fmt"; return 1 ;;
+	esac
+	for val in "$incr" "$blank" "$width"; do
+		_bt_isnum "$val" || { _bt_err "nl: invalid number: $val"; return 1; }
+	done
+	_bt_isnum "$start" || { _bt_err "nl: invalid starting line number: $start"; return 1; }
+	incr=$(( 10#$incr )); blank=$(( 10#$blank ))
+	width=$(( 10#$width )); start=$(( 10#$start ))
+	[ "$blank" -ge 1 ] || blank=1
+
+	if [ "$#" -gt 1 ]; then
+		_bt_err "nl: extra operand: $2"
+		return 1
+	fi
+	if [ "$#" -eq 0 ] || [ "$1" = - ]; then
+		fd=0
+	else
+		if [ -d "$1" ] || ! { exec {fd}<"$1"; } 2>/dev/null; then
+			_bt_why "$1"
+			_bt_err "nl: $1: $_bt_reason"
+			return 1
+		fi
+	fi
+
+	num=$start
+	printf -v pad '%*s' $(( width + ${#sep} )) ''
+	line=
+	while IFS= read -r line <&"$fd" || [ -n "$line" ]; do
+		# A section delimiter is written out as an empty line.
+		case $line in
+		"$delim$delim$delim")	sect=header; newsect=1 ;;
+		"$delim$delim")	sect=body;   newsect=1 ;;
+		"$delim")		sect=footer; newsect=1 ;;
+		*)			newsect=0 ;;
+		esac
+		if [ "$newsect" = 1 ]; then
+			[ "$renumber" = 1 ] && num=$start
+			blanks=0
+			printf '\n'
+			line=
+			continue
+		fi
+		case $sect in
+		header)	type=$htype re=$hre ;;
+		footer)	type=$ftype re=$fre ;;
+		*)	type=$btype re=$bre ;;
+		esac
+
+		out=0
+		case $type in
+		a)	if [ -z "$line" ]; then
+				# -l groups consecutive empty lines
+				blanks=$(( blanks + 1 ))
+				[ "$blanks" -ge "$blank" ] && { out=1; blanks=0; }
+			else
+				blanks=0
+				out=1
+			fi ;;
+		t)	blanks=0
+			[ -n "$line" ] && out=1 ;;
+		n)	blanks=0 ;;
+		p)	blanks=0
+			[[ $line =~ $re ]] && out=1 ;;
+		*)	blanks=0
+			[ -n "$line" ] && out=1 ;;
+		esac
+
+		if [ "$out" = 1 ]; then
+			case $fmt in
+			ln)	printf '%-*d%s%s\n' "$width" "$num" "$sep" "$line" ;;
+			rz)	printf '%0*d%s%s\n' "$width" "$num" "$sep" "$line" ;;
+			*)	printf '%*d%s%s\n' "$width" "$num" "$sep" "$line" ;;
+			esac
+			num=$(( num + incr ))
+		else
+			printf '%s%s\n' "$pad" "$line"
+		fi
+		line=
+	done
+	[ "$fd" = 0 ] || exec {fd}<&-
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# tsort -- POSIX.1-2017: tsort [file]
+#
+# The order among items with no relation between them is unspecified; this
+# keeps the order they were first seen in.
+# ---------------------------------------------------------------------------
+tsort () {
+	local LC_ALL=C
+	local file fd status=0 tok u v i n out _bt_reason
+	local -a nodes=() queue=()
+	local -A indeg=() succ=() known=()
+
+	[ "$#" -gt 0 ] && [ "$1" = -- ] && shift
+	if [ "$#" -gt 1 ]; then
+		_bt_err "tsort: extra operand: $2"
+		return 1
+	fi
+	if [ "$#" -eq 0 ] || [ "$1" = - ]; then
+		fd=0
+	else
+		if [ -d "$1" ] || ! { exec {fd}<"$1"; } 2>/dev/null; then
+			_bt_why "$1"
+			_bt_err "tsort: $1: $_bt_reason"
+			return 1
+		fi
+	fi
+
+	u=
+	while read -r tok <&"$fd" || [ -n "$tok" ]; do
+		for v in $tok; do
+			if [ -z "${known[$v]-}" ]; then
+				known[$v]=1
+				nodes+=("$v")
+				indeg[$v]=0
+				succ[$v]=
+			fi
+			if [ -z "$u" ]; then
+				u=$v
+			else
+				if [ "$u" != "$v" ]; then
+					succ[$u]="${succ[$u]} $v"
+					indeg[$v]=$(( ${indeg[$v]} + 1 ))
+				fi
+				u=
+			fi
+		done
+		tok=
+	done
+	[ "$fd" = 0 ] || exec {fd}<&-
+	if [ -n "$u" ]; then
+		_bt_err "tsort: odd number of tokens"
+		return 1
+	fi
+
+	for v in ${nodes[@]+"${nodes[@]}"}; do
+		[ "${indeg[$v]}" -eq 0 ] && queue+=("$v")
+	done
+	n=0
+	i=0
+	while [ "$i" -lt "${#queue[@]}" ]; do
+		u=${queue[i]}
+		i=$(( i + 1 ))
+		printf '%s\n' "$u"
+		n=$(( n + 1 ))
+		for v in ${succ[$u]}; do
+			indeg[$v]=$(( ${indeg[$v]} - 1 ))
+			[ "${indeg[$v]}" -eq 0 ] && queue+=("$v")
+		done
+	done
+	if [ "$n" -lt "${#nodes[@]}" ]; then
+		# Whatever is left is in a cycle.
+		_bt_err "tsort: input contains a loop"
+		for v in ${nodes[@]+"${nodes[@]}"}; do
+			[ "${indeg[$v]}" -gt 0 ] && printf '%s\n' "$v"
+		done
+		status=1
+	fi
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# pathchk -- POSIX.1-2017: pathchk [-p] pathname...
+#
+# Without -p the limits are the ones this kernel actually uses, since
+# pathconf() is not reachable from a builtin.
+# ---------------------------------------------------------------------------
+pathchk () {
+	local LC_ALL=C
+	local arg opt portable=0 leading=0 p comp rest status=0
+	local namemax=255 pathmax=4096 dir
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				p)	portable=1 ;;
+				P)	leading=1 ;;
+				*)	_bt_err "pathchk: illegal option -- $opt"
+					_bt_err "usage: pathchk [-p] pathname..."
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -eq 0 ]; then
+		_bt_err "usage: pathchk [-p] pathname..."
+		return 1
+	fi
+	# -p asks about the limits every conforming system guarantees; without
+	# it the question is whether this system could use the name, and
+	# pathconf() is not reachable, so the kernel's own limits stand in.
+	if [ "$portable" = 1 ]; then
+		namemax=14 pathmax=256
+	fi
+
+	for p in "$@"; do
+		if [ -z "$p" ]; then
+			_bt_err "pathchk: '': No such file or directory"
+			status=1
+			continue
+		fi
+		if [ "${#p}" -gt "$pathmax" ]; then
+			_bt_err "pathchk: '$p': name too long (${#p} > $pathmax)"
+			status=1
+			continue
+		fi
+		rest=$p
+		dir=
+		while :; do
+			rest=${rest#/}
+			comp=${rest%%/*}
+			[ -n "$comp" ] || break
+			if [ "${#comp}" -gt "$namemax" ]; then
+				_bt_err "pathchk: '$p': component too long: $comp"
+				status=1
+				break
+			fi
+			if [ "$portable" = 1 ]; then
+				case $comp in
+				*[!A-Za-z0-9._-]*)
+					_bt_err "pathchk: '$p': non-portable character in: $comp"
+					status=1
+					break ;;
+				esac
+			fi
+			# A leading hyphen is checked only under -P.
+			if [ "$leading" = 1 ]; then
+				case $comp in
+				-*)	_bt_err "pathchk: '$p': leading '-' in: $comp"
+					status=1
+					break ;;
+				esac
+			fi
+			case $rest in
+			*/*)	rest=${rest#*/} ;;
+			*)	break ;;
+			esac
+			# -p is about portability, not about what this
+			# filesystem happens to hold, so the rest is skipped.
+			[ "$portable" = 0 ] || continue
+			dir=$dir/$comp
+			if [ -e "$dir" ] && [ ! -d "$dir" ]; then
+				_bt_err "pathchk: '$p': $comp is not a directory"
+				status=1
+				break
+			fi
+			if [ -d "$dir" ] && [ ! -x "$dir" ]; then
+				_bt_err "pathchk: '$p': $comp is not searchable"
+				status=1
+				break
+			fi
+		done
+	done
+	return "$status"
+}

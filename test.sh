@@ -439,6 +439,134 @@ for pair in "k1 k2" "k7 k8" "k5 k6" "k1 k1"; do
 	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "cmp -l $pair"; fi
 done
 
+# --- date, cksum, split, env, nl, tsort, pathchk, asa ----------------------
+echo "### date cksum split env nl tsort pathchk asa"
+R_DATE=$(command -v date); R_CKSUM=$(command -v cksum)
+
+# date is compared by asking for the same instant twice; a second boundary
+# between the two calls would be a false failure, so a mismatch is retried.
+for f in '+%Y-%m-%d' '+%H:%M' '+%Y' '+literal text' '+%Y%%%j' '+%s'; do
+	a=$( . "$BT"; date "$f" )
+	b=$( "$R_DATE" "$f" )
+	if [ "$a" != "$b" ]; then a=$( . "$BT"; date "$f" ); b=$( "$R_DATE" "$f" ); fi
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "date $f: [$a] vs [$b]"; fi
+done
+a=$( . "$BT"; date -u '+%Y-%m-%dT%H' ); b=$( "$R_DATE" -u '+%Y-%m-%dT%H' )
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "date -u"; fi
+chk "date bad option" date -Z
+# Not compared against the reference: the bare MMDDhhmm operand is the
+# form that *sets* the clock, so running it is not something a test
+# suite should do.  Only the refusal is checked.
+( . "$BT"; date 010100002000 ) > /dev/null 2>&1
+if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "date should refuse to set the clock"; fi
+
+for f in lines12 nonl empty binary words blanks; do chk "cksum $f" cksum "$f"; done
+chk "cksum two"     cksum lines12 binary
+chk "cksum missing" cksum no-such-file
+chks "cksum stdin"  lines12 cksum
+
+# split writes files, so each run gets its own directory and the trees are
+# compared afterwards.
+splitchk() {
+	rm -rf sp1 sp2
+	mkdir -p sp1 sp2
+	( cd sp1 && . "$BT" && split "$@" ) > /dev/null 2>&1
+	( cd sp2 && "$(real_of split)" "$@" ) > /dev/null 2>&1
+	if diff -r sp1 sp2 > /dev/null 2>&1; then pass=$((pass + 1))
+	else note_fail "split $*"; fi
+}
+seq 1 25 > spin
+splitchk -l 10 ../spin
+splitchk -l 1 ../spin
+splitchk -l 1000 ../spin
+splitchk -b 7 ../spin
+splitchk -b 1 ../nonl
+splitchk -b 1k ../spin
+splitchk -a 3 -l 5 ../spin
+splitchk -l 5 ../spin pre
+splitchk -b 4 ../binary
+splitchk ../empty
+
+a=$( . "$BT"; env | grep -v '^_=' | sort )
+b=$( env | grep -v '^_=' | sort )
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "env listing"; fi
+for spec in "env FOO=bar sh -c 'echo \$FOO'" \
+            "env X=1 Y=2 sh -c 'echo \$X\$Y'" \
+            "env sh -c 'exit 7'; echo \$?" \
+            "env /bin/echo hi" \
+            "env nosuchprog; echo \$?" \
+            "env /nonexistent/x; echo \$?" \
+            "env /etc/passwd; echo \$?" \
+            "env -i /usr/bin/env"; do
+	a=$( bash -c ". \"$BT\"; $spec" 2>&1 )
+	b=$( bash -c "$spec" 2>&1 )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "$spec"; fi
+done
+
+printf 'one\n\ntwo\nthree\n\n\nfour\n' > nl1
+printf '\\:\\:\\:\nhdr\n\\:\\:\nbody1\nbody2\n\\:\nftr\n' > nl3
+printf 'foo\nbar\nfoobar\nbaz\n' > nl4
+for o in "" -ba -bn -bt -w3 -sX -nln -nrn -nrz -v5 -i2 -p; do
+	for f in nl1 nl3 nl4; do
+		# shellcheck disable=SC2086
+		if [ -z "$o" ]; then chk "nl $f" nl "$f"; else chk "nl $o $f" nl $o "$f"; fi
+	done
+done
+chk "nl -ba -l2"    nl -ba -l2 nl1
+chk "nl -s space"   nl -s' ' nl1
+chk "nl -ha -ba -fa" nl -ha -ba -fa nl3
+chk "nl -bp"        nl -bp^foo nl4
+chk "nl -d::"       nl -d'::' nl3
+chk "nl missing"    nl no-such-file
+chk "nl bad -n"     nl -nxx nl1
+
+printf 'a b\nb c\nc d\n' > ts1
+printf 'a b\n' > ts2
+printf 'x x\n' > ts3
+printf 'a b\nb a\n' > ts5
+printf 'a b c\n' > ts6
+for f in ts1 ts2 ts3; do chk "tsort $f" tsort "$f"; done
+for f in ts5 ts6; do
+	# only the exit status is comparable: a loop and an odd token count
+	( . "$BT"; tsort "$f" ) > /dev/null 2>&1; a=$?
+	"$(real_of tsort)" "$f" > /dev/null 2>&1; b=$?
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "tsort $f exit $a vs $b"; fi
+done
+# For unrelated items the order is unspecified, so check the property.
+printf 'a b\nc d\nb d\ne f\n' > ts4
+out=$( . "$BT"; tsort ts4 )
+ok=1
+while read -r u v; do
+	iu=$(printf '%s\n' "$out" | grep -n "^$u\$" | cut -d: -f1)
+	iv=$(printf '%s\n' "$out" | grep -n "^$v\$" | cut -d: -f1)
+	[ -n "$iu" ] && [ -n "$iv" ] && [ "$iu" -lt "$iv" ] || ok=0
+done < ts4
+if [ "$ok" = 1 ] && [ "$(printf '%s\n' "$out" | sort)" = "$("$(real_of tsort)" ts4 | sort)" ]; then
+	pass=$((pass + 1))
+else
+	note_fail "tsort is not a valid topological order"
+fi
+
+long=$(printf 'x%.0s' $(seq 1 300))
+deep=$(printf 'd/%.0s' $(seq 1 200))x
+for p in "/etc/passwd" "ok/name" "" "-lead" "a b" "no/such/dir/file" "/etc/passwd/x" "." ".." "$long" "$deep"; do
+	for o in "" -p -P; do
+		# shellcheck disable=SC2086
+		a=$( . "$BT"; pathchk $o -- "$p" > /dev/null 2>&1; echo $? )
+		# shellcheck disable=SC2086
+		b=$( "$(real_of pathchk)" $o -- "$p" > /dev/null 2>&1; echo $? )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "pathchk $o '$p' ($a vs $b)"; fi
+	done
+done
+
+# asa is not shipped by GNU, so it is checked against the standard directly.
+printf ' first\n0double\n1page\n+over\n' > asain
+a=$( . "$BT"; asa asain | od -An -c )
+b=$( printf 'first\n\ndouble\n\fpage\rover\n' | od -An -c )
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "asa carriage control"; fi
+a=$( . "$BT"; asa < empty | od -An -c )
+if [ -z "$(printf '%s' "$a" | tr -d ' \n')" ]; then pass=$((pass + 1)); else note_fail "asa empty"; fi
+
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"
 out=$(env -i PATH= "$BASH" --noprofile --norc -c '
