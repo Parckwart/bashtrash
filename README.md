@@ -28,7 +28,7 @@ $ cat README.md | head -n 3 | wc -l
 
 This is a toy, and it is meant to be one. It is also a real conformance
 exercise: every utility is checked against GNU coreutils, byte for byte on
-stdout and on exit status, over 5895 comparisons.
+stdout and on exit status, over 6075 comparisons.
 
 ## Use it
 
@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-40 of the 160 utilities in POSIX.1-2017, as of now.
+41 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -77,6 +77,7 @@ Run the test suite with:
 | `paste` | `paste [-s] [-d list] file...` |
 | `pathchk` | `pathchk [-p] pathname...` |
 | `pr` | `pr [+page] [-column] [-adFmrt] [-h header] [-l lines] [-o offset] [-w width] [file...]` |
+| `sed` | `sed [-n] script [file...]` · `sed [-n] [-e script]... [-f file]... [file...]` |
 | `sleep` | `sleep time` |
 | `sort` | `sort [-m] [-o out] [-bdfinru] [-t char] [-k keydef]... [file...]` · `sort -c ...` |
 | `split` | `split [-l line_count] [-a suffix_length] [file [name]]` · `split -b n[k\|m] ...` |
@@ -141,7 +142,7 @@ $ ./test.sh
 ### fuzz
 ### id
 ...
-==== pass=5895 fail=0 ====
+==== pass=6075 fail=0 ====
 ```
 
 Every case runs twice — once through the bash function, once through the system
@@ -191,16 +192,16 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 40 |
+| implemented here | 41 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **40** |
-| reachable, not yet written | 58 |
+| reachable, not yet written | 57 |
 
 **The ceiling is 98 of 160**, or about 61% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 58 that remain are wildly uneven, too. `true`, `false`, `logname` and
+The 57 that remain are wildly uneven, too. `true`, `false`, `logname` and
 `printf` are afternoons. `awk`, `sed`, `m4`, `bc`, `make`, `lex` and `yacc` are
 interpreters and compilers, each larger than everything here put together,
 written in a language with no arrays of structs and no way to turn a character
@@ -230,7 +231,10 @@ into an integer except `printf '%d' "'$c"`.
 * In `unexpand`, behaviour past the end of an explicit `-t` list is
   implementation-defined; a run of blanks holding a literal tab is left as it was
   rather than flattened.
-* `nl -bp` matches with bash's `=~`, an ERE, where the standard asks for a BRE.
+* `sed` and `nl -bp` match with bash's `=~`, an ERE, where the standard
+  asks for a BRE, so the two are translated. `sed` implements the POSIX
+  command set; GNU's own extensions, such as the `first~step` address, are
+  not there.
 * Everything is byte oriented; multibyte locales are not interpreted.
 
 ## Speed

@@ -5606,3 +5606,548 @@ dd () {
 	_bt_err "$total bytes copied"
 	return "$status"
 }
+
+# ---------------------------------------------------------------------------
+# sed -- POSIX.1-2017:
+#	sed [-n] script [file...]
+#	sed [-n] [-e script]... [-f script_file]... [file...]
+# ---------------------------------------------------------------------------
+
+# Read one address at _bt_i of the script in _bt_s.  Sets _bt_a to "" (none),
+# "N<number>", "$", or "R<regex>", and advances _bt_i.
+_bt_sed_addr() {
+	local c d re=
+	_bt_a=
+	c=${_bt_s:_bt_i:1}
+	case $c in
+	[0-9])	_bt_a=N
+		while :; do
+			c=${_bt_s:_bt_i:1}
+			case $c in
+			[0-9])	_bt_a=$_bt_a$c; _bt_i=$(( _bt_i + 1 )) ;;
+			*)	break ;;
+			esac
+		done ;;
+	'$')	_bt_a='$'; _bt_i=$(( _bt_i + 1 )) ;;
+	'/'|'\')
+		if [ "$c" = '\' ]; then
+			d=${_bt_s:_bt_i+1:1}
+			_bt_i=$(( _bt_i + 2 ))
+		else
+			d=/
+			_bt_i=$(( _bt_i + 1 ))
+		fi
+		while [ "$_bt_i" -lt "${#_bt_s}" ]; do
+			c=${_bt_s:_bt_i:1}
+			if [ "$c" = '\' ] && [ "${_bt_s:_bt_i+1:1}" = "$d" ]; then
+				re=$re$d
+				_bt_i=$(( _bt_i + 2 ))
+				continue
+			fi
+			[ "$c" = "$d" ] && { _bt_i=$(( _bt_i + 1 )); break; }
+			re=$re$c
+			_bt_i=$(( _bt_i + 1 ))
+		done
+		_bt_a=R$re ;;
+	esac
+	return 0
+}
+
+# Read a delimited piece (a regex, replacement or transliteration operand)
+# ending at the unescaped delimiter $1.  Sets _bt_piece.
+_bt_sed_piece() {
+	local d=$1 c
+	_bt_piece=
+	while [ "$_bt_i" -lt "${#_bt_s}" ]; do
+		c=${_bt_s:_bt_i:1}
+		if [ "$c" = '\' ]; then
+			if [ "${_bt_s:_bt_i+1:1}" = "$d" ]; then
+				_bt_piece=$_bt_piece$d
+			else
+				_bt_piece=$_bt_piece'\'${_bt_s:_bt_i+1:1}
+			fi
+			_bt_i=$(( _bt_i + 2 ))
+			continue
+		fi
+		[ "$c" = "$d" ] && { _bt_i=$(( _bt_i + 1 )); return 0; }
+		_bt_piece=$_bt_piece$c
+		_bt_i=$(( _bt_i + 1 ))
+	done
+	return 1
+}
+
+# Take the rest of the current line as an argument.
+_bt_sed_rest() {
+	local out=
+	while [ "$_bt_i" -lt "${#_bt_s}" ]; do
+		case ${_bt_s:_bt_i:1} in
+		$'\n')	break ;;
+		esac
+		out=$out${_bt_s:_bt_i:1}
+		_bt_i=$(( _bt_i + 1 ))
+	done
+	_bt_piece=$out
+	return 0
+}
+
+# Parse the whole script in _bt_s into the command arrays.
+_bt_sed_parse() {
+	local c d lbl i
+	local -a stack=()
+	while [ "$_bt_i" -lt "${#_bt_s}" ]; do
+		c=${_bt_s:_bt_i:1}
+		case $c in
+		$'\n'|';'|' '|$'\t')	_bt_i=$(( _bt_i + 1 )); continue ;;
+		'#')	while [ "$_bt_i" -lt "${#_bt_s}" ] && [ "${_bt_s:_bt_i:1}" != $'\n' ]; do
+				_bt_i=$(( _bt_i + 1 ))
+			done
+			continue ;;
+		esac
+		_bt_sed_addr
+		_sa1+=("$_bt_a")
+		_bt_a=
+		if [ "${_bt_s:_bt_i:1}" = ',' ]; then
+			_bt_i=$(( _bt_i + 1 ))
+			_bt_sed_addr
+		fi
+		_sa2+=("$_bt_a")
+		if [ "${_bt_s:_bt_i:1}" = '!' ]; then
+			_sneg+=(1)
+			_bt_i=$(( _bt_i + 1 ))
+		else
+			_sneg+=(0)
+		fi
+		c=${_bt_s:_bt_i:1}
+		_bt_i=$(( _bt_i + 1 ))
+		_scmd+=("$c")
+		_sactive+=(0)
+		case $c in
+		s)	d=${_bt_s:_bt_i:1}
+			_bt_i=$(( _bt_i + 1 ))
+			_bt_sed_piece "$d"; _sarg+=("$_bt_piece")
+			_bt_sed_piece "$d"; _sarg2+=("$_bt_piece")
+			_bt_piece=
+			while [ "$_bt_i" -lt "${#_bt_s}" ]; do
+				case ${_bt_s:_bt_i:1} in
+				[gpGP0-9])	_bt_piece=$_bt_piece${_bt_s:_bt_i:1}; _bt_i=$(( _bt_i + 1 )) ;;
+				w)	_bt_i=$(( _bt_i + 1 ))
+					_bt_sed_rest
+					_bt_piece=w$_bt_piece
+					break ;;
+				*)	break ;;
+				esac
+			done
+			_sflag+=("$_bt_piece") ;;
+		y)	d=${_bt_s:_bt_i:1}
+			_bt_i=$(( _bt_i + 1 ))
+			_bt_sed_piece "$d"; _sarg+=("$_bt_piece")
+			_bt_sed_piece "$d"; _sarg2+=("$_bt_piece")
+			_sflag+=('') ;;
+		a|i|c)	# both the "a\" + newline form and the one-line form
+			[ "${_bt_s:_bt_i:1}" = '\' ] && _bt_i=$(( _bt_i + 1 ))
+			[ "${_bt_s:_bt_i:1}" = $'\n' ] && _bt_i=$(( _bt_i + 1 ))
+			while [ "${_bt_s:_bt_i:1}" = ' ' ]; do _bt_i=$(( _bt_i + 1 )); done
+			_bt_piece=
+			while [ "$_bt_i" -lt "${#_bt_s}" ]; do
+				if [ "${_bt_s:_bt_i:1}" = '\' ] && [ "${_bt_s:_bt_i+1:1}" = $'\n' ]; then
+					_bt_piece=$_bt_piece$'\n'
+					_bt_i=$(( _bt_i + 2 ))
+					continue
+				fi
+				[ "${_bt_s:_bt_i:1}" = $'\n' ] && break
+				_bt_piece=$_bt_piece${_bt_s:_bt_i:1}
+				_bt_i=$(( _bt_i + 1 ))
+			done
+			_sarg+=("$_bt_piece"); _sarg2+=(''); _sflag+=('') ;;
+		r|w)	while [ "${_bt_s:_bt_i:1}" = ' ' ]; do _bt_i=$(( _bt_i + 1 )); done
+			_bt_sed_rest
+			_sarg+=("$_bt_piece"); _sarg2+=(''); _sflag+=('') ;;
+		b|t|:)	_bt_piece=
+			while [ "$_bt_i" -lt "${#_bt_s}" ]; do
+				case ${_bt_s:_bt_i:1} in
+				$'\n'|';'|'}')	break ;;
+				' ')	[ -z "$_bt_piece" ] && { _bt_i=$(( _bt_i + 1 )); continue; }
+					break ;;
+				esac
+				_bt_piece=$_bt_piece${_bt_s:_bt_i:1}
+				_bt_i=$(( _bt_i + 1 ))
+			done
+			_sarg+=("$_bt_piece"); _sarg2+=(''); _sflag+=('') ;;
+		'{')	stack+=($(( ${#_scmd[@]} - 1 )))
+			_sarg+=(''); _sarg2+=(''); _sflag+=('') ;;
+		'}')	if [ "${#stack[@]}" -gt 0 ]; then
+				i=${stack[${#stack[@]}-1]}
+				stack=("${stack[@]:0:${#stack[@]}-1}")
+				_sarg[i]=$(( ${#_scmd[@]} ))
+			fi
+			_sarg+=(''); _sarg2+=(''); _sflag+=('') ;;
+		*)	_sarg+=(''); _sarg2+=(''); _sflag+=('') ;;
+		esac
+	done
+	return 0
+}
+
+# A sed regular expression, with \n and \t meaning the characters they
+# name, converted to the ERE bash matches with.  grep does not do this:
+# in its BRE \n is a literal n.
+_bt_sed_re() {
+	local s=$1 out= i c
+	for (( i = 0; i < ${#s}; i++ )); do
+		c=${s:i:1}
+		if [ "$c" = '\' ] && [ $(( i + 1 )) -lt "${#s}" ]; then
+			case ${s:i+1:1} in
+			n)	out=$out$'\n'; i=$(( i + 1 )); continue ;;
+			t)	out=$out$'\t'; i=$(( i + 1 )); continue ;;
+			esac
+		fi
+		out=$out$c
+	done
+	_bt_bre2ere "$out"
+	return 0
+}
+
+# Does address $1 select the current line?
+_bt_sed_matchaddr() {
+	local re
+	case $1 in
+	'')	return 0 ;;
+	N*)	[ "$lineno" -eq "${1#N}" ] && return 0
+		return 1 ;;
+	'$')	[ "$lineno" -eq "$nlines" ] && return 0
+		return 1 ;;
+	R*)	re=${1#R}
+		[ -n "$re" ] || re=$_bt_lastre
+		_bt_lastre=$re
+		_bt_sed_re "$re"
+		[[ $pat =~ $_bt_re ]] && return 0
+		return 1 ;;
+	esac
+	return 1
+}
+
+# s/$1/$2/$3 over the pattern space.  Sets subflag when anything changed.
+_bt_sed_sub() {
+	local re=$1 rep=$2 flags=$3
+	local global=0 which=1 doprint=0 wfile= digits
+	local ere out= i=0 count=0 len m mlen r c j lastend=-1
+	case $flags in *g*) global=1 ;; esac
+	digits=${flags//[!0-9]/}
+	[ -n "$digits" ] && which=$(( 10#$digits ))
+	case $flags in *p*) doprint=1 ;; esac
+	case $flags in w*) wfile=${flags#w} ;; esac
+	[ -n "$re" ] || re=$_bt_lastre
+	_bt_lastre=$re
+	_bt_sed_re "$re"
+	ere=$_bt_re
+	len=${#pat}
+	while [ "$i" -le "$len" ]; do
+		if [[ ${pat:i} =~ ^($ere) ]]; then
+			m=${BASH_REMATCH[1]}
+			mlen=${#m}
+			# An empty match sitting where the last one ended is not a
+			# second match; step over a character first.
+			if [ "$mlen" -eq 0 ] && [ "$i" -eq "$lastend" ]; then
+				[ "$i" -lt "$len" ] && out=$out${pat:i:1}
+				i=$(( i + 1 ))
+				continue
+			fi
+			lastend=$(( i + mlen ))
+			count=$(( count + 1 ))
+			if { [ "$global" = 1 ] && [ "$count" -ge "$which" ]; } ||
+			   [ "$count" -eq "$which" ]; then
+				r=
+				for (( j = 0; j < ${#rep}; j++ )); do
+					c=${rep:j:1}
+					if [ "$c" = '\' ]; then
+						j=$(( j + 1 ))
+						case ${rep:j:1} in
+						[1-9])	r=$r${BASH_REMATCH[${rep:j:1} + 1]} ;;
+						n)	r=$r$'\n' ;;
+						t)	r=$r$'\t' ;;
+						*)	r=$r${rep:j:1} ;;
+						esac
+					elif [ "$c" = '&' ]; then
+						r=$r$m
+					else
+						r=$r$c
+					fi
+				done
+				out=$out$r
+				subflag=1
+			else
+				out=$out$m
+			fi
+			if [ "$mlen" -eq 0 ]; then
+				[ "$i" -lt "$len" ] && out=$out${pat:i:1}
+				i=$(( i + 1 ))
+			else
+				i=$(( i + mlen ))
+			fi
+			if [ "$global" = 0 ] && [ "$count" -ge "$which" ]; then
+				out=$out${pat:i}
+				break
+			fi
+		else
+			[ "$i" -lt "$len" ] && out=$out${pat:i:1}
+			i=$(( i + 1 ))
+		fi
+	done
+	pat=$out
+	if [ "$subflag" = 1 ]; then
+		[ "$doprint" = 1 ] && printf '%s\n' "$pat"
+		if [ -n "$wfile" ]; then
+			printf '%s\n' "$pat" >> "$wfile"
+		fi
+	fi
+	return 0
+}
+
+# The pattern space as `l` writes it.
+_bt_sed_visible() {
+	local s=$1 i c out= v
+	for (( i = 0; i < ${#s}; i++ )); do
+		c=${s:i:1}
+		case $c in
+		'\')	out=$out'\\' ;;
+		$'\a')	out=$out'\a' ;;
+		$'\b')	out=$out'\b' ;;
+		$'\f')	out=$out'\f' ;;
+		$'\n')	out=$out'\n' ;;
+		$'\r')	out=$out'\r' ;;
+		$'\t')	out=$out'\t' ;;
+		$'\v')	out=$out'\v' ;;
+		[[:print:]])	out=$out$c ;;
+		*)	printf -v v '%03o' "'$c"
+			out=$out'\'$v ;;
+		esac
+	done
+	_bt_vis=$out
+	return 0
+}
+
+sed () {
+	local LC_ALL=C
+	local quiet=0 havescript=0 arg opt val file fd status=0
+	local -a _sa1=() _sa2=() _sneg=() _scmd=() _sarg=() _sarg2=() _sflag=() _sactive=()
+	local -a lines=()
+	local _bt_s= _bt_i=0 _bt_a _bt_piece _bt_re _bt_lastre= _bt_vis _bt_reason
+	local pat hold= lineno nlines pc sel ncmds line
+	local deleted restart quitflag=0 subflag=0 appendq= i j lbl
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				n)	quiet=1 ;;
+				e|f)	if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "sed: option requires an argument -- $opt"
+						return 1
+					fi
+					if [ "$opt" = e ]; then
+						[ -n "$_bt_s" ] && _bt_s=$_bt_s$'\n'
+						_bt_s=$_bt_s$val
+					else
+						if ! { exec {fd}<"$val"; } 2>/dev/null; then
+							_bt_err "sed: couldn't open file $val"
+							return 1
+						fi
+						line=
+						while IFS= read -r line <&"$fd" || [ -n "$line" ]; do
+							[ -n "$_bt_s" ] && _bt_s=$_bt_s$'\n'
+							_bt_s=$_bt_s$line
+							line=
+						done
+						exec {fd}<&-
+					fi
+					havescript=1 ;;
+				*)	_bt_err "sed: illegal option -- $opt"
+					_bt_err "usage: sed [-n] script [file...]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$havescript" = 0 ]; then
+		if [ "$#" -eq 0 ]; then
+			_bt_err "usage: sed [-n] script [file...]"
+			return 1
+		fi
+		_bt_s=$1
+		shift
+	fi
+	_bt_i=0
+	_bt_sed_parse
+	ncmds=${#_scmd[@]}
+
+	[ "$#" -eq 0 ] && set -- -
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			fd=0
+		elif [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_why "$file"
+			_bt_err "sed: can't read $file: $_bt_reason"
+			status=2
+			continue
+		fi
+		line=
+		while IFS= read -r line <&"$fd" || [ -n "$line" ]; do
+			lines+=("$line")
+			line=
+		done
+		[ "$fd" = 0 ] || exec {fd}<&-
+	done
+	nlines=${#lines[@]}
+
+	lineno=0
+	while [ "$lineno" -lt "$nlines" ]; do
+		lineno=$(( lineno + 1 ))
+		pat=${lines[lineno-1]}
+		subflag=0 appendq= deleted=0
+		restart=1
+		while [ "$restart" = 1 ]; do
+			restart=0
+			pc=0
+			while [ "$pc" -lt "$ncmds" ]; do
+				sel=0
+				if [ -z "${_sa1[pc]}" ]; then
+					sel=1
+				elif [ -z "${_sa2[pc]}" ]; then
+					_bt_sed_matchaddr "${_sa1[pc]}" && sel=1
+				elif [ "${_sactive[pc]}" = 0 ]; then
+					if _bt_sed_matchaddr "${_sa1[pc]}"; then
+						sel=1
+						_sactive[pc]=1
+						case ${_sa2[pc]} in
+						N*)	[ "${_sa2[pc]#N}" -le "$lineno" ] && _sactive[pc]=0 ;;
+						esac
+					fi
+				else
+					sel=1
+					case ${_sa2[pc]} in
+					N*)	[ "$lineno" -ge "${_sa2[pc]#N}" ] && _sactive[pc]=0 ;;
+					*)	_bt_sed_matchaddr "${_sa2[pc]}" && _sactive[pc]=0 ;;
+					esac
+				fi
+				[ "${_sneg[pc]}" = 1 ] && sel=$(( 1 - sel ))
+				if [ "$sel" = 0 ]; then
+					if [ "${_scmd[pc]}" = '{' ]; then
+						pc=${_sarg[pc]}
+					else
+						pc=$(( pc + 1 ))
+					fi
+					continue
+				fi
+				case ${_scmd[pc]} in
+				'{'|'}'|':')	;;
+				s)	_bt_sed_sub "${_sarg[pc]}" "${_sarg2[pc]}" "${_sflag[pc]}" ;;
+				y)	val=${_sarg[pc]}; arg=${_sarg2[pc]}
+					line=
+					for (( i = 0; i < ${#pat}; i++ )); do
+						j=0
+						while [ "$j" -lt "${#val}" ]; do
+							[ "${pat:i:1}" = "${val:j:1}" ] && break
+							j=$(( j + 1 ))
+						done
+						if [ "$j" -lt "${#val}" ]; then
+							line=$line${arg:j:1}
+						else
+							line=$line${pat:i:1}
+						fi
+					done
+					pat=$line ;;
+				p)	printf '%s\n' "$pat" ;;
+				P)	printf '%s\n' "${pat%%$'\n'*}" ;;
+				d)	deleted=1; break ;;
+				D)	case $pat in
+					*$'\n'*)	pat=${pat#*$'\n'}; restart=1; deleted=1 ;;
+					*)		deleted=1 ;;
+					esac
+					break ;;
+				n)	[ "$quiet" = 0 ] && printf '%s\n' "$pat"
+					if [ "$lineno" -ge "$nlines" ]; then
+						deleted=1
+						quitflag=1
+						break
+					fi
+					lineno=$(( lineno + 1 ))
+					pat=${lines[lineno-1]} ;;
+				N)	if [ "$lineno" -ge "$nlines" ]; then
+						quitflag=1
+						break
+					fi
+					lineno=$(( lineno + 1 ))
+					pat=$pat$'\n'${lines[lineno-1]} ;;
+				g)	pat=$hold ;;
+				G)	pat=$pat$'\n'$hold ;;
+				h)	hold=$pat ;;
+				H)	hold=$hold$'\n'$pat ;;
+				x)	line=$pat; pat=$hold; hold=$line ;;
+				a)	appendq=$appendq${_sarg[pc]}$'\n' ;;
+				i)	printf '%s\n' "${_sarg[pc]}" ;;
+				c)	if [ -z "${_sa2[pc]}" ] || [ "${_sactive[pc]}" = 0 ]; then
+						printf '%s\n' "${_sarg[pc]}"
+					fi
+					deleted=1
+					break ;;
+				r)	if [ -r "${_sarg[pc]}" ]; then
+						line=
+						{ exec {fd}<"${_sarg[pc]}"; } 2>/dev/null &&
+						while IFS= read -r line <&"$fd" || [ -n "$line" ]; do
+							appendq=$appendq$line$'\n'
+							line=
+						done
+						exec {fd}<&-
+					fi ;;
+				w)	printf '%s\n' "$pat" >> "${_sarg[pc]}" ;;
+				'=')	printf '%d\n' "$lineno" ;;
+				l)	_bt_sed_visible "$pat"
+					printf '%s$\n' "$_bt_vis" ;;
+				q)	quitflag=1; break ;;
+				b)	lbl=${_sarg[pc]}
+					if [ -z "$lbl" ]; then
+						pc=$ncmds
+						continue
+					fi
+					for (( i = 0; i < ncmds; i++ )); do
+						if [ "${_scmd[i]}" = ':' ] && [ "${_sarg[i]}" = "$lbl" ]; then
+							pc=$i
+							break
+						fi
+					done
+					continue ;;
+				t)	if [ "$subflag" = 1 ]; then
+						subflag=0
+						lbl=${_sarg[pc]}
+						if [ -z "$lbl" ]; then
+							pc=$ncmds
+							continue
+						fi
+						for (( i = 0; i < ncmds; i++ )); do
+							if [ "${_scmd[i]}" = ':' ] && [ "${_sarg[i]}" = "$lbl" ]; then
+								pc=$i
+								break
+							fi
+						done
+						continue
+					fi ;;
+				esac
+				pc=$(( pc + 1 ))
+			done
+		done
+		[ "$deleted" = 0 ] && [ "$quiet" = 0 ] && printf '%s\n' "$pat"
+		[ -n "$appendq" ] && printf '%s' "$appendq"
+		[ "$quitflag" = 1 ] && break
+	done
+	return "$status"
+}

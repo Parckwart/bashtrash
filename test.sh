@@ -25,7 +25,7 @@ fi
 for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          fold head id nl od paste pathchk sleep sort split strings tabs \
          tail tee tr tsort tty uname unexpand uniq wc join csplit grep xargs \
-         nohup pr dd; do
+         nohup pr dd sed; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -890,6 +890,76 @@ ddchk if=rand.bin bs=64 count=3
 ddchk if=rand.bin bs=100
 ddchk if=empty
 ddchk if=no-such-file
+
+# --- sed ------------------------------------------------------------------
+echo "### sed"
+printf 'one\ntwo\nthree\nfour\nfive\n'                                > s1
+printf 'foo bar\n\nbaz  qux\n  indented\nUPPER lower\n123 456\nend\n' > s2
+printf 'a\nb\nc\nd\ne\nf\ng\nh\n'                                     > s3
+sedchk() {
+	local f=$1
+	shift
+	( . "$BT"; sed "$@" "$f" ) > bt.out 2> /dev/null; local a=$?
+	"$(real_of sed)" "$@" "$f" > re.out 2> /dev/null; local b=$?
+	if cmp -s bt.out re.out && [ "$a" = "$b" ]; then pass=$((pass + 1))
+	else note_fail "sed $* < $f ($a vs $b)"; fi
+}
+for f in s1 s2 s3 empty; do
+	sedchk "$f" 's/o/0/'
+	sedchk "$f" 's/o/0/g'
+	sedchk "$f" 's/o/0/2'
+	sedchk "$f" 's/e/E/2g'
+	sedchk "$f" 's/x*/-/g'
+	sedchk "$f" 's/o*/./g'
+	sedchk "$f" 's/[0-9]*/N/g'
+	sedchk "$f" 's/[0-9]\+/N/g'
+	sedchk "$f" 's/^ *//'
+	sedchk "$f" 's/ *$//'
+	sedchk "$f" 's/\(.\)\(.\)/\2\1/'
+	sedchk "$f" 's/.*/[&]/'
+	sedchk "$f" 's/e/&&/g'
+	sedchk "$f" 's/^/> /'
+	sedchk "$f" 's/[aeiou]//g'
+	sedchk "$f" '1d'
+	sedchk "$f" '$d'
+	sedchk "$f" '2d'
+	sedchk "$f" '2,4d'
+	sedchk "$f" '/^$/d'
+	sedchk "$f" '2!d'
+	sedchk "$f" 'y/abc/ABC/'
+	sedchk "$f" 'y/oe/0E/'
+	sedchk "$f" 'G'
+	sedchk "$f" 'N;s/\n/+/'
+	sedchk "$f" '$!N;s/\n/ /'
+	sedchk "$f" '2{s/./X/}'
+	sedchk "$f" ':a;s/o/0/;ta'
+	sedchk "$f" -n '$p'
+	sedchk "$f" -n '2,3p'
+	sedchk "$f" -n 'p;p'
+	sedchk "$f" -n 'l'
+	sedchk "$f" -n '='
+	sedchk "$f" -n '$='
+	sedchk "$f" -n 'N;P;D'
+	sedchk "$f" -n 'H;${x;s/\n/,/g;p}'
+	sedchk "$f" -n '/a/,/c/p'
+	sedchk "$f" -n '/./{s/^/> /;p}'
+	sedchk "$f" -n 's/o/0/p'
+	sedchk "$f" -n '/o/!p'
+	sedchk "$f" -n '/o/{s//X/p}'
+	sedchk "$f" -e '1h' -e '$!d' -e 'x;G'
+	sedchk "$f" -e 's/x/y/' -e 's/o/0/'
+done
+sedchk s1 '1a\
+APPEND'
+sedchk s1 '1i\
+INS'
+sedchk s1 '2c\
+CHG'
+sedchk s1 '2q'
+sedchk s1 -n '/five/q;p'
+sedchk s1 's/\t/TAB/'
+chk "sed missing" sed 's/a/b/' no-such-file
+chks "sed stdin" s1 sed 's/o/0/'
 
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"
