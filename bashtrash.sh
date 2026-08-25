@@ -3532,6 +3532,9 @@ _bt_bre2ere() {
 		c=${s:i:1}
 		if [ "$c" = '\' ] && [ $(( i + 1 )) -lt "${#s}" ]; then
 			case ${s:i+1:1} in
+			# \+ \? and \| are the operators in a BRE as every
+			# implementation extends it, so they lose the backslash.
+			'+'|'?'|'|')	out=$out${s:i+1:1} ;;
 			'('|')'|'{'|'}')	out=$out${s:i+1:1} ;;
 			*)			out=$out'\'${s:i+1:1} ;;
 			esac
@@ -4881,4 +4884,725 @@ _bt_csplit_apply() {
 	fi
 	_bt_csplit_write "$target" 0 || return 1
 	return 0
+}
+
+# ---------------------------------------------------------------------------
+# grep -- POSIX.1-2017:
+#	grep [-E|-F] [-c|-l|-q] [-insvx] -e pattern_list... [-f pattern_file]...
+#	     [file...]
+#	grep [-E|-F] [-c|-l|-q] [-insvx] pattern_list [file...]
+# ---------------------------------------------------------------------------
+
+# Does $1 match any of the patterns?  Relies on the caller's locals.
+_bt_grep_match() {
+	local line=$1 p
+	for p in ${_bt_pat[@]+"${_bt_pat[@]}"}; do
+		if [ "$_bt_fixed" = 1 ]; then
+			if [ "$_bt_whole" = 1 ]; then
+				[[ $line == "$p" ]] && return 0
+			else
+				[[ $line == *"$p"* ]] && return 0
+			fi
+		else
+			[[ $line =~ $p ]] && return 0
+		fi
+	done
+	return 1
+}
+
+grep () {
+	local LC_ALL=C
+	local arg opt val file fd status=1 err=0 _bt_reason _bt_re
+	local _bt_fixed=0 _bt_whole=0 ere=0 icase=0 count=0 listf=0 quiet=0
+	local nums=0 quietfail=0 invert=0 havepat=0 prefix=0
+	local line n hits total p saved_nocase
+	local -a _bt_pat=() files=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				E)	ere=1 ;;
+				F)	_bt_fixed=1 ;;
+				c)	count=1 ;;
+				l)	listf=1 ;;
+				q)	quiet=1 ;;
+				i)	icase=1 ;;
+				n)	nums=1 ;;
+				s)	quietfail=1 ;;
+				v)	invert=1 ;;
+				x)	_bt_whole=1 ;;
+				e|f)	if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "grep: option requires an argument -- $opt"
+						return 2
+					fi
+					if [ "$opt" = e ]; then
+						while [ -n "$val" ]; do
+							_bt_pat+=("${val%%$'\n'*}")
+							case $val in
+							*$'\n'*)	val=${val#*$'\n'} ;;
+							*)		val= ;;
+							esac
+						done
+					else
+						if ! { exec {fd}<"$val"; } 2>/dev/null; then
+							_bt_err "grep: $val: No such file or directory"
+							return 2
+						fi
+						line=
+						while IFS= read -r line <&"$fd" || [ -n "$line" ]; do
+							_bt_pat+=("$line")
+							line=
+						done
+						exec {fd}<&-
+					fi
+					havepat=1 ;;
+				*)	_bt_err "grep: illegal option -- $opt"
+					_bt_err "usage: grep [-E|-F] [-c|-l|-q] [-insvx] pattern [file...]"
+					return 2 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	if [ "$havepat" = 0 ]; then
+		if [ "$#" -eq 0 ]; then
+			_bt_err "usage: grep [-E|-F] [-c|-l|-q] [-insvx] pattern [file...]"
+			return 2
+		fi
+		val=$1
+		shift
+		while [ -n "$val" ]; do
+			_bt_pat+=("${val%%$'\n'*}")
+			case $val in
+			*$'\n'*)	val=${val#*$'\n'} ;;
+			*)		val= ;;
+			esac
+		done
+	fi
+
+	# A basic regular expression is turned into the extended one bash's =~
+	# understands; -F patterns are left exactly as they are.
+	if [ "$_bt_fixed" = 0 ]; then
+		for (( n = 0; n < ${#_bt_pat[@]}; n++ )); do
+			if [ "$ere" = 0 ]; then
+				_bt_bre2ere "${_bt_pat[n]}"
+				_bt_pat[n]=$_bt_re
+			fi
+			[ "$_bt_whole" = 1 ] && _bt_pat[n]='^('${_bt_pat[n]}')$'
+		done
+	fi
+
+	saved_nocase=$(shopt -p nocasematch)
+	[ "$icase" = 1 ] && shopt -s nocasematch
+
+	[ "$#" -eq 0 ] && set -- -
+	[ "$#" -gt 1 ] && prefix=1
+
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			fd=0
+		elif [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+			if [ "$quietfail" = 0 ]; then
+				_bt_why "$file"
+				_bt_err "grep: $file: $_bt_reason"
+			fi
+			err=2
+			continue
+		fi
+		n=0 hits=0
+		line=
+		while IFS= read -r line <&"$fd" || [ -n "$line" ]; do
+			n=$(( n + 1 ))
+			if _bt_grep_match "$line"; then p=1; else p=0; fi
+			[ "$invert" = 1 ] && p=$(( 1 - p ))
+			if [ "$p" = 1 ]; then
+				hits=$(( hits + 1 ))
+				status=0
+				if [ "$quiet" = 1 ]; then
+					eval "$saved_nocase"
+					[ "$fd" = 0 ] || exec {fd}<&-
+					return 0
+				fi
+				if [ "$listf" = 1 ]; then
+					printf '%s\n' "$file"
+					break
+				fi
+				if [ "$count" = 0 ]; then
+					if [ "$prefix" = 1 ] && [ "$nums" = 1 ]; then
+						printf '%s:%d:%s\n' "$file" "$n" "$line"
+					elif [ "$prefix" = 1 ]; then
+						printf '%s:%s\n' "$file" "$line"
+					elif [ "$nums" = 1 ]; then
+						printf '%d:%s\n' "$n" "$line"
+					else
+						printf '%s\n' "$line"
+					fi
+				fi
+			fi
+			line=
+		done
+		[ "$fd" = 0 ] || exec {fd}<&-
+		if [ "$count" = 1 ] && [ "$listf" = 0 ]; then
+			if [ "$prefix" = 1 ]; then
+				printf '%s:%d\n' "$file" "$hits"
+			else
+				printf '%d\n' "$hits"
+			fi
+		fi
+	done
+
+	eval "$saved_nocase"
+	[ "$err" = 2 ] && return 2
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# xargs -- POSIX.1-2017:
+#	xargs [-t] [-E eofstr] [-I replstr] [-L number] [-n number] [-s size]
+#	      [utility [argument...]]
+# ---------------------------------------------------------------------------
+xargs () {
+	local LC_ALL=C
+	local arg opt val eofstr= repl= maxargs=0 maxlines=0 maxsize=0 trace=0
+	local i c q tok line status=0 rc
+	local -a words=() cmd=() batch=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-*)	[ "$1" = - ] && break
+			arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				t)	trace=1 ;;
+				p)	;;	# prompting needs a terminal dialogue
+				E|I|L|n|s)
+					if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "xargs: option requires an argument -- $opt"
+						return 1
+					fi
+					case $opt in
+					E)	eofstr=$val ;;
+					I)	repl=$val; maxlines=1 ;;
+					L)	maxlines=$(( 10#$val )) ;;
+					n)	maxargs=$(( 10#$val )) ;;
+					s)	maxsize=$(( 10#$val )) ;;
+					esac ;;
+				*)	_bt_err "xargs: illegal option -- $opt"
+					_bt_err "usage: xargs [-t] [-E eof] [-I repl] [-L n] [-n n] [-s size] [utility [arg...]]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -eq 0 ]; then
+		cmd=(echo)
+	else
+		cmd=("$@")
+	fi
+
+	if [ -n "$repl" ] || [ "$maxlines" -gt 0 ]; then
+		# Line at a time: -I substitutes the whole line.
+		line=
+		while IFS= read -r line || [ -n "$line" ]; do
+			if [ -n "$eofstr" ] && [ "$line" = "$eofstr" ]; then break; fi
+			batch=()
+			if [ -n "$repl" ]; then
+				for tok in "${cmd[@]}"; do
+					batch+=("${tok//"$repl"/$line}")
+				done
+			else
+				batch=("${cmd[@]}")
+				_bt_xargs_words "$line"
+				batch+=(${words[@]+"${words[@]}"})
+			fi
+			[ "$trace" = 1 ] && printf '%s\n' "${batch[*]}" >&2
+			"${batch[@]}" || status=$?
+			line=
+		done
+		return "$status"
+	fi
+
+	# Otherwise the whole input is one stream of quoted words.
+	line=
+	words=()
+	while IFS= read -r line || [ -n "$line" ]; do
+		_bt_xargs_words "$line" append
+		line=
+	done
+	if [ -n "$eofstr" ]; then
+		for (( i = 0; i < ${#words[@]}; i++ )); do
+			if [ "${words[i]}" = "$eofstr" ]; then
+				words=("${words[@]:0:i}")
+				break
+			fi
+		done
+	fi
+	if [ "${#words[@]}" -eq 0 ]; then
+		[ "$trace" = 1 ] && printf '%s\n' "${cmd[*]}" >&2
+		"${cmd[@]}"
+		return $?
+	fi
+	i=0
+	while [ "$i" -lt "${#words[@]}" ]; do
+		if [ "$maxargs" -gt 0 ]; then
+			batch=("${cmd[@]}" "${words[@]:i:maxargs}")
+			i=$(( i + maxargs ))
+		else
+			batch=("${cmd[@]}" "${words[@]}")
+			i=${#words[@]}
+		fi
+		[ "$trace" = 1 ] && printf '%s\n' "${batch[*]}" >&2
+		"${batch[@]}" || status=$?
+	done
+	return "$status"
+}
+
+# Split $1 into words the way xargs does: blanks separate, quotes group, a
+# backslash protects the next character.  Appends when $2 is given.
+_bt_xargs_words() {
+	local s=$1 append=$2 i=0 n=${#1} c tok= have=0 quote=
+	[ -n "$append" ] || words=()
+	while [ "$i" -lt "$n" ]; do
+		c=${s:i:1}
+		i=$(( i + 1 ))
+		if [ -n "$quote" ]; then
+			if [ "$c" = "$quote" ]; then
+				quote=
+			else
+				tok=$tok$c
+			fi
+			have=1
+			continue
+		fi
+		case $c in
+		\\)	if [ "$i" -lt "$n" ]; then
+				tok=$tok${s:i:1}
+				i=$(( i + 1 ))
+				have=1
+			fi ;;
+		\'|\")	quote=$c; have=1 ;;
+		[$' \t'])
+			if [ "$have" = 1 ]; then
+				words+=("$tok")
+				tok= have=0
+			fi ;;
+		*)	tok=$tok$c; have=1 ;;
+		esac
+	done
+	[ "$have" = 1 ] && words+=("$tok")
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# nohup -- POSIX.1-2017: nohup utility [argument...]
+#
+# The file it creates should be mode 0600; without chmod() it lands on
+# whatever the umask allows.
+# ---------------------------------------------------------------------------
+nohup () {
+	local LC_ALL=C prog out rc
+	if [ "$#" -eq 0 ]; then
+		_bt_err "usage: nohup utility [argument...]"
+		return 127
+	fi
+	prog=$1
+	case $prog in
+	*/*)	if [ ! -e "$prog" ]; then
+			_bt_err "nohup: cannot run $prog: No such file or directory"
+			return 127
+		fi
+		if [ ! -x "$prog" ] || [ -d "$prog" ]; then
+			_bt_err "nohup: cannot run $prog: Permission denied"
+			return 126
+		fi ;;
+	*)	prog=$(command -v "$1" 2>/dev/null)
+		if [ -z "$prog" ]; then
+			_bt_err "nohup: cannot run $1: No such file or directory"
+			return 127
+		fi ;;
+	esac
+	(
+		trap '' HUP
+		if [ -t 1 ]; then
+			out=nohup.out
+			if ! { exec >> "$out"; } 2>/dev/null; then
+				out=${HOME:-.}/nohup.out
+				exec >> "$out" || exit 127
+			fi
+			_bt_err "nohup: appending output to '$out'"
+			[ -t 2 ] && exec 2>&1
+		fi
+		"$prog" "${@:2}"
+	)
+	return $?
+}
+
+# ---------------------------------------------------------------------------
+# pr -- POSIX.1-2017:
+#	pr [+page] [-column] [-adFmrt] [-e[char][gap]] [-h header] [-i[char][gap]]
+#	   [-l lines] [-n[char][width]] [-o offset] [-s[char]] [-w width] [file...]
+# ---------------------------------------------------------------------------
+
+# Move from column $1 to column $2 with tabs where they fit, then spaces.
+_bt_pr_pad() {
+	local at=$1 to=$2 nxt out=
+	while :; do
+		nxt=$(( at / 8 * 8 + 8 ))
+		[ "$nxt" -le "$to" ] || break
+		out=$out$'\t'
+		at=$nxt
+	done
+	if [ "$at" -lt "$to" ]; then
+		printf -v nxt '%*s' $(( to - at )) ''
+		out=$out$nxt
+	fi
+	_bt_pad=$out
+	return 0
+}
+
+pr () {
+	local LC_ALL=C
+	local arg opt val file fd status=0 _bt_reason _bt_pad
+	local cols=1 across=0 dbl=0 formfeed=0 merge=0 noheader=0 numbered=0
+	local numwidth=5 numchar=$'\t' header= offset=0 width=72 startpage=1
+	local sepchar= usesep=0 pagelen=66 bodylen line n i j c
+	local -a lines=() out=()
+	local page total colw row rows idx now
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		+*)	startpage=${1#+}
+			_bt_isnum "$startpage" || { _bt_err "pr: invalid page: $startpage"; return 1; }
+			startpage=$(( 10#$startpage ))
+			shift ;;
+		-[0-9]*)	cols=${1#-}
+			_bt_isnum "$cols" || { _bt_err "pr: invalid column count"; return 1; }
+			cols=$(( 10#$cols ))
+			shift ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				a)	across=1 ;;
+				d)	dbl=1 ;;
+				F|f)	formfeed=1 ;;
+				m)	merge=1 ;;
+				r)	;;	# quiet about files that cannot be opened
+				t)	noheader=1 ;;
+				n)	numbered=1
+					if [ -n "$arg" ]; then
+						case ${arg:0:1} in
+						[0-9])	numwidth=${arg%%[!0-9]*}; arg=${arg#"$numwidth"} ;;
+						*)	numchar=${arg:0:1}; arg=${arg:1}
+							case $arg in
+							[0-9]*)	numwidth=${arg%%[!0-9]*}; arg=${arg#"$numwidth"} ;;
+							esac ;;
+						esac
+					fi
+					numwidth=$(( 10#$numwidth )) ;;
+				s)	usesep=1
+					if [ -n "$arg" ]; then
+						sepchar=${arg:0:1}; arg=${arg:1}
+					else
+						sepchar=$'\t'
+					fi ;;
+				h|l|o|w)
+					if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "pr: option requires an argument -- $opt"
+						return 1
+					fi
+					case $opt in
+					h)	header=$val ;;
+					l)	pagelen=$(( 10#$val )) ;;
+					o)	offset=$(( 10#$val )) ;;
+					w)	width=$(( 10#$val )) ;;
+					esac ;;
+				e|i)	arg= ;;	# tab expansion: accepted, input is left as is
+				*)	_bt_err "pr: illegal option -- $opt"
+					_bt_err "usage: pr [+page] [-column] [-adFmrt] [-h header] [-l lines] [-o offset] [-w width] [file...]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	[ "$cols" -ge 1 ] || cols=1
+	[ "$pagelen" -ge 1 ] || pagelen=66
+
+	[ "$#" -eq 0 ] && set -- -
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			fd=0
+		elif [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_why "$file"
+			_bt_err "pr: $file: $_bt_reason"
+			status=1
+			continue
+		fi
+		lines=()
+		line=
+		while IFS= read -r line <&"$fd" || [ -n "$line" ]; do
+			lines+=("$line")
+			line=
+		done
+		[ "$fd" = 0 ] || exec {fd}<&-
+
+		if [ "$dbl" = 1 ]; then
+			out=()
+			for line in ${lines[@]+"${lines[@]}"}; do
+				out+=("$line" '')
+			done
+			lines=(${out[@]+"${out[@]}"})
+		fi
+		if [ "$numbered" = 1 ]; then
+			out=()
+			for (( i = 0; i < ${#lines[@]}; i++ )); do
+				printf -v val '%*d' "$numwidth" $(( i + 1 ))
+				out+=("$val$numchar${lines[i]}")
+			done
+			lines=(${out[@]+"${out[@]}"})
+		fi
+
+		total=${#lines[@]}
+		if [ "$noheader" = 1 ]; then
+			bodylen=$pagelen
+		else
+			bodylen=$(( pagelen - 10 ))
+			[ "$bodylen" -ge 1 ] || bodylen=1
+		fi
+		colw=$(( width / cols ))
+		page=1
+		idx=0
+		printf -v now '%(%Y-%m-%d %H:%M)T' -1
+		while [ "$idx" -lt "$total" ] || { [ "$page" -eq 1 ] && [ "$total" -eq 0 ]; }; do
+			# Rows are balanced against what is left, so a short page
+			# does not stretch to the full length; without -t the page
+			# is padded out to its length afterwards.
+			rows=$(( (total - idx + cols - 1) / cols ))
+			[ "$rows" -gt "$bodylen" ] && rows=$bodylen
+			[ "$rows" -lt 1 ] && rows=1
+			[ "$noheader" = 0 ] && rows=$bodylen
+			if [ "$page" -ge "$startpage" ] && [ "$noheader" = 0 ]; then
+				printf '\n\n'
+				printf '%s %*s%s%*s Page %d\n' "$now" \
+					$(( (width - ${#now} - ${#file} - 8) / 2 )) '' \
+					"${header:-$file}" \
+					$(( (width - ${#now} - ${#file} - 8) / 2 )) '' "$page"
+				printf '\n\n'
+			fi
+			for (( row = 0; row < rows; row++ )); do
+				line= c=0
+				for (( j = 0; j < cols; j++ )); do
+					if [ "$across" = 1 ]; then
+						i=$(( idx + row * cols + j ))
+					else
+						i=$(( idx + j * rows + row ))
+					fi
+					[ "$i" -ge "$total" ] && continue
+					[ $(( idx + rows * cols )) -le "$i" ] && continue
+					if [ "$j" -gt 0 ]; then
+						if [ "$usesep" = 1 ]; then
+							line=$line$sepchar
+							c=$(( c + 1 ))
+						else
+							_bt_pr_pad "$c" $(( j * colw ))
+							line=$line$_bt_pad
+							c=$(( j * colw ))
+						fi
+					elif [ "$offset" -gt 0 ]; then
+						printf -v val '%*s' "$offset" ''
+						line=$val
+						c=$offset
+					fi
+					line=$line${lines[i]}
+					c=$(( c + ${#lines[i]} ))
+				done
+				[ "$page" -ge "$startpage" ] && printf '%s\n' "$line"
+			done
+			idx=$(( idx + rows * cols ))
+			if [ "$page" -ge "$startpage" ] && [ "$noheader" = 0 ]; then
+				if [ "$formfeed" = 1 ]; then
+					printf '\f'
+				else
+					printf '\n\n\n\n\n'
+				fi
+			fi
+			page=$(( page + 1 ))
+			[ "$total" -eq 0 ] && break
+		done
+	done
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# dd -- POSIX.1-2017: dd [operand...]
+#
+# Records are counted in bytes, not in whatever the NUL-delimited reader
+# happens to hand back, so the pending input is held in the same segment form
+# tail uses and sliced to ibs.
+# ---------------------------------------------------------------------------
+
+# Write the first $1 bytes of _bt_seg to $fdout, applying conv, and count the
+# output record.
+_bt_dd_out() {
+	local want=$1 wrote=0 i n=${#_bt_seg[@]} piece
+	for (( i = 0; i < n && want > 0; i++ )); do
+		if [ "$i" -gt 0 ]; then
+			printf '\000' >&"$fdout"
+			want=$(( want - 1 ))
+			wrote=$(( wrote + 1 ))
+			[ "$want" -gt 0 ] || break
+		fi
+		piece=${_bt_seg[i]}
+		[ "${#piece}" -gt "$want" ] && piece=${piece:0:want}
+		case $conv in
+		*ucase*)	piece=${piece^^} ;;
+		*lcase*)	piece=${piece,,} ;;
+		esac
+		case $conv in
+		*swab*)	# byte pairs are swapped within a NUL free run
+			local sw= j
+			for (( j = 0; j + 1 < ${#piece}; j += 2 )); do
+				sw=$sw${piece:j+1:1}${piece:j:1}
+			done
+			[ $(( ${#piece} % 2 )) -eq 1 ] && sw=$sw${piece:${#piece}-1:1}
+			piece=$sw ;;
+		esac
+		printf '%s' "$piece" >&"$fdout"
+		want=$(( want - ${#piece} ))
+		wrote=$(( wrote + ${#piece} ))
+	done
+	total=$(( total + wrote ))
+	if [ "$wrote" -eq "$obs" ]; then
+		rout=$(( rout + 1 ))
+	elif [ "$wrote" -gt 0 ]; then
+		pout=$(( pout + 1 ))
+	fi
+	return 0
+}
+
+dd () {
+	local LC_ALL=C
+	local a name val infile= outfile= ibs=512 obs=512 cbs=0 _bt_reason
+	local count=-1 skip=0 seek=0 conv= fdin fdout status=0
+	local _bt_buf _bt_nul _bt_total rc
+	local rin=0 pin=0 rout=0 pout=0 total=0
+	local -a _bt_seg=("")
+
+	for a in "$@"; do
+		case $a in
+		*=*)	;;
+		*)	_bt_err "dd: unrecognized operand: $a"; return 1 ;;
+		esac
+		name=${a%%=*}
+		val=${a#*=}
+		case $name in
+		if)	infile=$val ;;
+		of)	outfile=$val ;;
+		ibs|obs|bs)
+			i=$(( 10#${val%[kKbB]} ))
+			case $val in
+			*k|*K)	i=$(( i * 1024 )) ;;
+			*b|*B)	i=$(( i * 512 )) ;;
+			esac
+			case $name in
+			ibs)	ibs=$i ;;
+			obs)	obs=$i ;;
+			bs)	ibs=$i; obs=$i ;;
+			esac ;;
+		cbs)	cbs=$(( 10#$val )) ;;
+		count)	count=$(( 10#$val )) ;;
+		skip)	skip=$(( 10#$val )) ;;
+		seek)	seek=$(( 10#$val )) ;;
+		conv)	conv=$val ;;
+		*)	_bt_err "dd: unrecognized operand: $name"; return 1 ;;
+		esac
+	done
+	[ "$ibs" -ge 1 ] || ibs=512
+	[ "$obs" -ge 1 ] || obs=512
+
+	if [ -n "$infile" ]; then
+		if ! { exec {fdin}<"$infile"; } 2>/dev/null; then
+			_bt_why "$infile"
+			_bt_err "dd: failed to open '$infile': $_bt_reason"
+			return 1
+		fi
+	else
+		fdin=0
+	fi
+	if [ -n "$outfile" ]; then
+		case $conv in
+		*notrunc*)	{ exec {fdout}>>"$outfile"; } 2>/dev/null ||
+				{ _bt_err "dd: failed to open '$outfile'"; return 1; } ;;
+		*)		{ exec {fdout}>"$outfile"; } 2>/dev/null ||
+				{ _bt_err "dd: failed to open '$outfile'"; return 1; } ;;
+		esac
+	else
+		fdout=1
+	fi
+
+	local _BT_BLOCK=$ibs
+	local done=0
+	while [ "$done" = 0 ]; do
+		if _bt_read "$fdin"; then rc=0; else rc=1; fi
+		_bt_append "$_bt_buf" "$_bt_nul"
+		_bt_len
+		while [ "$_bt_total" -ge "$ibs" ]; do
+			if [ "$skip" -gt 0 ]; then
+				skip=$(( skip - 1 ))
+			elif [ "$count" -ge 0 ] && [ "$rin" -ge "$count" ]; then
+				done=1
+				break
+			else
+				rin=$(( rin + 1 ))
+				_bt_dd_out "$ibs"
+			fi
+			_bt_drop "$ibs"
+			_bt_len
+		done
+		[ "$rc" = 1 ] && done=1
+	done
+	# whatever is left is a partial record
+	_bt_len
+	if [ "$_bt_total" -gt 0 ] && [ "$skip" -eq 0 ] &&
+	   { [ "$count" -lt 0 ] || [ "$rin" -lt "$count" ]; }; then
+		pin=$(( pin + 1 ))
+		_bt_dd_out "$_bt_total"
+	fi
+
+	[ -n "$infile" ] && exec {fdin}<&-
+	[ -n "$outfile" ] && exec {fdout}>&-
+	_bt_err "$rin+$pin records in"
+	_bt_err "$rout+$pout records out"
+	_bt_err "$total bytes copied"
+	return "$status"
 }

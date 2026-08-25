@@ -28,7 +28,7 @@ $ cat README.md | head -n 3 | wc -l
 
 This is a toy, and it is meant to be one. It is also a real conformance
 exercise: every utility is checked against GNU coreutils, byte for byte on
-stdout and on exit status, over 5807 comparisons.
+stdout and on exit status, over 5895 comparisons.
 
 ## Use it
 
@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-35 of the 160 utilities in POSIX.1-2017, as of now.
+40 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -61,18 +61,22 @@ Run the test suite with:
 | `csplit` | `csplit [-ks] [-f prefix] [-n number] file arg...` |
 | `cut` | `cut -b list [-n] [file...]` · `cut -c list [file...]` · `cut -f list [-d delim] [-s] [file...]` |
 | `date` | `date [-u] [+format]` |
+| `dd` | `dd [operand...]` (`if` `of` `bs` `ibs` `obs` `count` `skip` `conv`) |
 | `dirname` | `dirname string` |
 | `env` | `env [-i] [name=value]... [utility [argument...]]` |
 | `expand` | `expand [-t tablist] [file...]` |
 | `expr` | `expr operand...` |
 | `fold` | `fold [-bs] [-w width] [file...]` |
+| `grep` | `grep [-E\|-F] [-c\|-l\|-q] [-insvx] [-e pattern] [-f file] [file...]` |
 | `head` | `head [-n number] [file...]` |
 | `id` | `id [user]` · `id -G [-n] [user]` · `id -g [-nr] [user]` · `id -u [-nr] [user]` |
 | `join` | `join [-a n] [-e s] [-o list] [-t c] [-v n] [-1 f] [-2 f] file1 file2` |
 | `nl` | `nl [-p] [-b type] [-d delim] [-f type] [-h type] [-i incr] [-l num] [-n format] [-s sep] [-v start] [-w width] [file]` |
+| `nohup` | `nohup utility [argument...]` |
 | `od` | `od [-v] [-A base] [-j skip] [-N count] [-t type]... [file...]` |
 | `paste` | `paste [-s] [-d list] file...` |
 | `pathchk` | `pathchk [-p] pathname...` |
+| `pr` | `pr [+page] [-column] [-adFmrt] [-h header] [-l lines] [-o offset] [-w width] [file...]` |
 | `sleep` | `sleep time` |
 | `sort` | `sort [-m] [-o out] [-bdfinru] [-t char] [-k keydef]... [file...]` · `sort -c ...` |
 | `split` | `split [-l line_count] [-a suffix_length] [file [name]]` · `split -b n[k\|m] ...` |
@@ -87,6 +91,7 @@ Run the test suite with:
 | `unexpand` | `unexpand [-a] [-t tablist] [file...]` |
 | `uniq` | `uniq [-c\|-d\|-u] [-f fields] [-s chars] [input [output]]` |
 | `wc` | `wc [-c\|-m] [-lw] [file...]` |
+| `xargs` | `xargs [-t] [-E eof] [-I repl] [-L n] [-n n] [-s size] [utility [arg...]]` |
 
 Including the parts that are easy to forget: `--` ends the options and a lone
 `-` names standard input; `tail -n +5` counts from the start of the file while
@@ -136,7 +141,7 @@ $ ./test.sh
 ### fuzz
 ### id
 ...
-==== pass=5807 fail=0 ====
+==== pass=5895 fail=0 ====
 ```
 
 Every case runs twice — once through the bash function, once through the system
@@ -186,16 +191,16 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 35 |
+| implemented here | 40 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **40** |
-| reachable, not yet written | 63 |
+| reachable, not yet written | 58 |
 
 **The ceiling is 98 of 160**, or about 61% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 63 that remain are wildly uneven, too. `true`, `false`, `logname` and
+The 58 that remain are wildly uneven, too. `true`, `false`, `logname` and
 `printf` are afternoons. `awk`, `sed`, `m4`, `bc`, `make`, `lex` and `yacc` are
 interpreters and compilers, each larger than everything here put together,
 written in a language with no arrays of structs and no way to turn a character
@@ -213,6 +218,10 @@ into an integer except `printf '%d' "'$c"`.
   `/etc/passwd` and `/etc/group` is the only lookup available without `getent`.
 * `id` takes one operand, as POSIX specifies; GNU accepts several.
 * `date` can display but not set: writing the clock is a syscall.
+* `nohup` should create its output file mode 0600; without `chmod()` it
+  lands on whatever the umask allows.
+* `dd` reports records and bytes but not a transfer rate, having no clock
+  fine enough to measure one.
 * `csplit` is supposed to remove the files it created when an operand
   fails. `unlink()` is out of reach, so they are truncated to nothing and
   named on stderr instead.

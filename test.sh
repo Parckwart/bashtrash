@@ -24,7 +24,8 @@ if ! ( . "$BT" ) 2>/dev/null; then
 fi
 for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          fold head id nl od paste pathchk sleep sort split strings tabs \
-         tail tee tr tsort tty uname unexpand uniq wc join csplit; do
+         tail tee tr tsort tty uname unexpand uniq wc join csplit grep xargs \
+         nohup pr dd; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -769,6 +770,126 @@ csplitchk ../csin '/5/-1'
 csplitchk ../csin 100
 csplitchk ../csin '/nomatch/'
 csplitchk ../csin 5 100
+
+# --- grep, xargs, nohup, pr, dd -------------------------------------------
+echo "### grep xargs nohup pr dd"
+printf 'apple pie\nBanana\ncherry\napple tart\n\nlast\n' > g1
+printf 'other\napple\n' > g2
+chk "grep"           grep apple g1
+chk "grep two"       grep apple g1 g2
+chk "grep -n"        grep -n apple g1
+chk "grep -n two"    grep -n apple g1 g2
+chk "grep -c"        grep -c apple g1
+chk "grep -c two"    grep -c apple g1 g2
+chk "grep -l"        grep -l apple g1 g2
+chk "grep -v"        grep -v apple g1
+chk "grep -i"        grep -i banana g1
+chk "grep -x"        grep -x cherry g1
+chk "grep -q"        grep -q apple g1
+chk "grep -q none"   grep -q zzz g1
+chk "grep -F"        grep -F '.' g1
+chk "grep -e multi"  grep -e apple -e cherry g1
+chk "grep missing"   grep apple no-such-file
+chk "grep -s"        grep -s apple no-such-file
+chk "grep -in"       grep -in APPLE g1
+chk "grep -vc"       grep -vc apple g1
+chk "grep -F -x"     grep -F -x cherry g1
+for p in 'app\+le' 'app\?le' 'apple\|cherry' '^apple' 'a.*e' '[abc]' 'e$' '\(ap\)ple' 'l\{2\}' 'a\{1,\}'; do
+	chk "grep BRE $p" grep "$p" g1
+done
+for p in 'app+le' 'app?le' 'apple|cherry' '(ap)ple' 'l{2}'; do
+	chk "grep ERE $p" grep -E "$p" g1
+done
+chks "grep stdin" g1 grep apple
+
+xargschk() {
+	local desc=$1 input=$2
+	shift 2
+	local a b
+	a=$(printf '%s' "$input" | ( . "$BT"; xargs "$@" ) 2>&1)
+	b=$(printf '%s' "$input" | "$(real_of xargs)" "$@" 2>&1)
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "xargs $desc"; fi
+}
+xargschk "echo X"    'a b c
+' echo X
+xargschk "-n 2"      'a
+b
+c
+' -n 2 echo
+xargschk "quotes"    "a 'b c' d
+" echo
+xargschk "dquotes"   'a "b c" d
+' echo
+xargschk "backslash" 'a\ b c
+' echo
+xargschk "default"   'x y
+'
+xargschk "-I{}"      'a b
+' -I{} echo "[{}]"
+xargschk "-L 1"      'a b
+c d
+' -L 1 echo
+
+# nohup runs its utility; only the outcome is comparable.
+( . "$BT"; nohup true ) > /dev/null 2>&1; a=$?
+"$(real_of nohup)" true > /dev/null 2>&1; b=$?
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "nohup true ($a vs $b)"; fi
+( . "$BT"; nohup sh -c 'exit 5' ) > /dev/null 2>&1; a=$?
+"$(real_of nohup)" sh -c 'exit 5' > /dev/null 2>&1; b=$?
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "nohup exit code ($a vs $b)"; fi
+( . "$BT"; nohup nosuchprog ) > /dev/null 2>&1; a=$?
+"$(real_of nohup)" nosuchprog > /dev/null 2>&1; b=$?
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "nohup not found ($a vs $b)"; fi
+
+seq 1 8 > pr1
+seq 1 200 > pr2
+# -t only: the page header carries a clock, which would race the reference.
+for o in "-t" "-t -n" "-t -o 3" "-t -d" "-t -2" "-t -3" "-t -4" "-t -2 -a" \
+         "-t -2 -s:" "-t -l 5" "-t -l 3 -2"; do
+	# shellcheck disable=SC2086
+	chk "pr $o pr1" pr $o pr1
+	# shellcheck disable=SC2086
+	chk "pr $o pr2" pr $o pr2
+done
+chk "pr missing" pr -t no-such-file
+
+# dd's third stderr line is a transfer rate, so only the record counts are
+# compared, along with the data itself.
+ddchk() {
+	( . "$BT"; dd "$@" ) > m.o 2> m.e; local a=$?
+	"$(real_of dd)" "$@" > g.o 2> g.e; local b=$?
+	# The reference is invoked by absolute path and puts argv[0] in its
+	# diagnostics, so the leading path is normalised away.
+	local me they
+	me=$(head -2 m.e | sed "s|^.*/dd:|dd:|")
+	they=$(head -2 g.e | sed "s|^.*/dd:|dd:|")
+	if cmp -s m.o g.o && [ "$a" = "$b" ] && [ "$me" = "$they" ]; then
+		pass=$((pass + 1))
+	else
+		note_fail "dd $* ($a vs $b)"
+	fi
+}
+printf 'abcdefghij' > dd1
+printf 'A\000B\000\000C\n' > ddn
+ddchk if=dd1
+ddchk if=dd1 bs=1
+ddchk if=dd1 bs=1 count=5
+ddchk if=dd1 bs=2
+ddchk if=dd1 bs=2 skip=1
+ddchk if=dd1 bs=3
+ddchk if=dd1 conv=ucase
+ddchk if=dd1 bs=1 conv=ucase
+ddchk if=dd1 conv=swab
+ddchk if=dd1 bs=4 count=1
+ddchk if=dd1 bs=1 skip=3 count=4
+ddchk if=ddn bs=1
+ddchk if=ddn
+ddchk if=ddn bs=2
+ddchk if=ddn bs=3 skip=1
+ddchk if=rand.bin bs=64 count=3
+ddchk if=rand.bin bs=100
+ddchk if=empty
+ddchk if=no-such-file
 
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"
