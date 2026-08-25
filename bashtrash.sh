@@ -19985,3 +19985,1438 @@ file () {
 	done
 	return "$status"
 }
+
+# ---------------------------------------------------------------------------
+# lex -- POSIX.1-2017:  lex [-t] [-n|-v] file...
+#
+# A lexer generator: the rules are read as regular expressions, each is turned
+# into a machine with Thompson's construction, the machines are joined and
+# made deterministic by the subset construction, and the result is written out
+# as C -- tables for the transitions, a switch for the actions, and a scanner
+# that takes the longest match and, among equals, the rule written first.
+#
+# The characters are put into classes that behave alike before the machine is
+# made deterministic, which is what keeps a table of 256 columns from being
+# built for what is usually a dozen distinct sorts of character.
+# ---------------------------------------------------------------------------
+
+# A new state, its number in _lx_s.
+_bt_lex_new() {
+	_lx_s=$_lx_n
+	_lx_eps[_lx_n]=
+	_lx_cls[_lx_n]=
+	_lx_to[_lx_n]=-1
+	_lx_acc[_lx_n]=0
+	_lx_trail[_lx_n]=0
+	_lx_n=$(( _lx_n + 1 ))
+	return 0
+}
+
+# An epsilon step from $1 to $2.
+_bt_lex_eps() {
+	_lx_eps[$1]="${_lx_eps[$1]} $2"
+	return 0
+}
+
+# Turn the byte set in the array `bits` into the string a state holds.
+_bt_lex_bits() {
+	local i out=
+	for (( i = 0; i < 256; i++ )); do
+		out=$out${bits[i]:-0}
+	done
+	_lx_bitstr=$out
+	return 0
+}
+
+# The characters a bracket expression describes, into the array `bits`.
+# $1 is the pattern, $2 where the bracket starts; the index after the closing
+# bracket comes back in _lx_i.
+_bt_lex_bracket() {
+	local p=$1 i=$2 n=${#1} neg=0 c d lo hi j name
+	local -a bits=()
+	i=$(( i + 1 ))
+	if [ "${p:i:1}" = '^' ]; then
+		neg=1
+		i=$(( i + 1 ))
+	fi
+	if [ "${p:i:1}" = ']' ]; then
+		bits[93]=1
+		i=$(( i + 1 ))
+	fi
+	while [ "$i" -lt "$n" ] && [ "${p:i:1}" != ']' ]; do
+		if [ "${p:i:2}" = '[:' ]; then
+			name=${p:i+2}
+			name=${name%%:]*}
+			i=$(( i + ${#name} + 4 ))
+			for (( j = 0; j < 256; j++ )); do
+				_bt_lex_inclass "$j" "$name" && bits[j]=1
+			done
+			continue
+		fi
+		if [ "${p:i:1}" = '\' ]; then
+			_bt_lex_esc "$p" "$i"
+			c=$_lx_c
+			i=$_lx_i
+		else
+			printf -v c '%d' "'${p:i:1}"
+			i=$(( i + 1 ))
+		fi
+		if [ "${p:i:1}" = '-' ] && [ "${p:i+1:1}" != ']' ] && [ $(( i + 1 )) -lt "$n" ]; then
+			i=$(( i + 1 ))
+			if [ "${p:i:1}" = '\' ]; then
+				_bt_lex_esc "$p" "$i"
+				d=$_lx_c
+				i=$_lx_i
+			else
+				printf -v d '%d' "'${p:i:1}"
+				i=$(( i + 1 ))
+			fi
+			lo=$c hi=$d
+			for (( j = lo; j <= hi; j++ )); do bits[j]=1; done
+			continue
+		fi
+		bits[c]=1
+	done
+	i=$(( i + 1 ))
+	if [ "$neg" = 1 ]; then
+		for (( j = 0; j < 256; j++ )); do
+			if [ "${bits[j]:-0}" = 1 ]; then bits[j]=0; else bits[j]=1; fi
+		done
+		# a negated set never matches a newline, as in lex
+		bits[10]=0
+	fi
+	_bt_lex_bits
+	_lx_i=$i
+	return 0
+}
+
+# Is byte $1 in the named class $2?
+_bt_lex_inclass() {
+	local v=$1 name=$2
+	case $name in
+	alpha)	{ [ "$v" -ge 65 ] && [ "$v" -le 90 ]; } ||
+		{ [ "$v" -ge 97 ] && [ "$v" -le 122 ]; } ;;
+	digit)	[ "$v" -ge 48 ] && [ "$v" -le 57 ] ;;
+	alnum)	{ [ "$v" -ge 48 ] && [ "$v" -le 57 ]; } ||
+		{ [ "$v" -ge 65 ] && [ "$v" -le 90 ]; } ||
+		{ [ "$v" -ge 97 ] && [ "$v" -le 122 ]; } ;;
+	upper)	[ "$v" -ge 65 ] && [ "$v" -le 90 ] ;;
+	lower)	[ "$v" -ge 97 ] && [ "$v" -le 122 ] ;;
+	space)	case $v in 32|9|10|11|12|13) true ;; *) false ;; esac ;;
+	blank)	case $v in 32|9) true ;; *) false ;; esac ;;
+	punct)	{ [ "$v" -ge 33 ] && [ "$v" -le 47 ]; } ||
+		{ [ "$v" -ge 58 ] && [ "$v" -le 64 ]; } ||
+		{ [ "$v" -ge 91 ] && [ "$v" -le 96 ]; } ||
+		{ [ "$v" -ge 123 ] && [ "$v" -le 126 ]; } ;;
+	print)	[ "$v" -ge 32 ] && [ "$v" -le 126 ] ;;
+	graph)	[ "$v" -ge 33 ] && [ "$v" -le 126 ] ;;
+	cntrl)	[ "$v" -lt 32 ] || [ "$v" = 127 ] ;;
+	xdigit)	{ [ "$v" -ge 48 ] && [ "$v" -le 57 ]; } ||
+		{ [ "$v" -ge 65 ] && [ "$v" -le 70 ]; } ||
+		{ [ "$v" -ge 97 ] && [ "$v" -le 102 ]; } ;;
+	*)	false ;;
+	esac
+	return $?
+}
+
+# The escape at $2 in $1: the byte in _lx_c, the index after it in _lx_i.
+_bt_lex_esc() {
+	local p=$1 i=$2 c v d
+	i=$(( i + 1 ))
+	c=${p:i:1}
+	case $c in
+	n)	_lx_c=10; _lx_i=$(( i + 1 )) ;;
+	t)	_lx_c=9; _lx_i=$(( i + 1 )) ;;
+	r)	_lx_c=13; _lx_i=$(( i + 1 )) ;;
+	f)	_lx_c=12; _lx_i=$(( i + 1 )) ;;
+	v)	_lx_c=11; _lx_i=$(( i + 1 )) ;;
+	b)	_lx_c=8; _lx_i=$(( i + 1 )) ;;
+	a)	_lx_c=7; _lx_i=$(( i + 1 )) ;;
+	[0-7])	v=0
+		d=0
+		while [ "$d" -lt 3 ]; do
+			case ${p:i:1} in
+			[0-7])	v=$(( v * 8 + ${p:i:1} )); i=$(( i + 1 )); d=$(( d + 1 )) ;;
+			*)	break ;;
+			esac
+		done
+		_lx_c=$v
+		_lx_i=$i ;;
+	x)	i=$(( i + 1 ))
+		v=0
+		while :; do
+			case ${p:i:1} in
+			[0-9a-fA-F])	v=$(( v * 16 + 16#${p:i:1} )); i=$(( i + 1 )) ;;
+			*)		break ;;
+			esac
+		done
+		_lx_c=$v
+		_lx_i=$i ;;
+	'')	_lx_c=92; _lx_i=$i ;;
+	*)	printf -v _lx_c '%d' "'$c"; _lx_i=$(( i + 1 )) ;;
+	esac
+	return 0
+}
+
+# A state that steps on the single byte $1.  Start in _lx_a, end in _lx_b.
+_bt_lex_one() {
+	local v=$1 s e i out=
+	local -a bits=()
+	bits[v]=1
+	_bt_lex_bits
+	_bt_lex_new; s=$_lx_s
+	_bt_lex_new; e=$_lx_s
+	_lx_cls[s]=$_lx_bitstr
+	_lx_to[s]=$e
+	_lx_a=$s _lx_b=$e
+	return 0
+}
+
+# A state that steps on the byte set $1.
+_bt_lex_set() {
+	local s e
+	_bt_lex_new; s=$_lx_s
+	_bt_lex_new; e=$_lx_s
+	_lx_cls[s]=$1
+	_lx_to[s]=$e
+	_lx_a=$s _lx_b=$e
+	return 0
+}
+
+# Put the definitions in place of {name}, into _lx_str.  A definition stands
+# in as though it were bracketed, and nothing is replaced inside a bracket
+# expression or inside quotes.
+_bt_lex_subst() {
+	local p=$1 n=${#1} i=0 out= c name depth=0
+	while [ "$i" -lt "$n" ]; do
+		c=${p:i:1}
+		case $c in
+		'\')	out=$out${p:i:2}; i=$(( i + 2 )); continue ;;
+		'"')	out=$out$c
+			i=$(( i + 1 ))
+			while [ "$i" -lt "$n" ] && [ "${p:i:1}" != '"' ]; do
+				if [ "${p:i:1}" = '\' ]; then
+					out=$out${p:i:2}
+					i=$(( i + 2 ))
+					continue
+				fi
+				out=$out${p:i:1}
+				i=$(( i + 1 ))
+			done
+			out=$out'"'
+			i=$(( i + 1 ))
+			continue ;;
+		'[')	out=$out$c
+			i=$(( i + 1 ))
+			[ "${p:i:1}" = '^' ] && { out=$out'^'; i=$(( i + 1 )); }
+			[ "${p:i:1}" = ']' ] && { out=$out']'; i=$(( i + 1 )); }
+			while [ "$i" -lt "$n" ] && [ "${p:i:1}" != ']' ]; do
+				if [ "${p:i:1}" = '\' ]; then
+					out=$out${p:i:2}
+					i=$(( i + 2 ))
+					continue
+				fi
+				out=$out${p:i:1}
+				i=$(( i + 1 ))
+			done
+			out=$out']'
+			i=$(( i + 1 ))
+			continue ;;
+		'{')	case ${p:i+1:1} in
+			[A-Za-z_])
+				name=${p:i+1}
+				name=${name%%\}*}
+				if [ -n "${_lx_def[$name]+x}" ]; then
+					out=$out'('${_lx_def[$name]}')'
+					i=$(( i + ${#name} + 2 ))
+					continue
+				fi ;;
+			esac
+			out=$out$c
+			i=$(( i + 1 ))
+			continue ;;
+		esac
+		out=$out$c
+		i=$(( i + 1 ))
+	done
+	_lx_str=$out
+	return 0
+}
+
+# The whole expression: alternatives.
+_bt_lex_alt() {
+	local a b s e
+	_bt_lex_cat || return 1
+	a=$_lx_a b=$_lx_b
+	while [ "${pat:_lx_p:1}" = '|' ]; do
+		_lx_p=$(( _lx_p + 1 ))
+		_bt_lex_cat || return 1
+		_bt_lex_new; s=$_lx_s
+		_bt_lex_new; e=$_lx_s
+		_bt_lex_eps "$s" "$a"
+		_bt_lex_eps "$s" "$_lx_a"
+		_bt_lex_eps "$b" "$e"
+		_bt_lex_eps "$_lx_b" "$e"
+		a=$s b=$e
+	done
+	_lx_a=$a _lx_b=$b
+	return 0
+}
+
+# One or more pieces, one after another.
+_bt_lex_cat() {
+	local a= b= first=1
+	while :; do
+		case ${pat:_lx_p:1} in
+		''|'|'|')')	break ;;
+		'/')		break ;;
+		esac
+		_bt_lex_rep || return 1
+		if [ "$first" = 1 ]; then
+			a=$_lx_a b=$_lx_b
+			first=0
+		else
+			_bt_lex_eps "$b" "$_lx_a"
+			b=$_lx_b
+		fi
+	done
+	if [ "$first" = 1 ]; then
+		# an empty expression: one state that goes straight through
+		_bt_lex_new
+		_lx_a=$_lx_s _lx_b=$_lx_s
+		return 0
+	fi
+	_lx_a=$a _lx_b=$b
+	return 0
+}
+
+# A piece, with whatever repetition follows it.
+_bt_lex_rep() {
+	local start a b s e lo hi i spec after
+	start=$_lx_p
+	_bt_lex_atom || return 1
+	a=$_lx_a b=$_lx_b
+	while :; do
+		case ${pat:_lx_p:1} in
+		'*')	_bt_lex_new; s=$_lx_s
+			_bt_lex_new; e=$_lx_s
+			_bt_lex_eps "$s" "$a"
+			_bt_lex_eps "$s" "$e"
+			_bt_lex_eps "$b" "$a"
+			_bt_lex_eps "$b" "$e"
+			a=$s b=$e
+			_lx_p=$(( _lx_p + 1 )) ;;
+		'+')	_bt_lex_new; s=$_lx_s
+			_bt_lex_new; e=$_lx_s
+			_bt_lex_eps "$s" "$a"
+			_bt_lex_eps "$b" "$a"
+			_bt_lex_eps "$b" "$e"
+			a=$s b=$e
+			_lx_p=$(( _lx_p + 1 )) ;;
+		'?')	_bt_lex_new; s=$_lx_s
+			_bt_lex_new; e=$_lx_s
+			_bt_lex_eps "$s" "$a"
+			_bt_lex_eps "$s" "$e"
+			_bt_lex_eps "$b" "$e"
+			a=$s b=$e
+			_lx_p=$(( _lx_p + 1 )) ;;
+		'{')	case ${pat:_lx_p+1:1} in
+			[0-9])	;;
+			*)	break ;;
+			esac
+			spec=${pat:_lx_p+1}
+			spec=${spec%%\}*}
+			after=$(( _lx_p + ${#spec} + 2 ))
+			case $spec in
+			*,*)	lo=${spec%%,*}; hi=${spec#*,} ;;
+			*)	lo=$spec; hi=$spec ;;
+			esac
+			[ -z "$lo" ] && lo=0
+			_bt_lex_repeat "$start" "$after" "$lo" "$hi" || return 1
+			a=$_lx_a b=$_lx_b
+			_lx_p=$after ;;
+		*)	break ;;
+		esac
+	done
+	_lx_a=$a _lx_b=$b
+	return 0
+}
+
+# The piece between $1 and $2 in the pattern, repeated between $3 and $4 times.
+# It is read again for each copy, which is what makes a copy.
+_bt_lex_repeat() {
+	local from=$1 to=$2 lo=$3 hi=$4 i save a= b= s e
+	save=$_lx_p
+	if [ "$lo" = 0 ] && { [ -z "$hi" ] || [ "$hi" = 0 ]; }; then
+		_bt_lex_new
+		_lx_a=$_lx_s _lx_b=$_lx_s
+		_lx_p=$save
+		return 0
+	fi
+	for (( i = 0; i < lo; i++ )); do
+		_lx_p=$from
+		_bt_lex_atom || return 1
+		if [ -z "$a" ]; then
+			a=$_lx_a b=$_lx_b
+		else
+			_bt_lex_eps "$b" "$_lx_a"
+			b=$_lx_b
+		fi
+	done
+	if [ -z "$hi" ]; then
+		# {m,} : one more, repeated as often as one likes
+		_lx_p=$from
+		_bt_lex_atom || return 1
+		_bt_lex_new; s=$_lx_s
+		_bt_lex_new; e=$_lx_s
+		_bt_lex_eps "$s" "$_lx_a"
+		_bt_lex_eps "$s" "$e"
+		_bt_lex_eps "$_lx_b" "$_lx_a"
+		_bt_lex_eps "$_lx_b" "$e"
+		if [ -z "$a" ]; then
+			a=$s b=$e
+		else
+			_bt_lex_eps "$b" "$s"
+			b=$e
+		fi
+	else
+		for (( i = lo; i < hi; i++ )); do
+			_lx_p=$from
+			_bt_lex_atom || return 1
+			_bt_lex_new; s=$_lx_s
+			_bt_lex_new; e=$_lx_s
+			_bt_lex_eps "$s" "$_lx_a"
+			_bt_lex_eps "$s" "$e"
+			_bt_lex_eps "$_lx_b" "$e"
+			if [ -z "$a" ]; then
+				a=$s b=$e
+			else
+				_bt_lex_eps "$b" "$s"
+				b=$e
+			fi
+		done
+	fi
+	if [ -z "$a" ]; then
+		_bt_lex_new
+		a=$_lx_s b=$_lx_s
+	fi
+	_lx_a=$a _lx_b=$b
+	_lx_p=$save
+	return 0
+}
+
+# One thing: a bracket, a group, a quoted string, a dot or a character.
+_bt_lex_atom() {
+	local c v i a b first=1 s e
+	c=${pat:_lx_p:1}
+	case $c in
+	'(')	_lx_p=$(( _lx_p + 1 ))
+		_bt_lex_alt || return 1
+		if [ "${pat:_lx_p:1}" = ')' ]; then
+			_lx_p=$(( _lx_p + 1 ))
+		else
+			_bt_err "lex: unmatched ( in $pat"
+			return 1
+		fi
+		return 0 ;;
+	'[')	_bt_lex_bracket "$pat" "$_lx_p"
+		_lx_p=$_lx_i
+		_bt_lex_set "$_lx_bitstr"
+		return 0 ;;
+	'"')	_lx_p=$(( _lx_p + 1 ))
+		a= b=
+		while [ "$_lx_p" -lt "${#pat}" ] && [ "${pat:_lx_p:1}" != '"' ]; do
+			if [ "${pat:_lx_p:1}" = '\' ]; then
+				_bt_lex_esc "$pat" "$_lx_p"
+				v=$_lx_c
+				_lx_p=$_lx_i
+			else
+				printf -v v '%d' "'${pat:_lx_p:1}"
+				_lx_p=$(( _lx_p + 1 ))
+			fi
+			_bt_lex_one "$v"
+			if [ -z "$a" ]; then
+				a=$_lx_a b=$_lx_b
+			else
+				_bt_lex_eps "$b" "$_lx_a"
+				b=$_lx_b
+			fi
+		done
+		_lx_p=$(( _lx_p + 1 ))
+		if [ -z "$a" ]; then
+			_bt_lex_new
+			a=$_lx_s b=$_lx_s
+		fi
+		_lx_a=$a _lx_b=$b
+		return 0 ;;
+	'.')	local -a bits=()
+		for (( i = 0; i < 256; i++ )); do bits[i]=1; done
+		bits[10]=0
+		_bt_lex_bits
+		_lx_p=$(( _lx_p + 1 ))
+		_bt_lex_set "$_lx_bitstr"
+		return 0 ;;
+	'\')	_bt_lex_esc "$pat" "$_lx_p"
+		v=$_lx_c
+		_lx_p=$_lx_i
+		_bt_lex_one "$v"
+		return 0 ;;
+	'')	_bt_lex_new
+		_lx_a=$_lx_s _lx_b=$_lx_s
+		return 0 ;;
+	esac
+	printf -v v '%d' "'$c"
+	_lx_p=$(( _lx_p + 1 ))
+	_bt_lex_one "$v"
+	return 0
+}
+
+# Put the bytes into classes that behave alike, so that the table has a column
+# for each sort of character rather than for each of the 256.
+_bt_lex_classes() {
+	local s i c sig key n=0
+	local -a maps=()
+	local -A seen=() sigs=()
+	for (( s = 0; s < _lx_n; s++ )); do
+		[ -z "${_lx_cls[s]}" ] && continue
+		if [ -z "${seen[${_lx_cls[s]}]+x}" ]; then
+			seen[${_lx_cls[s]}]=${#maps[@]}
+			maps+=("${_lx_cls[s]}")
+		fi
+	done
+	_lx_ncls=1
+	sigs=()
+	for (( c = 0; c < 256; c++ )); do
+		# the leading letter keeps the key from being empty when there
+		# are no transitions at all
+		sig=k
+		for (( i = 0; i < ${#maps[@]}; i++ )); do
+			sig=$sig${maps[i]:c:1}
+		done
+		if [ -z "${sigs[$sig]+x}" ]; then
+			sigs[$sig]=$_lx_ncls
+			_lx_ncls=$(( _lx_ncls + 1 ))
+		fi
+		_lx_ec[c]=${sigs[$sig]}
+	done
+	# which classes each state steps on
+	for (( s = 0; s < _lx_n; s++ )); do
+		_lx_ecset[s]=
+		[ -z "${_lx_cls[s]}" ] && continue
+		local -A got=()
+		for (( c = 0; c < 256; c++ )); do
+			[ "${_lx_cls[s]:c:1}" = 1 ] || continue
+			got[${_lx_ec[c]}]=1
+		done
+		_lx_ecset[s]=" ${!got[*]} "
+	done
+	return 0
+}
+
+# The epsilon closure of the states in $1, sorted, into _lx_key.
+_bt_lex_closure() {
+	local -a stack=() out=()
+	local -A in=()
+	local s t i j tmp
+	for s in $1; do
+		[ -n "${in[$s]+x}" ] && continue
+		in[$s]=1
+		stack+=("$s")
+	done
+	i=0
+	while [ "$i" -lt "${#stack[@]}" ]; do
+		s=${stack[i]}
+		i=$(( i + 1 ))
+		for t in ${_lx_eps[s]}; do
+			[ -n "${in[$t]+x}" ] && continue
+			in[$t]=1
+			stack+=("$t")
+		done
+	done
+	out=("${stack[@]}")
+	for (( i = 1; i < ${#out[@]}; i++ )); do
+		tmp=${out[i]}
+		j=$(( i - 1 ))
+		while [ "$j" -ge 0 ] && [ "${out[j]}" -gt "$tmp" ]; do
+			out[j+1]=${out[j]}
+			j=$(( j - 1 ))
+		done
+		out[j+1]=$tmp
+	done
+	_lx_key=${out[*]}
+	return 0
+}
+
+# The DFA state for the set $1, making it if it is new.  Its number is in
+# _lx_st.
+_bt_lex_state() {
+	local key=$1 s rule=0 tr=
+	if [ -n "${_lx_id[k$key]+x}" ]; then
+		_lx_st=${_lx_id[k$key]}
+		return 0
+	fi
+	_lx_st=$_lx_dn
+	_lx_id[k$key]=$_lx_st
+	_lx_dset[_lx_st]=$key
+	_lx_dn=$(( _lx_dn + 1 ))
+	for s in $key; do
+		if [ "${_lx_acc[s]}" != 0 ]; then
+			if [ "$rule" = 0 ] || [ "${_lx_acc[s]}" -lt "$rule" ]; then
+				rule=${_lx_acc[s]}
+			fi
+		fi
+	done
+	_lx_dacc[_lx_st]=$rule
+	_lx_work+=("$_lx_st")
+	return 0
+}
+
+# Build the deterministic machine from the starting sets.
+_bt_lex_dfa() {
+	local i j s t ec key next
+	local -a moved=()
+	_lx_dn=1
+	_lx_dset[0]=
+	_lx_dacc[0]=0
+	_lx_work=()
+	# the dead state goes nowhere
+	for (( ec = 0; ec < _lx_ncls; ec++ )); do
+		_lx_next[ec]=0
+	done
+	for (( i = 0; i < ${#_lx_startset[@]}; i++ )); do
+		_bt_lex_closure "${_lx_startset[i]}"
+		_bt_lex_state "$_lx_key"
+		_lx_start[i]=$_lx_st
+	done
+	i=0
+	while [ "$i" -lt "${#_lx_work[@]}" ]; do
+		s=${_lx_work[i]}
+		i=$(( i + 1 ))
+		for (( ec = 1; ec < _lx_ncls; ec++ )); do
+			next=
+			for t in ${_lx_dset[s]}; do
+				[ "${_lx_to[t]}" = -1 ] && continue
+				case ${_lx_ecset[t]} in
+				*" $ec "*)	next="$next ${_lx_to[t]}" ;;
+				esac
+			done
+			if [ -z "$next" ]; then
+				_lx_next[s * _lx_ncls + ec]=0
+				continue
+			fi
+			_bt_lex_closure "$next"
+			_bt_lex_state "$_lx_key"
+			_lx_next[s * _lx_ncls + ec]=$_lx_st
+		done
+	done
+	return 0
+}
+
+# Write the C file.  Everything the scanner needs is a table: which class each
+# byte falls in, where each state goes on each class, which rules a state
+# accepts, and where each start condition begins.
+_bt_lex_emit() {
+	local i j s ec line n out= sep
+	{
+	printf '/* lex.yy.c, written by bashtrash lex */\n'
+	printf '#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n\n'
+	printf '#define YY_NCLS %d\n' "$_lx_ncls"
+	printf '#define YY_NSTATES %d\n' "$_lx_dn"
+	printf '#define YY_NRULES %d\n\n' "$_lx_nrules"
+	if [ -n "$_lx_top" ]; then
+		printf '%s\n' "$_lx_top"
+	fi
+	printf '\nstatic const unsigned char yy_ec[256] = {\n'
+	out= sep=
+	for (( i = 0; i < 256; i++ )); do
+		out=$out$sep${_lx_ec[i]}
+		sep=,
+		if [ $(( (i + 1) % 20 )) = 0 ]; then
+			printf '%s\n' "$out"
+			out= sep=,
+		fi
+	done
+	[ -n "$out" ] && printf '%s\n' "$out"
+	printf '};\n\n'
+
+	printf 'static const short yy_nxt[YY_NSTATES][YY_NCLS] = {\n'
+	for (( s = 0; s < _lx_dn; s++ )); do
+		out='{0'
+		for (( ec = 1; ec < _lx_ncls; ec++ )); do
+			out=$out,${_lx_next[s * _lx_ncls + ec]-0}
+		done
+		printf '%s},\n' "$out"
+	done
+	printf '};\n\n'
+
+	printf 'static const short yy_acc[YY_NSTATES] = {'
+	out= sep=
+	for (( s = 0; s < _lx_dn; s++ )); do
+		out=$out$sep${_lx_dacc[s]-0}
+		sep=,
+	done
+	printf '%s};\n\n' "$out"
+
+	printf 'static const short yy_accpos[YY_NSTATES + 1] = {'
+	out= sep=
+	for (( s = 0; s <= _lx_dn; s++ )); do
+		out=$out$sep${_lx_accpos[s]-0}
+		sep=,
+	done
+	printf '%s};\n' "$out"
+	printf 'static const short yy_acclist[] = {'
+	out= sep=
+	for (( i = 0; i < ${#_lx_acclist[@]}; i++ )); do
+		out=$out$sep${_lx_acclist[i]}
+		sep=,
+	done
+	[ -z "$out" ] && out=0
+	printf '%s};\n\n' "$out"
+
+	printf 'static const short yy_start[] = {'
+	out= sep=
+	for (( i = 0; i < ${#_lx_start[@]}; i++ )); do
+		out=$out$sep${_lx_start[i]}
+		sep=,
+	done
+	printf '%s};\n' "$out"
+
+	printf 'static const short yy_trail[YY_NRULES + 1] = {0'
+	for (( i = 1; i <= _lx_nrules; i++ )); do
+		printf ',%d' "${_lx_rtrail[i]-0}"
+	done
+	printf '};\n\n'
+
+	# the scanner itself
+	if [ "$_lx_array" = 1 ]; then
+		printf '#ifndef YYLMAX\n#define YYLMAX 8192\n#endif\nchar yytext[YYLMAX];\n'
+	else
+		printf 'char *yytext;\nstatic long yy_tsize;\n'
+	fi
+	cat <<'SKEL'
+int yyleng;
+FILE *yyin, *yyout;
+int yylineno = 1;
+
+extern int yywrap(void);
+
+static char *yy_ibuf;
+static long yy_ilen, yy_isize, yy_ipos;
+static int yy_init, yy_sc, yy_more_flag;
+static long yy_more_len;
+static long yy_tok;
+
+#define BEGIN yy_sc =
+#define ECHO do { fwrite(yytext, 1, yyleng, yyout); } while (0)
+#define REJECT goto yy_reject
+#define yymore() (yy_more_flag = 1)
+#define yyless(n) yy_do_less(n)
+
+static void yy_do_less(int n);
+int input(void);
+void unput(int c);
+void output(int c);
+
+static void yy_fill(void)
+{
+	int c;
+	long room;
+	if (yyin == NULL)
+		yyin = stdin;
+	for (;;) {
+		if (yy_ilen + 1 >= yy_isize) {
+			yy_isize = yy_isize ? yy_isize * 2 : 8192;
+			yy_ibuf = (char *) realloc(yy_ibuf, yy_isize);
+			if (yy_ibuf == NULL) {
+				fprintf(stderr, "lex: out of memory\n");
+				exit(2);
+			}
+		}
+		room = yy_isize - yy_ilen - 1;
+		c = (int) fread(yy_ibuf + yy_ilen, 1, (size_t) room, yyin);
+		if (c <= 0)
+			break;
+		yy_ilen += c;
+	}
+	if (yy_ibuf == NULL) {
+		yy_ibuf = (char *) malloc(1);
+		yy_isize = 1;
+	}
+	yy_ibuf[yy_ilen] = '\0';
+}
+
+static void yy_do_less(int n)
+{
+	if (n < 0)
+		n = 0;
+	if (n > yyleng)
+		n = yyleng;
+	yy_ipos = yy_tok + n;
+	yyleng = n;
+	yytext[yyleng] = 0;
+}
+
+SKEL
+	cat <<'SKEL'
+int input(void)
+{
+	if (!yy_init) {
+		yy_init = 1;
+		if (yyout == NULL)
+			yyout = stdout;
+		yy_fill();
+	}
+	if (yy_ipos >= yy_ilen)
+		return 0;
+	return (unsigned char) yy_ibuf[yy_ipos++];
+}
+
+void unput(int c)
+{
+	if (yy_ipos > 0) {
+		yy_ipos--;
+		yy_ibuf[yy_ipos] = (char) c;
+	}
+}
+
+void output(int c)
+{
+	if (yyout == NULL)
+		yyout = stdout;
+	putc(c, yyout);
+}
+
+int yylex(void)
+{
+	int cur, next, bol;
+	long pos, start;
+	int rule;
+	static short *yy_state_at;
+	static long *yy_len_at;
+	static long yy_nacc_max;
+	long nacc, ri;
+	int rj;
+
+SKEL
+	if [ -n "$_lx_inner" ]; then
+		printf '%s\n' "$_lx_inner"
+	fi
+	cat <<'SKEL'
+	if (!yy_init) {
+		yy_init = 1;
+		if (yyout == NULL)
+			yyout = stdout;
+		yy_fill();
+	}
+	for (;;) {
+		if (yy_ipos >= yy_ilen) {
+			if (yywrap())
+				return 0;
+			yy_ilen = 0;
+			yy_ipos = 0;
+			yy_fill();
+			if (yy_ipos >= yy_ilen)
+				return 0;
+		}
+		start = yy_ipos;
+		yy_tok = start;
+		if (yy_more_flag) {
+			yy_more_flag = 0;
+			yy_more_len += yyleng;
+			yy_tok = start - yy_more_len;
+		} else {
+			yy_more_len = 0;
+		}
+		bol = (start == 0 || yy_ibuf[start - 1] == '\n');
+		cur = yy_start[yy_sc * 2 + (bol ? 1 : 0)];
+		pos = start;
+		nacc = 0;
+		if (yy_nacc_max == 0) {
+			yy_nacc_max = 1024;
+			yy_state_at = (short *) malloc(yy_nacc_max * sizeof(short));
+			yy_len_at = (long *) malloc(yy_nacc_max * sizeof(long));
+		}
+		if (yy_acc[cur]) {
+			yy_state_at[nacc] = (short) cur;
+			yy_len_at[nacc] = 0;
+			nacc++;
+		}
+		while (pos < yy_ilen) {
+			next = yy_nxt[cur][yy_ec[(unsigned char) yy_ibuf[pos]]];
+			if (next == 0)
+				break;
+			cur = next;
+			pos++;
+			if (yy_acc[cur]) {
+				if (nacc >= yy_nacc_max) {
+					yy_nacc_max *= 2;
+					yy_state_at = (short *) realloc(yy_state_at, yy_nacc_max * sizeof(short));
+					yy_len_at = (long *) realloc(yy_len_at, yy_nacc_max * sizeof(long));
+				}
+				yy_state_at[nacc] = (short) cur;
+				yy_len_at[nacc] = pos - start;
+				nacc++;
+			}
+		}
+		if (nacc == 0) {
+			/* nothing matched: the default action copies a byte */
+			if (yyout == NULL)
+				yyout = stdout;
+			putc(yy_ibuf[start], yyout);
+			yy_ipos = start + 1;
+			continue;
+		}
+		ri = nacc - 1;
+		rj = yy_accpos[yy_state_at[ri]];
+	yy_take:
+		rule = yy_acclist[rj];
+		yyleng = (int) (yy_len_at[ri] + yy_more_len);
+		if (yy_trail[rule] > 0)
+			yyleng -= yy_trail[rule];
+		yy_ipos = yy_tok + yyleng;
+SKEL
+	if [ "$_lx_array" = 1 ]; then
+		printf '\t\tif (yyleng >= YYLMAX)\n\t\t\tyyleng = YYLMAX - 1;\n'
+		printf '\t\tmemcpy(yytext, yy_ibuf + yy_tok, (size_t) yyleng);\n'
+		printf '\t\tyytext[yyleng] = 0;\n'
+	else
+		printf '\t\tif (yyleng + 1 > yy_tsize) {\n'
+		printf '\t\t\tyy_tsize = yyleng + 1024;\n'
+		printf '\t\t\tyytext = (char *) realloc(yytext, (size_t) yy_tsize);\n'
+		printf '\t\t}\n'
+		printf '\t\tmemcpy(yytext, yy_ibuf + yy_tok, (size_t) yyleng);\n'
+		printf '\t\tyytext[yyleng] = 0;\n'
+	fi
+	cat <<'SKEL'
+		{
+			long yy_i;
+			for (yy_i = 0; yy_i < yyleng; yy_i++)
+				if (yy_ibuf[yy_tok + yy_i] == '\n')
+					yylineno++;
+		}
+		switch (rule) {
+SKEL
+	for (( i = 1; i <= _lx_nrules; i++ )); do
+		printf 'case %d:\n' "$i"
+		printf '%s\n' "${_lx_action[i]}"
+		printf 'break;\n'
+	done
+	cat <<'SKEL'
+		default:
+			break;
+		}
+SKEL
+	cat <<'SKEL'
+		continue;
+	yy_reject:
+		rj++;
+		while (rj >= yy_accpos[yy_state_at[ri] + 1]) {
+			ri--;
+			if (ri < 0)
+				break;
+			rj = yy_accpos[yy_state_at[ri]];
+		}
+		if (ri < 0) {
+			if (yyout == NULL)
+				yyout = stdout;
+			putc(yy_ibuf[start], yyout);
+			yy_ipos = start + 1;
+			continue;
+		}
+		goto yy_take;
+	}
+}
+SKEL
+	if [ -n "$_lx_bottom" ]; then
+		printf '%s\n' "$_lx_bottom"
+	fi
+	} > "$1"
+	return 0
+}
+
+# The rules each state accepts, in the order the rules were written.
+_bt_lex_acclist() {
+	local s t r i j tmp
+	local -a rules=()
+	_lx_acclist=()
+	for (( s = 0; s < _lx_dn; s++ )); do
+		_lx_accpos[s]=${#_lx_acclist[@]}
+		rules=()
+		for t in ${_lx_dset[s]}; do
+			r=${_lx_acc[t]}
+			[ "$r" = 0 ] && continue
+			case " ${rules[*]-} " in
+			*" $r "*)	continue ;;
+			esac
+			rules+=("$r")
+		done
+		for (( i = 1; i < ${#rules[@]}; i++ )); do
+			tmp=${rules[i]}
+			j=$(( i - 1 ))
+			while [ "$j" -ge 0 ] && [ "${rules[j]}" -gt "$tmp" ]; do
+				rules[j+1]=${rules[j]}
+				j=$(( j - 1 ))
+			done
+			rules[j+1]=$tmp
+		done
+		for r in ${rules[@]+"${rules[@]}"}; do
+			_lx_acclist+=("$r")
+		done
+	done
+	_lx_accpos[_lx_dn]=${#_lx_acclist[@]}
+	return 0
+}
+
+# How long the text $1 always is, or -1 if it can vary.
+_bt_lex_fixlen() {
+	local p=$1 n=${#1} i=0 len=0 c
+	while [ "$i" -lt "$n" ]; do
+		c=${p:i:1}
+		case $c in
+		'*'|'+'|'?'|'|'|'{')	_lx_len=-1; return 0 ;;
+		'(')	_lx_len=-1; return 0 ;;
+		'\')	_bt_lex_esc "$p" "$i"
+			i=$_lx_i
+			len=$(( len + 1 ))
+			continue ;;
+		'"')	i=$(( i + 1 ))
+			while [ "$i" -lt "$n" ] && [ "${p:i:1}" != '"' ]; do
+				if [ "${p:i:1}" = '\' ]; then
+					_bt_lex_esc "$p" "$i"
+					i=$_lx_i
+				else
+					i=$(( i + 1 ))
+				fi
+				len=$(( len + 1 ))
+			done
+			i=$(( i + 1 ))
+			continue ;;
+		'[')	_bt_lex_bracket "$p" "$i"
+			i=$_lx_i
+			len=$(( len + 1 ))
+			continue ;;
+		esac
+		i=$(( i + 1 ))
+		len=$(( len + 1 ))
+	done
+	_lx_len=$len
+	return 0
+}
+
+# Split a rule line into its pattern and its action.
+_bt_lex_split() {
+	local line=$1 n=${#1} i=0 c
+	while [ "$i" -lt "$n" ]; do
+		c=${line:i:1}
+		case $c in
+		'\')	i=$(( i + 2 )); continue ;;
+		'"')	i=$(( i + 1 ))
+			while [ "$i" -lt "$n" ] && [ "${line:i:1}" != '"' ]; do
+				[ "${line:i:1}" = '\' ] && i=$(( i + 1 ))
+				i=$(( i + 1 ))
+			done
+			i=$(( i + 1 ))
+			continue ;;
+		'[')	i=$(( i + 1 ))
+			[ "${line:i:1}" = '^' ] && i=$(( i + 1 ))
+			[ "${line:i:1}" = ']' ] && i=$(( i + 1 ))
+			while [ "$i" -lt "$n" ] && [ "${line:i:1}" != ']' ]; do
+				[ "${line:i:1}" = '\' ] && i=$(( i + 1 ))
+				i=$(( i + 1 ))
+			done
+			i=$(( i + 1 ))
+			continue ;;
+		' '|$'\t')	break ;;
+		esac
+		i=$(( i + 1 ))
+	done
+	_lx_pat=${line:0:i}
+	_lx_act=${line:i}
+	_lx_act=${_lx_act#"${_lx_act%%[![:space:]]*}"}
+	return 0
+}
+
+# Read the lex source held in the array _lx_lines.
+_bt_lex_source() {
+	local n=${#_lx_lines[@]} i=0 line sect=0 name rest word first=1
+	local act depth j c instr= incom=0 seen=0
+	while [ "$i" -lt "$n" ]; do
+		line=${_lx_lines[i]}
+		if [ "$line" = '%%' ]; then
+			sect=$(( sect + 1 ))
+			i=$(( i + 1 ))
+			[ "$sect" = 2 ] && break
+			continue
+		fi
+		if [ "$sect" = 0 ]; then
+			case $line in
+			'%{')	i=$(( i + 1 ))
+				while [ "$i" -lt "$n" ] && [ "${_lx_lines[i]}" != '%}' ]; do
+					_lx_top=$_lx_top${_lx_lines[i]}$'\n'
+					i=$(( i + 1 ))
+				done
+				i=$(( i + 1 ))
+				continue ;;
+			[' 	']*)	_lx_top=$_lx_top$line$'\n'; i=$(( i + 1 )); continue ;;
+			'/*'*)	while [ "$i" -lt "$n" ]; do
+					_lx_top=$_lx_top${_lx_lines[i]}$'\n'
+					case ${_lx_lines[i]} in
+					*'*/'*)	i=$(( i + 1 )); break ;;
+					esac
+					i=$(( i + 1 ))
+				done
+				continue ;;
+			'')	i=$(( i + 1 )); continue ;;
+			'%array')	_lx_array=1; i=$(( i + 1 )); continue ;;
+			'%pointer')	_lx_array=0; i=$(( i + 1 )); continue ;;
+			'%'[sS]*)
+				rest=${line#%[sS]}
+				rest=${rest#[a-zA-Z]*[	 ]}
+				for word in ${line#%[sSxX]}; do
+					case $word in
+					[A-Za-z_]*)	_bt_lex_addsc "$word" 0 ;;
+					esac
+				done
+				i=$(( i + 1 ))
+				continue ;;
+			'%'[xX]*)
+				for word in ${line#%[sSxX]}; do
+					case $word in
+					[A-Za-z_]*)	_bt_lex_addsc "$word" 1 ;;
+					esac
+				done
+				i=$(( i + 1 ))
+				continue ;;
+			'%'[pnaeko]*)	i=$(( i + 1 )); continue ;;
+			'%'*)	_bt_err "lex: unknown directive ${line%%[	 ]*}"
+				i=$(( i + 1 ))
+				continue ;;
+			esac
+			name=${line%%[	 ]*}
+			rest=${line#"$name"}
+			rest=${rest#"${rest%%[![:space:]]*}"}
+			[ -n "$name" ] && _lx_def[$name]=$rest
+			i=$(( i + 1 ))
+			continue
+		fi
+		# the rules
+		case $line in
+		'%{')	i=$(( i + 1 ))
+			while [ "$i" -lt "$n" ] && [ "${_lx_lines[i]}" != '%}' ]; do
+				if [ "$seen" = 0 ]; then
+					_lx_inner=$_lx_inner${_lx_lines[i]}$'\n'
+				else
+					_lx_bottom=$_lx_bottom${_lx_lines[i]}$'\n'
+				fi
+				i=$(( i + 1 ))
+			done
+			i=$(( i + 1 ))
+			continue ;;
+		'')	i=$(( i + 1 )); continue ;;
+		[' 	']*)
+			if [ "$seen" = 0 ]; then
+				_lx_inner=$_lx_inner$line$'\n'
+			fi
+			i=$(( i + 1 ))
+			continue ;;
+		esac
+		_bt_lex_split "$line"
+		act=$_lx_act
+		i=$(( i + 1 ))
+		# an action in braces can run over several lines
+		case $act in
+		'{'*)	depth=0
+			j=0
+			while :; do
+				_bt_lex_braces "$act" "$depth"
+				depth=$_lx_depth
+				[ "$depth" -le 0 ] && break
+				[ "$i" -ge "$n" ] && break
+				act=$act$'\n'${_lx_lines[i]}
+				i=$(( i + 1 ))
+			done ;;
+		esac
+		seen=1
+		_lx_nrules=$(( _lx_nrules + 1 ))
+		_lx_rpat[_lx_nrules]=$_lx_pat
+		_lx_action[_lx_nrules]=$act
+	done
+	while [ "$i" -lt "$n" ]; do
+		_lx_bottom=$_lx_bottom${_lx_lines[i]}$'\n'
+		i=$(( i + 1 ))
+	done
+	# a bare | means the action of the next rule
+	for (( i = _lx_nrules; i >= 1; i-- )); do
+		case ${_lx_action[i]} in
+		'|')	if [ "$i" -lt "$_lx_nrules" ]; then
+				_lx_action[i]=${_lx_action[i+1]}
+			else
+				_lx_action[i]=';'
+			fi ;;
+		'')	_lx_action[i]=';' ;;
+		esac
+	done
+	return 0
+}
+
+# How deep the braces are after $1, starting from $2, in _lx_depth.
+_bt_lex_braces() {
+	local s=$1 depth=$2 i=0 n=${#1} c instr= incom=0
+	while [ "$i" -lt "$n" ]; do
+		c=${s:i:1}
+		if [ "$incom" = 1 ]; then
+			if [ "${s:i:2}" = '*/' ]; then incom=0; i=$(( i + 2 )); continue; fi
+			i=$(( i + 1 ))
+			continue
+		fi
+		if [ -n "$instr" ]; then
+			if [ "$c" = '\' ]; then i=$(( i + 2 )); continue; fi
+			[ "$c" = "$instr" ] && instr=
+			i=$(( i + 1 ))
+			continue
+		fi
+		case $c in
+		'/')	if [ "${s:i+1:1}" = '*' ]; then incom=1; i=$(( i + 2 )); continue; fi
+			if [ "${s:i+1:1}" = '/' ]; then break; fi ;;
+		'"'|"'")	instr=$c; i=$(( i + 1 )); continue ;;
+		'{')	depth=$(( depth + 1 )) ;;
+		'}')	depth=$(( depth - 1 )) ;;
+		esac
+		i=$(( i + 1 ))
+	done
+	_lx_depth=$depth
+	return 0
+}
+
+# Add start condition $1; $2 says whether it is exclusive.
+_bt_lex_addsc() {
+	case " $_lx_scnames " in
+	*" $1 "*)	return 0 ;;
+	esac
+	_lx_scnames="$_lx_scnames $1 "
+	_lx_scidx[$1]=$_lx_nsc
+	_lx_scexcl[$1]=$2
+	_lx_nsc=$(( _lx_nsc + 1 ))
+	return 0
+}
+
+# Pull the pieces off a rule's pattern: the start conditions in front, the ^,
+# the trailing context and the $.
+_bt_lex_pieces() {
+	local p=$1 n i c list
+	_lx_pbol=0
+	_lx_psc=
+	_lx_ptrail=
+	case $p in
+	'<'*)	list=${p#<}
+		case $list in
+		*'>'*)	_lx_psc=${list%%>*}
+			p=${list#*>} ;;
+		esac ;;
+	esac
+	case $p in
+	'^'*)	_lx_pbol=1; p=${p#^} ;;
+	esac
+	# a slash at the top level starts the trailing context
+	n=${#p}
+	i=0
+	while [ "$i" -lt "$n" ]; do
+		c=${p:i:1}
+		case $c in
+		'\')	i=$(( i + 2 )); continue ;;
+		'"')	i=$(( i + 1 ))
+			while [ "$i" -lt "$n" ] && [ "${p:i:1}" != '"' ]; do
+				[ "${p:i:1}" = '\' ] && i=$(( i + 1 ))
+				i=$(( i + 1 ))
+			done
+			i=$(( i + 1 ))
+			continue ;;
+		'[')	i=$(( i + 1 ))
+			[ "${p:i:1}" = '^' ] && i=$(( i + 1 ))
+			[ "${p:i:1}" = ']' ] && i=$(( i + 1 ))
+			while [ "$i" -lt "$n" ] && [ "${p:i:1}" != ']' ]; do
+				[ "${p:i:1}" = '\' ] && i=$(( i + 1 ))
+				i=$(( i + 1 ))
+			done
+			i=$(( i + 1 ))
+			continue ;;
+		'/')	_lx_ptrail=${p:i+1}
+			p=${p:0:i}
+			n=0
+			break ;;
+		esac
+		i=$(( i + 1 ))
+	done
+	# a dollar at the very end is the same as a trailing newline
+	if [ -z "$_lx_ptrail" ]; then
+		case $p in
+		*'$')	case $p in
+			*'\$')	;;
+			*)	p=${p%$}
+				_lx_ptrail='\n' ;;
+			esac ;;
+		esac
+	fi
+	_lx_ppat=$p
+	return 0
+}
+
+lex () {
+	local LC_ALL=C
+	local arg opt f fd line status=0 tostdout=0 verbose=0 nosum=0
+	local i j k sc a b out want name
+	local pat _lx_p=0 _lx_a=0 _lx_b=0 _lx_s=0 _lx_c=0 _lx_i=0 _lx_key=
+	local _lx_bitstr= _lx_str= _lx_len=0 _lx_pat= _lx_act= _lx_depth=0
+	local _lx_ppat= _lx_pbol=0 _lx_psc= _lx_ptrail= _lx_st=0
+	local _lx_n=0 _lx_dn=0 _lx_ncls=0 _lx_nrules=0 _lx_nsc=0
+	local _lx_top= _lx_inner= _lx_bottom= _lx_array=0 _lx_scnames=' '
+	local -a _lx_lines=() _lx_eps=() _lx_cls=() _lx_to=() _lx_acc=()
+	local -a _lx_trail=() _lx_ecset=() _lx_ec=() _lx_dset=() _lx_dacc=()
+	local -a _lx_next=() _lx_work=() _lx_start=() _lx_startset=()
+	local -a _lx_rpat=() _lx_action=() _lx_rtrail=() _lx_rbol=() _lx_rsc=()
+	local -a _lx_rstart=() _lx_acclist=() _lx_accpos=()
+	local -A _lx_def=() _lx_id=() _lx_scidx=() _lx_scexcl=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				t)	tostdout=1 ;;
+				v)	verbose=1 ;;
+				n)	nosum=1 ;;
+				*)	_bt_err "lex: illegal option -- $opt"
+					_bt_err "usage: lex [-t] [-n|-v] file..."
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	if [ "$#" = 0 ]; then
+		line=
+		while IFS= read -r line; do _lx_lines+=("$line"); line=; done
+		[ -n "$line" ] && _lx_lines+=("$line")
+	else
+		for f in "$@"; do
+			if [ "$f" = - ]; then
+				line=
+				while IFS= read -r line; do _lx_lines+=("$line"); line=; done
+				[ -n "$line" ] && _lx_lines+=("$line")
+				continue
+			fi
+			if ! { exec {fd}<"$f"; } 2>/dev/null; then
+				_bt_err "lex: cannot open $f"
+				return 1
+			fi
+			line=
+			while IFS= read -r line <&"$fd"; do _lx_lines+=("$line"); line=; done
+			[ -n "$line" ] && _lx_lines+=("$line")
+			exec {fd}<&-
+		done
+	fi
+
+	_bt_lex_addsc INITIAL 0
+	_bt_lex_source
+
+	# every rule becomes a machine, and they all start together
+	for (( i = 1; i <= _lx_nrules; i++ )); do
+		_bt_lex_pieces "${_lx_rpat[i]}"
+		_lx_rbol[i]=$_lx_pbol
+		_lx_rsc[i]=$_lx_psc
+		_bt_lex_subst "$_lx_ppat"
+		pat=$_lx_str
+		_lx_p=0
+		if ! _bt_lex_alt; then
+			_bt_err "lex: bad regular expression: ${_lx_rpat[i]}"
+			return 1
+		fi
+		a=$_lx_a b=$_lx_b
+		_lx_rtrail[i]=0
+		if [ -n "$_lx_ptrail" ]; then
+			_bt_lex_fixlen "$_lx_ptrail"
+			if [ "$_lx_len" -lt 0 ]; then
+				_bt_err "lex: trailing context of variable length in rule $i"
+				_lx_rtrail[i]=0
+			else
+				_lx_rtrail[i]=$_lx_len
+			fi
+			_bt_lex_subst "$_lx_ptrail"
+			pat=$_lx_str
+			_lx_p=0
+			if ! _bt_lex_alt; then
+				_bt_err "lex: bad trailing context: ${_lx_rpat[i]}"
+				return 1
+			fi
+			_bt_lex_eps "$b" "$_lx_a"
+			b=$_lx_b
+		fi
+		_lx_acc[b]=$i
+		_lx_rstart[i]=$a
+	done
+
+	# where each start condition begins: one set for the beginning of a
+	# line and one for anywhere else
+	for name in $_lx_scnames; do
+		k=${_lx_scidx[$name]}
+		a= b=
+		for (( i = 1; i <= _lx_nrules; i++ )); do
+			want=0
+			if [ -z "${_lx_rsc[i]}" ]; then
+				[ "${_lx_scexcl[$name]}" = 0 ] && want=1
+			else
+				case ",${_lx_rsc[i]}," in
+				*",$name,"*)	want=1 ;;
+				esac
+			fi
+			[ "$want" = 0 ] && continue
+			b="$b ${_lx_rstart[i]}"
+			[ "${_lx_rbol[i]}" = 1 ] && continue
+			a="$a ${_lx_rstart[i]}"
+		done
+		_lx_startset[k * 2]=$a
+		_lx_startset[k * 2 + 1]=$b
+	done
+
+	_bt_lex_classes
+	_bt_lex_dfa
+	_bt_lex_acclist
+
+	# the names of the start conditions have to be visible to the actions
+	out=
+	for name in $_lx_scnames; do
+		out=$out"#define $name ${_lx_scidx[$name]}"$'\n'
+	done
+	_lx_top=$out$_lx_top
+
+	if [ "$tostdout" = 1 ]; then
+		_bt_lex_emit /dev/stdout
+	else
+		_bt_lex_emit lex.yy.c
+	fi
+
+	if [ "$verbose" = 1 ] && [ "$nosum" = 0 ]; then
+		if [ "$tostdout" = 1 ]; then
+			_bt_lex_stats >&2
+		else
+			_bt_lex_stats
+		fi
+	fi
+	return "$status"
+}
+
+# The summary -v asks for.
+_bt_lex_stats() {
+	printf '%d/%d NFA states\n' "$_lx_n" "$_lx_n"
+	printf '%d/%d DFA states\n' "$_lx_dn" "$_lx_dn"
+	printf '%d rules\n' "$_lx_nrules"
+	printf '%d character classes\n' "$(( _lx_ncls - 1 ))"
+	printf '%d/%d transitions\n' "$(( _lx_dn * (_lx_ncls - 1) ))" "$(( _lx_dn * (_lx_ncls - 1) ))"
+	return 0
+}

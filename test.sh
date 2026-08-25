@@ -28,7 +28,7 @@ for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          nohup pr dd sed who logname diff cal fuser ipcs patch tput \
          what uuencode uudecode write ps ed m4 iconv ar locale nm \
          admin delta get prs rmdel sact sccs unget val \
-         compress uncompress zcat bc make awk gencat ctags cflow cxref file; do
+         compress uncompress zcat bc make awk gencat ctags cflow cxref file lex; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -3379,6 +3379,186 @@ f_text: ascii text" ]; then pass=$((pass + 1))
 else note_fail "file with two operands: [$got]"; fi
 
 cd .. || exit 1
+
+# --- lex --------------------------------------------------------------------
+# The scanners lex writes are C, so the test compiles them and runs them: the
+# only way to know a generated program is right is to generate it, build it
+# and feed it something.
+echo "### lex"
+if command -v cc > /dev/null 2>&1; then
+	CC=$(real_of cc)
+	mkdir -p lxt
+	cd lxt || exit 1
+
+	cat > lmain.c <<'CEOF'
+extern int yylex(void);
+int yywrap(void) { return 1; }
+int main(void) { yylex(); return 0; }
+CEOF
+
+	lexrun() {	# lexrun description lexfile input expected [lexargs...]
+		local desc=$1 lf=$2 in=$3 want=$4 got out
+		shift 4
+		rm -f lex.yy.c a.out
+		if ! ( . "$BT"; lex "$@" "$lf" ) > /dev/null 2>&1; then
+			note_fail "lex $desc: lex itself failed"
+			return
+		fi
+		if ! "$CC" -o a.out lex.yy.c lmain.c > /dev/null 2>&1; then
+			note_fail "lex $desc: the C it wrote does not compile"
+			return
+		fi
+		got=$( printf '%s' "$in" | ./a.out 2>&1 )
+		if [ "$got" = "$want" ]; then pass=$((pass + 1))
+		else note_fail "lex $desc: [$got] not [$want]"; fi
+	}
+
+	# the smallest program there is: %% and nothing else copies its input
+	printf '%%%%\n' > l0.l
+	lexrun "the empty program" l0.l 'copy me
+and me
+' 'copy me
+and me'
+
+	# the longest match wins, and among equals the rule written first
+	cat > l1.l <<'CEOF'
+%{
+#include <stdio.h>
+%}
+%%
+[a-zA-Z]+	{ printf("W(%s)", yytext); }
+[0-9]+		{ printf("N(%s)", yytext); }
+[0-9]+"."[0-9]+	{ printf("R(%s)", yytext); }
+[ \t]+		;
+\n		{ printf("|"); }
+.		{ printf("?"); }
+%%
+CEOF
+	lexrun "words and numbers" l1.l 'abc 42 3.14 !
+' 'W(abc)N(42)R(3.14)?|'
+
+	# definitions, start conditions, anchors and trailing context
+	cat > l2.l <<'CEOF'
+D	[0-9]
+ID	[a-zA-Z_][a-zA-Z_0-9]*
+%x STR
+%{
+#include <stdio.h>
+%}
+%%
+\"		{ printf("[str"); BEGIN STR; }
+<STR>[^"\n]*	{ printf(":%s", yytext); }
+<STR>\"		{ printf("]"); BEGIN INITIAL; }
+{D}+		{ printf("<n %s>", yytext); }
+{ID}		{ printf("<i %s>", yytext); }
+^"#"[^\n]*	{ printf("<cpp>"); }
+"end"$		{ printf("<END>"); }
+[ \t]+		;
+\n		{ printf("|"); }
+.		{ printf("?"); }
+%%
+CEOF
+	lexrun "definitions, conditions and anchors" l2.l '#line 1
+foo 42 "a b" end
+end here
+' '<cpp>|<i foo><n 42>[str:a b]<END>|<i end><i here>|'
+
+	# REJECT, yymore, yyless, ECHO and the | action
+	cat > l3.l <<'CEOF'
+%{
+#include <stdio.h>
+%}
+%%
+xyz		{ printf("[xyz]"); REJECT; }
+xy		{ printf("[xy]"); }
+z		{ printf("[z]"); }
+a{2,3}		{ printf("[a%d]", yyleng); }
+"more"		{ yymore(); }
+"over"		{ printf("[%s]", yytext); }
+less..		{ yyless(4); printf("[%s]", yytext); }
+ECHOME		ECHO;
+[0-9]+		|
+[A-F]+		{ printf("<%s>", yytext); }
+\n		{ printf("|"); }
+%%
+CEOF
+	lexrun "the special actions" l3.l 'xyz
+aaa aa
+moreover
+lessXY
+ECHOME
+123 ABC
+' '[xyz][xy][z]|[a3] [a2]|[moreover]|[less]XY|ECHOME|<123> <ABC>|'
+
+	# yytext as an array rather than a pointer
+	cat > l4.l <<'CEOF'
+%array
+%{
+#include <stdio.h>
+%}
+%%
+[a-z]+	{ printf("(%s)", yytext); }
+.|\n	;
+%%
+CEOF
+	lexrun "%array" l4.l 'ab CD ef
+' '(ab)(ef)'
+
+	# a lexer of the sort someone would really write
+	cat > l5.l <<'CEOF'
+%{
+#include <stdio.h>
+%}
+D	[0-9]
+L	[a-zA-Z_]
+H	[a-fA-F0-9]
+E	[Ee][+-]?{D}+
+%%
+"/*"([^*]|"*"[^/])*"*/"		{ printf("C"); }
+"int"|"char"|"return"|"void"|"if"|"else"	{ printf("K"); }
+{L}({L}|{D})*			{ printf("I"); }
+0[xX]{H}+			{ printf("N"); }
+{D}+"."{D}*({E})?		{ printf("F"); }
+{D}+				{ printf("N"); }
+\"(\\.|[^\\"])*\"		{ printf("S"); }
+"=="|"!="|"<="|">="|"&&"|"||"|"++"|"--"|"->"	{ printf("O"); }
+[-+*/%&|^!~<>=(){}\[\];,.?:]	{ printf("p"); }
+[ \t\n]+			;
+.				{ printf("?"); }
+%%
+CEOF
+	lexrun "a C tokeniser" l5.l 'int main(void) { /* hi */ int x = 0x1F; return x >= 3.5 ? "s" : 0; }
+' 'KIpKppCKIpNpKIOFpSpNpp'
+
+	# -t writes the program to the standard output and leaves no file
+	rm -f lex.yy.c
+	out=$( . "$BT"; lex -t l1.l 2>/dev/null )
+	case $out in
+	*yylex*)	if [ ! -e lex.yy.c ]; then pass=$((pass + 1))
+			else note_fail "lex -t wrote lex.yy.c as well"; fi ;;
+	*)		note_fail "lex -t wrote nothing useful" ;;
+	esac
+	# -v says something about the tables, -n keeps it quiet
+	out=$( . "$BT"; lex -v l1.l 2>/dev/null )
+	case $out in
+	*rules*)	pass=$((pass + 1)) ;;
+	*)		note_fail "lex -v: [$out]" ;;
+	esac
+	out=$( . "$BT"; lex -n l1.l 2>/dev/null )
+	if [ -z "$out" ]; then pass=$((pass + 1))
+	else note_fail "lex -n wrote [$out]"; fi
+	# the source can come from the standard input
+	rm -f lex.yy.c
+	( . "$BT"; lex < l1.l ) > /dev/null 2>&1
+	if [ -s lex.yy.c ]; then pass=$((pass + 1))
+	else note_fail "lex reading its source from stdin"; fi
+	# a file that is not there
+	a=$( . "$BT"; lex nosuch.l 2>/dev/null; echo "rc=$?" )
+	if [ "$a" = "rc=1" ]; then pass=$((pass + 1))
+	else note_fail "lex with a missing file: [$a]"; fi
+
+	cd .. || exit 1
+fi
 
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"

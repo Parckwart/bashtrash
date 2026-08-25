@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-80 of the 160 utilities in POSIX.1-2017, as of now.
+81 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -89,6 +89,7 @@ Run the test suite with:
 | `id` | `id [user]` · `id -G [-n] [user]` · `id -g [-nr] [user]` · `id -u [-nr] [user]` |
 | `ipcs` | `ipcs [-qms]` |
 | `join` | `join [-a n] [-e s] [-o list] [-t c] [-v n] [-1 f] [-2 f] file1 file2` |
+| `lex` | `lex [-t] [-n\|-v] file...` |
 | `locale` | `locale [-a\|-m]` · `locale [-ck] name...` |
 | `logname` | `logname` |
 | `m4` | `m4 [-s] [-D name[=value]]... [-U name]... [file...]` |
@@ -231,6 +232,20 @@ declaration. Braces inside strings and comments are counted by nobody, and
 the tag `main` is written out as `M` and the file's name, as the standard
 asks.
 
+**`lex` builds a machine and writes it out as C.** Each rule's regular
+expression becomes a machine by Thompson's construction -- a state for every
+character, an empty step for every choice -- the machines are joined at a
+common start, and the subset construction turns the lot into one deterministic
+machine whose states are sets of the old ones. Before that happens the 256
+bytes are sorted into classes that behave alike, which is what keeps the table
+to a dozen columns instead of 256. What comes out is a table of transitions, a
+list of the rules each state accepts, and a scanner that takes the longest
+match and, among matches of the same length, the rule written first. `REJECT`
+works because the scanner remembers every place it could have stopped and
+every rule that would have accepted there, so it can walk back down the list;
+that list is the only reason the tables carry more than one rule per state.
+The whole thing is checked by compiling what it writes and running it.
+
 **`gencat` writes a hash table, and picks its shape the way gencat does.**
 A message catalogue is a table taking a set and a message number to a place in
 a pool of strings; the hash is `(set + 1) * message` modulo the table's width,
@@ -332,18 +347,18 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 80 |
+| implemented here | 81 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **52** |
-| reachable, not yet written | 6 |
+| reachable, not yet written | 5 |
 
 **The ceiling is 86 of 160**, or about 54% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 6 that remain are wildly uneven. `lex` and `yacc` are compilers whose
-output is C, `localedef` compiles locales into a binary nobody has written
-down, and `sh` would be a shell written in a shell.
+The 5 that remain are wildly uneven. `yacc` is a compiler whose output is C,
+`localedef` compiles locales into a binary nobody has written down, and `sh`
+would be a shell written in a shell.
 
 ### Smaller deviations, all deliberate
 
@@ -391,6 +406,14 @@ down, and `sh` would be a shell written in a shell.
   does and not what mawk does; a `printf` given fewer arguments than
   conversions treats the missing ones as empty, as the standard says, rather
   than stopping.
+* `lex` writes a scanner that reads all of its input into memory rather than
+  through a sliding window, which is what makes `unput` and `yyless` simple
+  and what would make it a poor choice for a stream that never ends. There is
+  no lex library here to link against, so a program has to bring its own
+  `main` and `yywrap`, exactly as it would with `-l l` on a system that has
+  one. Trailing context has to be of a fixed length -- `$` is, and so is
+  nearly every use of `/` in practice -- and a variable one is refused rather
+  than quietly mismatched.
 * `file` answers with the strings the standard's table asks for -- `empty`,
   `directory`, `character special`, `cpio archive`, `commands text`,
   `c program text` and the rest -- rather than the sentences GNU's file
