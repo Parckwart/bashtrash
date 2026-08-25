@@ -16,25 +16,38 @@ real utility for the rest of the session.
 
 ## What is implemented
 
-| utility    | synopsis                                    |
-| ---------- | ------------------------------------------- |
-| `basename` | `basename string [suffix]`                  |
-| `cat`      | `cat [-u] [file...]`                        |
-| `dirname`  | `dirname string`                            |
-| `head`     | `head [-n number] [file...]`                |
-| `id`       | `id [user]`                                 |
-|            | `id -G [-n] [user]`                         |
-|            | `id -g [-nr] [user]`                        |
-|            | `id -u [-nr] [user]`                        |
-| `sleep`    | `sleep time`                                |
-| `tail`     | `tail [-f] [-c number \| -n number] [file]` |
-| `tee`      | `tee [-ai] [file...]`                       |
-| `tty`      | `tty`                                       |
-| `uname`    | `uname [-amnrsv]`                           |
-| `uniq`     | `uniq [-c|-d|-u] [-f fields] [-s chars] [input [output]]` |
-| `wc`       | `wc [-c|-m] [-lw] [file...]`                |
+| utility     | synopsis                                                  |
+| ----------- | --------------------------------------------------------- |
+| `basename`  | `basename string [suffix]`                                |
+| `cat`       | `cat [-u] [file...]`                                      |
+| `cmp`       | `cmp [-l|-s] file1 file2`                                 |
+| `comm`      | `comm [-123] file1 file2`                                 |
+| `cut`       | `cut -b list [-n] [file...]`                              |
+|             | `cut -c list [file...]`                                   |
+|             | `cut -f list [-d delim] [-s] [file...]`                   |
+| `dirname`   | `dirname string`                                          |
+| `expand`    | `expand [-t tablist] [file...]`                           |
+| `fold`      | `fold [-bs] [-w width] [file...]`                         |
+| `head`      | `head [-n number] [file...]`                              |
+| `id`        | `id [user]`                                               |
+|             | `id -G [-n] [user]`                                       |
+|             | `id -g [-nr] [user]`                                      |
+|             | `id -u [-nr] [user]`                                      |
+| `paste`     | `paste [-s] [-d list] file...`                            |
+| `sleep`     | `sleep time`                                              |
+| `tail`      | `tail [-f] [-c number \| -n number] [file]`               |
+| `tee`       | `tee [-ai] [file...]`                                     |
+| `tr`        | `tr [-c|-C] [-s] string1 string2`                         |
+|             | `tr -s [-c|-C] string1`                                   |
+|             | `tr -d [-c|-C] string1`                                   |
+|             | `tr -ds [-c|-C] string1 string2`                          |
+| `tty`       | `tty`                                                     |
+| `uname`     | `uname [-amnrsv]`                                         |
+| `unexpand`  | `unexpand [-a] [-t tablist] [file...]`                    |
+| `uniq`      | `uniq [-c|-d|-u] [-f fields] [-s chars] [input [output]]` |
+| `wc`        | `wc [-c|-m] [-lw] [file...]`                              |
 
-That is 12 of the 160 utilities in the standard.  Another 22 (`cd`,
+That is 20 of the 160 utilities in the standard.  Another 22 (`cd`,
 `echo`, `printf`, `read`, `test`, `kill`, `wait` and friends) bash already
 provides as builtins, and 39 are unreachable from a builtin at all -- see
 **Limits** below.
@@ -50,6 +63,10 @@ and then exits non-zero; `tail` takes at most one file operand, and ignores
 spelling of `-n number`. `id -a` is accepted and ignored, as elsewhere.
 
 `head` accepts `-c` (the Issue 8 spelling of a long-standing extension)
+`cmp -l` uses the `"%d %o %o"` the standard gives; GNU pads the byte
+number to the width of the file size.  Where an explicit `-t` list runs out
+in `unexpand`, behaviour past the last stop is implementation-defined: a run
+of blanks holding a literal tab is left as it was rather than flattened.
 and the obsolescent `head -number`.  `wc` aligns its columns the way every
 wc does, rather than the single spaces the format string in the standard
 implies.  `uname -a` is the standard's `-a`, exactly `-mnrsv`; GNU adds
@@ -93,7 +110,7 @@ is missing. Names come from reading `/etc/passwd` and `/etc/group` directly.
 
 Every case runs twice, once through the bash functions and once through the
 system coreutils, comparing stdout byte for byte and comparing exit status:
-5174 comparisons, taking a couple of minutes.
+5344 comparisons, taking a few minutes.
 
 `cat` and `tail` are checked over embedded NULs, unterminated lines, empty
 files, 300 KB of random binary, and every sign and magnitude of `-n`/`-c`,

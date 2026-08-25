@@ -310,6 +310,135 @@ for loc in C C.UTF-8 en_US.UTF-8; do
 	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "cat under $loc"; fi
 done
 
+# --- cut, comm, paste, fold, expand, unexpand, tr, cmp ---------------------
+echo "### cut comm paste fold expand unexpand tr cmp"
+printf 'alpha:beta:gamma\na:b\n:x:\nnodelim\n\na::c\n'          > cf
+printf 'one two three\nlonger line here with words\nshort\n'    > tf
+printf 'a\nc\ne\n' > s1
+printf 'b\nc\nd\ne\nf\n' > s2
+printf '1\n2\n3\n' > pp1
+printf 'x\ny\n' > pp2
+printf 'Q\nR\nS\nT\n' > pp3
+printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbb cc\nshort\n\tTabbed line that is quite long indeed\n' > ff
+printf 'a\tb\tc\n\tlead\nno tabs here\na\t\tdouble\n   spaces   then\ttab\nx\by\n'   > ex
+printf 'a b\na  b\na   b\na       b\na        b\nab  c\n  lead  mid\n\t a\n\tmixed   \there\na\tb\tc\n' > ux
+printf 'Hello World 123\nfoo   bar\tbaz\naaabbbccc\n' > ti
+printf 'A\000B\000\000C\n' > tn
+
+for l in 1 2 3 1,3 2-3 2- -2 5 1-100 "3,1" "1-2,2-3"; do
+	chk "cut -c $l"        cut -c "$l" cf
+	chk "cut -d: -f $l"    cut -d: -f "$l" cf
+	chk "cut -d: -f $l -s" cut -d: -f "$l" -s cf
+	chk "cut -f $l"        cut -f "$l" cf
+done
+chk "cut -b 2-4"       cut -b 2-4 tf
+chk "cut -d' ' -f2"    cut -d' ' -f2 tf
+chk "cut bad list"     cut -c x cf
+chk "cut no mode"      cut cf
+chk "cut missing"      cut -c1 no-such-file
+
+for o in "" -1 -2 -3 -12 -13 -23 -123; do
+	# shellcheck disable=SC2086
+	if [ -z "$o" ]; then chk "comm" comm s1 s2; else chk "comm $o" comm $o s1 s2; fi
+done
+chk "comm empty"   comm empty s2
+chk "comm same"    comm s1 s1
+chk "comm missing" comm no-such-file s2
+
+chk "paste two"     paste pp1 pp2
+chk "paste three"   paste pp1 pp2 pp3
+chk "paste -s"      paste -s pp1 pp2
+chk "paste -d:"     paste -d: pp1 pp2
+chk "paste -d:-"    paste -d:- pp1 pp2 pp3
+chk "paste -s -d:"  paste -s -d: pp1
+chk "paste -d nl"   paste -d'\n' pp1 pp2
+chk "paste one"     paste pp1
+chk "paste missing" paste no-such-file
+
+for w in 5 10 20 1 2; do
+	chk "fold -w $w"     fold -w "$w" ff
+	chk "fold -b -w $w"  fold -b -w "$w" ff
+	chk "fold -s -w $w"  fold -s -w "$w" ff
+done
+chk "fold"         fold ff
+chk "fold -w5 tf"  fold -w5 tf
+chk "fold missing" fold no-such-file
+
+for t in "" "-t 4" "-t 8" "-t 1" "-t 2,4,8" "-t 3,6" "-4"; do
+	for f in ex ux; do
+		# shellcheck disable=SC2086
+		if [ -z "$t" ]; then chk "expand $f" expand "$f"; else chk "expand $t $f" expand $t "$f"; fi
+	done
+done
+for t in "" "-a" "-t 2" "-t 4" "-t 8" "-a -t 2" "-a -t 4" "-t 2,4" "-t 2,4,8" "-a -t 3,6,9" "-t 1"; do
+	for f in ux ex; do
+		# shellcheck disable=SC2086
+		if [ -z "$t" ]; then chk "unexpand $f" unexpand "$f"; else chk "unexpand $t $f" unexpand $t "$f"; fi
+	done
+done
+chk "expand bad -t" expand -t x ex
+chk "expand missing" expand no-such-file
+
+chks "tr a-z A-Z"    ti tr a-z A-Z
+chks "tr A-Z a-z"    ti tr A-Z a-z
+chks "tr abc xyz"    ti tr abc xyz
+chks "tr ab ba"      ti tr ab ba
+chks "tr short set2" ti tr a-z X
+chks "tr -d aeiou"   ti tr -d aeiou
+chks "tr -d 0-9"     ti tr -d 0-9
+chks "tr -s a"       ti tr -s a
+chks "tr -s abc"     ti tr -s abc
+chks "tr -s space"   ti tr -s ' '
+chks "tr -s a-z A-Z" ti tr -s a-z A-Z
+chks "tr -cd"        ti tr -cd 'a-zA-Z\n'
+chks "tr -c X"       ti tr -c 'a-zA-Z\n' X
+chks "tr -cs X"      ti tr -cs 'a-zA-Z\n' X
+chks "tr lower upper" ti tr '[:lower:]' '[:upper:]'
+chks "tr digit d"    ti tr '[:digit:]' 'd'
+chks "tr space _"    ti tr '[:space:]' '_'
+chks "tr -d punct"   ti tr -d '[:punct:]'
+chks "tr -d space"   ti tr -d '[:space:]'
+chks "tr newline"    ti tr '\n' 'X'
+chks "tr tab"        ti tr '\t' 'X'
+chks "tr octal"      ti tr '\101' 'Z'
+chks "tr [z*]"       ti tr 'abc' '[z*]'
+chks "tr [z*2]x"     ti tr 'abc' '[z*2]x'
+chks "tr NUL through" tn tr a-z A-Z
+chks "tr -d NUL"     tn tr -d '\000'
+chks "tr NUL to X"   tn tr '\000' 'X'
+chks "tr -s NUL"     tn tr -s '\000'
+chks "tr -cd NUL"    tn tr -cd 'A-Z\n'
+
+printf 'abcdef\nghi\n' > k1
+printf 'abcXef\nghi\n' > k2
+printf 'abcdef\n' > k3
+printf 'abcdef\nghi\nmore\n' > k4
+printf 'ab\000cd\n' > k5
+printf 'ab\000ce\n' > k6
+printf 'aXcYe\n' > k7
+printf 'aZcWe\n' > k8
+chk "cmp same"      cmp k1 k1
+chk "cmp differ"    cmp k1 k2
+chk "cmp prefix"    cmp k1 k3
+chk "cmp prefix r"  cmp k3 k1
+chk "cmp longer"    cmp k1 k4
+chk "cmp -s differ" cmp -s k1 k2
+chk "cmp -s same"   cmp -s k1 k1
+chk "cmp NUL"       cmp k5 k6
+chk "cmp empty"     cmp empty empty
+chk "cmp empty vs"  cmp empty k1
+chk "cmp missing"   cmp k1 no-such-file
+chk "cmp rand"      cmp rand.bin rand.bin
+# -l uses the standard's "%d %o %o"; GNU pads the byte number, so the
+# comparison ignores leading blanks.
+for pair in "k1 k2" "k7 k8" "k5 k6" "k1 k1"; do
+	# shellcheck disable=SC2086
+	set -- $pair
+	a=$( . "$BT"; cmp -l "$1" "$2" 2>/dev/null | sed 's/^ *//;s/  */ /g' )
+	b=$( "$(real_of cmp)" -l "$1" "$2" 2>/dev/null | sed 's/^ *//;s/  */ /g' )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "cmp -l $pair"; fi
+done
+
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"
 out=$(env -i PATH= "$BASH" --noprofile --norc -c '

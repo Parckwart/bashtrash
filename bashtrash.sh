@@ -1392,3 +1392,1214 @@ uniq () {
 	[ "$opened_out" = 1 ] && exec {outfd}>&-
 	return 0
 }
+
+# ---------------------------------------------------------------------------
+# Shared helpers for the line oriented utilities.
+# ---------------------------------------------------------------------------
+
+# Parse a cut/expand style list of numbers and ranges into _bt_lo/_bt_hi,
+# sorted and with overlaps merged.  A high end of 0 means "to the end".
+_bt_ranges() {
+	local list=$1 item lo hi i j n hadf=0
+	_bt_lo=() _bt_hi=()
+	case $- in *f*) hadf=1 ;; esac
+	set -f
+	local IFS=', '
+	set -- $list
+	for item in "$@"; do
+		case $item in
+		-*-*|*-*-*)	_bt_rangeerr=$item; [ "$hadf" = 1 ] || set +f; return 1 ;;
+		*-*)		lo=${item%%-*}; hi=${item#*-}
+				[ -n "$lo" ] || lo=1
+				[ -n "$hi" ] || hi=0 ;;
+		*)		lo=$item; hi=$item ;;
+		esac
+		case $lo$hi in
+		''|*[!0-9]*)	_bt_rangeerr=$item; [ "$hadf" = 1 ] || set +f; return 1 ;;
+		esac
+		lo=$(( 10#$lo )); [ "$hi" = 0 ] || hi=$(( 10#$hi ))
+		[ "$lo" -ge 1 ] || { _bt_rangeerr=$item; [ "$hadf" = 1 ] || set +f; return 1; }
+		_bt_lo+=("$lo"); _bt_hi+=("$hi")
+	done
+	[ "$hadf" = 1 ] || set +f
+
+	# insertion sort by low end, then merge
+	n=${#_bt_lo[@]}
+	for (( i = 1; i < n; i++ )); do
+		lo=${_bt_lo[i]} hi=${_bt_hi[i]} j=$(( i - 1 ))
+		while [ "$j" -ge 0 ] && [ "${_bt_lo[j]}" -gt "$lo" ]; do
+			_bt_lo[j+1]=${_bt_lo[j]}; _bt_hi[j+1]=${_bt_hi[j]}
+			j=$(( j - 1 ))
+		done
+		_bt_lo[j+1]=$lo; _bt_hi[j+1]=$hi
+	done
+	local -a mlo=() mhi=()
+	for (( i = 0; i < n; i++ )); do
+		if [ "${#mlo[@]}" -gt 0 ]; then
+			j=$(( ${#mlo[@]} - 1 ))
+			if [ "${mhi[j]}" = 0 ]; then continue; fi
+			if [ "${_bt_lo[i]}" -le $(( ${mhi[j]} + 1 )) ]; then
+				if [ "${_bt_hi[i]}" = 0 ]; then
+					mhi[j]=0
+				elif [ "${_bt_hi[i]}" -gt "${mhi[j]}" ]; then
+					mhi[j]=${_bt_hi[i]}
+				fi
+				continue
+			fi
+		fi
+		mlo+=("${_bt_lo[i]}"); mhi+=("${_bt_hi[i]}")
+	done
+	_bt_lo=(${mlo[@]+"${mlo[@]}"}); _bt_hi=(${mhi[@]+"${mhi[@]}"})
+	return 0
+}
+
+# Split $1 on the single character $2 into the _bt_fld array, keeping empty
+# fields -- word splitting drops a trailing one, so a sentinel is appended
+# and then discarded.
+_bt_split() {
+	local s=$1 d=$2 hadf=0
+	case $- in *f*) hadf=1 ;; esac
+	set -f
+	local IFS=$d
+	set -- "$s$d"x
+	set -- $1
+	_bt_fld=("${@:1:$#-1}")
+	[ "$hadf" = 1 ] || set +f
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# cut -- POSIX.1-2017:
+#	cut -b list [-n] [file...]
+#	cut -c list [-n] [file...]
+#	cut -f list [-d delim] [-s] [file...]
+# ---------------------------------------------------------------------------
+cut () {
+	local LC_ALL=C
+	local arg opt val mode= list= delim=$'\t' suppress=0 file fd status=0
+	local line i lo hi out nf first _bt_rangeerr _bt_reason
+	local -a _bt_lo=() _bt_hi=() _bt_fld=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				b|c|f)	if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "cut: option requires an argument -- $opt"
+						return 1
+					fi
+					mode=$opt list=$val ;;
+				d)	if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "cut: option requires an argument -- $opt"
+						return 1
+					fi
+					delim=$val ;;
+				s)	suppress=1 ;;
+				n)	;;	# -b only, and a no-op without multibyte splitting
+				*)	_bt_err "cut: illegal option -- $opt"
+					_bt_err "usage: cut -b list [-n] [file...]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	if [ -z "$mode" ]; then
+		_bt_err "cut: you must specify a list of bytes, characters, or fields"
+		return 1
+	fi
+	if ! _bt_ranges "$list"; then
+		_bt_err "cut: invalid byte, character or field list: $_bt_rangeerr"
+		return 1
+	fi
+	if [ "${#_bt_lo[@]}" -eq 0 ]; then
+		_bt_err "cut: invalid byte, character or field list"
+		return 1
+	fi
+
+	[ "$#" -eq 0 ] && set -- -
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			fd=0
+		elif [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_why "$file"
+			_bt_err "cut: $file: $_bt_reason"
+			status=1
+			continue
+		fi
+		line=
+		while IFS= read -r line <&"$fd" || [ -n "$line" ]; do
+			out= first=1
+			if [ "$mode" = f ]; then
+				case $line in
+				*"$delim"*)	;;
+				*)	# a line with no delimiter is passed
+					# through, or dropped under -s
+					[ "$suppress" = 1 ] || printf '%s\n' "$line"
+					line=
+					continue ;;
+				esac
+				_bt_split "$line" "$delim"
+				nf=${#_bt_fld[@]}
+				for (( i = 0; i < ${#_bt_lo[@]}; i++ )); do
+					lo=${_bt_lo[i]}; hi=${_bt_hi[i]}
+					[ "$hi" = 0 ] && hi=$nf
+					[ "$hi" -gt "$nf" ] && hi=$nf
+					while [ "$lo" -le "$hi" ]; do
+						# An empty field is still a field, so
+						# the separator cannot be driven off
+						# whether anything has accumulated.
+						if [ "$first" = 1 ]; then
+							out=${_bt_fld[lo-1]}
+							first=0
+						else
+							out=$out$delim${_bt_fld[lo-1]}
+						fi
+						lo=$(( lo + 1 ))
+					done
+				done
+			else
+				for (( i = 0; i < ${#_bt_lo[@]}; i++ )); do
+					lo=${_bt_lo[i]}; hi=${_bt_hi[i]}
+					if [ "$hi" = 0 ]; then
+						out=$out${line:lo-1}
+					else
+						out=$out${line:lo-1:hi-lo+1}
+					fi
+				done
+			fi
+			printf '%s\n' "$out"
+			line=
+		done
+		[ "$fd" = 0 ] || exec {fd}<&-
+	done
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# comm -- POSIX.1-2017: comm [-123] file1 file2
+# ---------------------------------------------------------------------------
+comm () {
+	local LC_ALL=C
+	local arg opt c1=1 c2=1 c3=1 fd1 fd2 l1 l2 h1 h2 p1 p2 p3 _bt_reason
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-[123]*)
+			arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				1)	c1=0 ;;
+				2)	c2=0 ;;
+				3)	c3=0 ;;
+				*)	_bt_err "comm: illegal option -- $opt"
+					return 1 ;;
+				esac
+			done ;;
+		-*)	_bt_err "comm: illegal option -- ${1#-}"
+			_bt_err "usage: comm [-123] file1 file2"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -ne 2 ]; then
+		_bt_err "usage: comm [-123] file1 file2"
+		return 1
+	fi
+
+	if [ "$1" = - ]; then
+		fd1=0
+	elif [ -d "$1" ] || ! { exec {fd1}<"$1"; } 2>/dev/null; then
+		_bt_why "$1"; _bt_err "comm: $1: $_bt_reason"; return 1
+	fi
+	if [ "$2" = - ]; then
+		fd2=0
+	elif [ -d "$2" ] || ! { exec {fd2}<"$2"; } 2>/dev/null; then
+		_bt_why "$2"; _bt_err "comm: $2: $_bt_reason"
+		[ "$fd1" = 0 ] || exec {fd1}<&-
+		return 1
+	fi
+
+	# The prefix for a column is one tab per column printed before it.
+	p1=
+	p2=; [ "$c1" = 1 ] && p2=$'\t'
+	p3=; [ "$c1" = 1 ] && p3=$'\t'
+	[ "$c2" = 1 ] && p3=$p3$'\t'
+
+	l1= l2=
+	if IFS= read -r l1 <&"$fd1" || [ -n "$l1" ]; then h1=1; else h1=0; fi
+	if IFS= read -r l2 <&"$fd2" || [ -n "$l2" ]; then h2=1; else h2=0; fi
+	while [ "$h1" = 1 ] || [ "$h2" = 1 ]; do
+		if [ "$h1" = 1 ] && [ "$h2" = 1 ] && [ "$l1" = "$l2" ]; then
+			[ "$c3" = 1 ] && printf '%s%s\n' "$p3" "$l1"
+			l1= l2=
+			if IFS= read -r l1 <&"$fd1" || [ -n "$l1" ]; then h1=1; else h1=0; fi
+			if IFS= read -r l2 <&"$fd2" || [ -n "$l2" ]; then h2=1; else h2=0; fi
+		elif [ "$h2" = 0 ] || { [ "$h1" = 1 ] && [ "$l1" '<' "$l2" ]; }; then
+			[ "$c1" = 1 ] && printf '%s%s\n' "$p1" "$l1"
+			l1=
+			if IFS= read -r l1 <&"$fd1" || [ -n "$l1" ]; then h1=1; else h1=0; fi
+		else
+			[ "$c2" = 1 ] && printf '%s%s\n' "$p2" "$l2"
+			l2=
+			if IFS= read -r l2 <&"$fd2" || [ -n "$l2" ]; then h2=1; else h2=0; fi
+		fi
+	done
+
+	[ "$fd1" = 0 ] || exec {fd1}<&-
+	[ "$fd2" = 0 ] || exec {fd2}<&-
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# paste -- POSIX.1-2017: paste [-s] [-d list] file...
+# ---------------------------------------------------------------------------
+paste () {
+	local LC_ALL=C
+	local arg opt val serial=0 dlist=$'\t' file i n di line out any status=0
+	local -a fds=() alive=() delims=()
+	local _bt_reason
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				s)	serial=1 ;;
+				d)	if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "paste: option requires an argument -- d"
+						return 1
+					fi
+					dlist=$val ;;
+				*)	_bt_err "paste: illegal option -- $opt"
+					_bt_err "usage: paste [-s] [-d list] file..."
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	[ "$#" -eq 0 ] && set -- -
+
+	# The delimiter list, with escapes expanded; an empty list means none.
+	delims=()
+	i=0
+	while [ "$i" -lt "${#dlist}" ]; do
+		di=${dlist:i:1}
+		if [ "$di" = '\' ] && [ $(( i + 1 )) -lt "${#dlist}" ]; then
+			i=$(( i + 1 ))
+			case ${dlist:i:1} in
+			n)	di=$'\n' ;;
+			t)	di=$'\t' ;;
+			0)	di= ;;
+			'\')	di='\' ;;
+			*)	di=${dlist:i:1} ;;
+			esac
+		fi
+		delims+=("$di")
+		i=$(( i + 1 ))
+	done
+	[ "${#delims[@]}" -gt 0 ] || delims=($'\t')
+
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			fds+=(0)
+		elif [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_why "$file"
+			_bt_err "paste: $file: $_bt_reason"
+			status=1
+			continue
+		else
+			fds+=("$fd")
+		fi
+		alive+=(1)
+	done
+	n=${#fds[@]}
+	[ "$n" -gt 0 ] || return "$status"
+
+	if [ "$serial" = 1 ]; then
+		for (( i = 0; i < n; i++ )); do
+			out= any=0 di=0 line=
+			while IFS= read -r line <&"${fds[i]}" || [ -n "$line" ]; do
+				if [ "$any" = 1 ]; then
+					out=$out${delims[di]}
+					di=$(( (di + 1) % ${#delims[@]} ))
+				fi
+				out=$out$line
+				any=1
+				line=
+			done
+			[ "$any" = 1 ] && printf '%s\n' "$out"
+			[ "${fds[i]}" = 0 ] || exec {fds[i]}<&-
+		done
+		return "$status"
+	fi
+
+	while :; do
+		out= any=0 di=0
+		for (( i = 0; i < n; i++ )); do
+			[ "$i" -gt 0 ] && { out=$out${delims[di]}; di=$(( (di + 1) % ${#delims[@]} )); }
+			if [ "${alive[i]}" = 1 ]; then
+				line=
+				if IFS= read -r line <&"${fds[i]}" || [ -n "$line" ]; then
+					out=$out$line
+					any=1
+				else
+					alive[i]=0
+				fi
+			fi
+		done
+		[ "$any" = 1 ] || break
+		printf '%s\n' "$out"
+	done
+	for (( i = 0; i < n; i++ )); do
+		[ "${fds[i]}" = 0 ] || exec {fds[i]}<&-
+	done
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# fold -- POSIX.1-2017: fold [-bs] [-w width] [file...]
+# ---------------------------------------------------------------------------
+fold () {
+	local LC_ALL=C
+	local arg opt val width=80 bytes=0 spaces=0 file fd status=0
+	local line i c col start seg brk _bt_reason
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-[0-9]*)	width=${1#-}
+			_bt_isnum "$width" || { _bt_err "fold: invalid width: $width"; return 1; }
+			shift ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				b)	bytes=1 ;;
+				s)	spaces=1 ;;
+				w)	if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "fold: option requires an argument -- w"
+						return 1
+					fi
+					_bt_isnum "$val" || { _bt_err "fold: invalid width: $val"; return 1; }
+					width=$val ;;
+				*)	_bt_err "fold: illegal option -- $opt"
+					_bt_err "usage: fold [-bs] [-w width] [file...]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	width=$(( 10#$width ))
+	if [ "$width" -lt 1 ]; then
+		_bt_err "fold: invalid width: $width"
+		return 1
+	fi
+
+	[ "$#" -eq 0 ] && set -- -
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			fd=0
+		elif [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_why "$file"
+			_bt_err "fold: $file: $_bt_reason"
+			status=1
+			continue
+		fi
+		line=
+		while IFS= read -r line <&"$fd" || [ -n "$line" ]; do
+			start=0 col=0
+			for (( i = 0; i < ${#line}; i++ )); do
+				c=${line:i:1}
+				if [ "$bytes" = 1 ]; then
+					col=$(( col + 1 ))
+				else
+					# Width is measured in display columns
+					# unless -b is given.
+					case $c in
+					$'\b')	[ "$col" -gt 0 ] && col=$(( col - 1 )) ;;
+					$'\r')	col=0 ;;
+					$'\t')	col=$(( col + 8 - col % 8 )) ;;
+					*)	col=$(( col + 1 )) ;;
+					esac
+				fi
+				if [ "$col" -gt "$width" ]; then
+					brk=$i
+					if [ "$spaces" = 1 ]; then
+						seg=${line:start:i-start}
+						case $seg in
+						*[$' \t']*)
+							seg=${seg%"${seg##*[$' \t']}"}
+							brk=$(( start + ${#seg} )) ;;
+						esac
+					fi
+					[ "$brk" -gt "$start" ] || brk=$i
+					# A character that overflows the width all by
+					# itself still has to be emitted, or the line
+					# never advances.
+					[ "$brk" -gt "$start" ] || brk=$(( start + 1 ))
+					printf '%s\n' "${line:start:brk-start}"
+					start=$brk
+					col=0
+					i=$(( brk - 1 ))
+				fi
+			done
+			printf '%s\n' "${line:start}"
+			line=
+		done
+		[ "$fd" = 0 ] || exec {fd}<&-
+	done
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# expand / unexpand -- POSIX.1-2017:
+#	expand [-t tablist] [file...]
+#	unexpand [-a] [-t tablist] [file...]
+# ---------------------------------------------------------------------------
+
+# Parse a tab list into _bt_stops.  A single number means "every n columns",
+# which is recorded as _bt_tabevery; an explicit list leaves that at 0.
+_bt_tablist() {
+	local list=$1 item prev=0 hadf=0
+	_bt_stops=() _bt_tabevery=0
+	case $- in *f*) hadf=1 ;; esac
+	set -f
+	local IFS=', '
+	set -- $list
+	for item in "$@"; do
+		case $item in
+		''|*[!0-9]*)	_bt_rangeerr=$item; [ "$hadf" = 1 ] || set +f; return 1 ;;
+		esac
+		item=$(( 10#$item ))
+		[ "$item" -gt "$prev" ] || { _bt_rangeerr=$item; [ "$hadf" = 1 ] || set +f; return 1; }
+		prev=$item
+		_bt_stops+=("$item")
+	done
+	[ "$hadf" = 1 ] || set +f
+	[ "${#_bt_stops[@]}" -gt 0 ] || return 1
+	if [ "${#_bt_stops[@]}" -eq 1 ]; then
+		_bt_tabevery=${_bt_stops[0]}
+		_bt_stops=()
+	fi
+	return 0
+}
+
+# The next tab stop strictly after column $1.  Past the last listed stop a
+# tab is worth a single column, which is what every expand does.
+_bt_nextstop() {
+	local col=$1 s
+	_bt_stop_real=1
+	if [ "$_bt_tabevery" -gt 0 ]; then
+		_bt_stop=$(( col / _bt_tabevery * _bt_tabevery + _bt_tabevery ))
+		return 0
+	fi
+	for s in ${_bt_stops[@]+"${_bt_stops[@]}"}; do
+		if [ "$s" -gt "$col" ]; then
+			_bt_stop=$s
+			return 0
+		fi
+	done
+	# Past the last listed stop a tab is worth a single column.
+	_bt_stop=$(( col + 1 ))
+	_bt_stop_real=0
+	return 0
+}
+
+expand () {
+	local LC_ALL=C
+	local arg opt val file fd status=0 line i c col out pad
+	local -a _bt_stops=()
+	local _bt_tabevery=8 _bt_stop _bt_stop_real _bt_rangeerr _bt_reason
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-[0-9]*)	# obsolescent "expand -8"
+			if ! _bt_tablist "${1#-}"; then
+				_bt_err "expand: invalid tab size: ${1#-}"
+				return 1
+			fi
+			shift ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				t)	if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "expand: option requires an argument -- t"
+						return 1
+					fi
+					if ! _bt_tablist "$val"; then
+						_bt_err "expand: invalid tab size: $_bt_rangeerr"
+						return 1
+					fi ;;
+				i)	;;	# GNU: leading blanks only; accepted, not honoured
+				*)	_bt_err "expand: illegal option -- $opt"
+					_bt_err "usage: expand [-t tablist] [file...]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	[ "$#" -eq 0 ] && set -- -
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			fd=0
+		elif [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_why "$file"
+			_bt_err "expand: $file: $_bt_reason"
+			status=1
+			continue
+		fi
+		line=
+		while IFS= read -r line <&"$fd" || [ -n "$line" ]; do
+			out= col=0
+			for (( i = 0; i < ${#line}; i++ )); do
+				c=${line:i:1}
+				case $c in
+				$'\t')	_bt_nextstop "$col"
+					printf -v pad '%*s' $(( _bt_stop - col )) ''
+					out=$out$pad
+					col=$_bt_stop ;;
+				$'\b')	out=$out$c
+					[ "$col" -gt 0 ] && col=$(( col - 1 )) ;;
+				*)	out=$out$c
+					col=$(( col + 1 )) ;;
+				esac
+			done
+			printf '%s\n' "$out"
+			line=
+		done
+		[ "$fd" = 0 ] || exec {fd}<&-
+	done
+	return "$status"
+}
+
+unexpand () {
+	local LC_ALL=C
+	local arg opt val allblanks=0 file fd status=0
+	local line i c col out run runcol runraw seen
+	local -a _bt_stops=()
+	local _bt_tabevery=8 _bt_stop _bt_stop_real _bt_rangeerr _bt_reason
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				a)	allblanks=1 ;;
+				t)	if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "unexpand: option requires an argument -- t"
+						return 1
+					fi
+					if ! _bt_tablist "$val"; then
+						_bt_err "unexpand: invalid tab size: $_bt_rangeerr"
+						return 1
+					fi
+					allblanks=1 ;;	# -t implies -a
+				*)	_bt_err "unexpand: illegal option -- $opt"
+					_bt_err "usage: unexpand [-a] [-t tablist] [file...]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	[ "$#" -eq 0 ] && set -- -
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			fd=0
+		elif [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_why "$file"
+			_bt_err "unexpand: $file: $_bt_reason"
+			status=1
+			continue
+		fi
+		line=
+		while IFS= read -r line <&"$fd" || [ -n "$line" ]; do
+			out= col=0 run=0 runcol=0 runraw= seen=0
+			for (( i = 0; i < ${#line}; i++ )); do
+				c=${line:i:1}
+				case $c in
+				' ')	[ "$run" = 0 ] && runcol=$col
+					run=$(( run + 1 ))
+					runraw=$runraw$c
+					col=$(( col + 1 )) ;;
+				$'\t')	[ "$run" = 0 ] && runcol=$col
+					_bt_nextstop "$col"
+					run=$(( run + _bt_stop - col ))
+					runraw=$runraw$c
+					col=$_bt_stop ;;
+				*)	_bt_unexpand_flush
+					out=$out$c
+					col=$(( col + 1 ))
+					seen=1 ;;
+				esac
+			done
+			_bt_unexpand_flush
+			printf '%s\n' "$out"
+			line=
+		done
+		[ "$fd" = 0 ] || exec {fd}<&-
+	done
+	return "$status"
+}
+
+# Emit the pending run of blanks.  Interior blanks are left exactly as they
+# were unless -a was given, a run of a single column is never worth a tab,
+# and anything longer is converted greedily: a tab at every stop the run
+# reaches, then spaces for the remainder.
+_bt_unexpand_flush() {
+	local at end pad conv=
+	[ "$run" -gt 0 ] || return 0
+	# Interior blanks stay as they were unless -a was given, and a run of
+	# a single column is never worth a tab.
+	if { [ "$seen" = 1 ] && [ "$allblanks" = 0 ]; } || [ "$run" -eq 1 ]; then
+		out=$out$runraw
+		run=0 runraw=
+		return 0
+	fi
+	at=$runcol
+	end=$(( runcol + run ))
+	# Build the conversion separately: if it turns out not to be usable
+	# the original text has to go out instead, not both.
+	while :; do
+		_bt_nextstop "$at"
+		# Only a genuine stop earns a tab; past the end of an explicit
+		# list there are no more.
+		[ "$_bt_stop_real" = 1 ] || break
+		[ "$_bt_stop" -le "$end" ] || break
+		conv=$conv$'\t'
+		at=$_bt_stop
+	done
+	if [ "$at" -lt "$end" ]; then
+		# The stops cannot reproduce the run exactly.  Spaces are fine
+		# for a run that was spaces, but a run holding a literal tab is
+		# left alone rather than flattened.
+		case $runraw in
+		*$'\t'*)
+			out=$out$runraw
+			run=0 runraw=
+			return 0 ;;
+		esac
+		printf -v pad '%*s' $(( end - at )) ''
+		conv=$conv$pad
+	fi
+	out=$out$conv
+	run=0 runraw=
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# tr -- POSIX.1-2017:
+#	tr [-c|-C] [-s] string1 string2
+#	tr -s [-c|-C] string1
+#	tr -d [-c|-C] string1
+#	tr -ds [-c|-C] string1 string2
+# ---------------------------------------------------------------------------
+
+# The byte value of character $1, and the character for byte value $1.
+_bt_ord() { printf -v _bt_n '%d' "'$1"; }
+_bt_chr() { local o; printf -v o '%03o' "$1"; printf -v _bt_c "\\$o"; }
+
+# Read one character of a tr operand: string $1 at index $2.  Sets _bt_c (an
+# empty string when the character is NUL, with _bt_cnul set) and _bt_i.
+_bt_tr_getc() {
+	local s=$1 i=$2 c d oct j
+	c=${s:i:1}
+	_bt_cnul=0
+	if [ "$c" = '\' ] && [ $(( i + 1 )) -lt "${#s}" ]; then
+		d=${s:i+1:1}
+		case $d in
+		a)	_bt_c=$'\a'; _bt_i=$(( i + 2 )) ;;
+		b)	_bt_c=$'\b'; _bt_i=$(( i + 2 )) ;;
+		f)	_bt_c=$'\f'; _bt_i=$(( i + 2 )) ;;
+		n)	_bt_c=$'\n'; _bt_i=$(( i + 2 )) ;;
+		r)	_bt_c=$'\r'; _bt_i=$(( i + 2 )) ;;
+		t)	_bt_c=$'\t'; _bt_i=$(( i + 2 )) ;;
+		v)	_bt_c=$'\v'; _bt_i=$(( i + 2 )) ;;
+		'\')	_bt_c='\'; _bt_i=$(( i + 2 )) ;;
+		[0-7])	oct=
+			j=$(( i + 1 ))
+			while [ "${#oct}" -lt 3 ] && [ "$j" -lt "${#s}" ]; do
+				case ${s:j:1} in
+				[0-7])	oct=$oct${s:j:1}; j=$(( j + 1 )) ;;
+				*)	break ;;
+				esac
+			done
+			if [ $(( 8#$oct )) -eq 0 ]; then
+				_bt_c=; _bt_cnul=1
+			else
+				_bt_chr $(( 8#$oct ))
+			fi
+			_bt_i=$j ;;
+		*)	_bt_c=$d; _bt_i=$(( i + 2 )) ;;
+		esac
+	else
+		_bt_c=$c
+		_bt_i=$(( i + 1 ))
+	fi
+	return 0
+}
+
+# Append every character of character class $1 to _bt_set.
+_bt_tr_class() {
+	local k c
+	for (( k = 1; k < 256; k++ )); do
+		_bt_chr "$k"
+		c=$_bt_c
+		case $1 in
+		alpha)	case $c in [[:alpha:]]) _bt_set+=("$c") ;; esac ;;
+		digit)	case $c in [[:digit:]]) _bt_set+=("$c") ;; esac ;;
+		alnum)	case $c in [[:alnum:]]) _bt_set+=("$c") ;; esac ;;
+		upper)	case $c in [[:upper:]]) _bt_set+=("$c") ;; esac ;;
+		lower)	case $c in [[:lower:]]) _bt_set+=("$c") ;; esac ;;
+		space)	case $c in [[:space:]]) _bt_set+=("$c") ;; esac ;;
+		blank)	case $c in [[:blank:]]) _bt_set+=("$c") ;; esac ;;
+		punct)	case $c in [[:punct:]]) _bt_set+=("$c") ;; esac ;;
+		print)	case $c in [[:print:]]) _bt_set+=("$c") ;; esac ;;
+		graph)	case $c in [[:graph:]]) _bt_set+=("$c") ;; esac ;;
+		cntrl)	case $c in [[:cntrl:]]) _bt_set+=("$c") ;; esac ;;
+		xdigit)	case $c in [[:xdigit:]]) _bt_set+=("$c") ;; esac ;;
+		esac
+	done
+	return 0
+}
+
+# Expand a tr operand into _bt_set, with _bt_set_nul recording whether NUL is
+# a member.  _bt_set_fill is the character an unbounded [c*] asks to pad with.
+_bt_tr_expand() {
+	# ${#1}, not ${#s}: every word on a local line is expanded before any
+	# of its assignments happen, so s is not set yet here.
+	local s=$1 i=0 n=${#1} c1 c2 lo hi k cls rep cnt rest
+	_bt_set=() _bt_set_nul=0 _bt_set_fill=
+	while [ "$i" -lt "$n" ]; do
+		rest=${s:i}
+		case $rest in
+		'[:'*)	cls=${rest#'[:'}
+			case $cls in
+			*':]'*)	cls=${cls%%':]'*}
+				case " alpha digit alnum upper lower space blank punct print graph cntrl xdigit " in
+				*" $cls "*)
+					_bt_tr_class "$cls"
+					i=$(( i + ${#cls} + 4 ))
+					continue ;;
+				esac ;;
+			esac ;;
+		'[='*)	cls=${rest#'[='}
+			case $cls in
+			*'=]'*)	cls=${cls%%'=]'*}
+				# No equivalence classes beyond the character
+				# itself in this locale.
+				if [ "${#cls}" -eq 1 ]; then
+					_bt_set+=("$cls")
+					i=$(( i + 4 ))
+					continue
+				fi ;;
+			esac ;;
+		esac
+		# [c*n] repeats, [c*] pads to the length of the other set
+		case $rest in
+		'['*)	_bt_tr_getc "$s" $(( i + 1 ))
+			c1=$_bt_c
+			k=$_bt_i
+			if [ "${s:k:1}" = '*' ]; then
+				cnt=${s:k+1}
+				cnt=${cnt%%]*}
+				if [ "${s:k+1+${#cnt}:1}" = ']' ]; then
+					case $cnt in
+					'')	_bt_set_fill=$c1
+						i=$(( k + 2 ))
+						continue ;;
+					*[!0-9]*) ;;
+					*)	rep=$(( 10#$cnt ))
+						if [ "$rep" -eq 0 ]; then
+							_bt_set_fill=$c1
+						else
+							for (( ; rep > 0; rep-- )); do
+								_bt_set+=("$c1")
+							done
+						fi
+						i=$(( k + 2 + ${#cnt} ))
+						continue ;;
+					esac
+				fi
+			fi ;;
+		esac
+		_bt_tr_getc "$s" "$i"
+		c1=$_bt_c
+		[ "$_bt_cnul" = 1 ] && _bt_set_nul=1
+		i=$_bt_i
+		# a-b ranges
+		if [ "$i" -lt "$n" ] && [ "${s:i:1}" = '-' ] && [ $(( i + 1 )) -lt "$n" ] && [ -n "$c1" ]; then
+			_bt_tr_getc "$s" $(( i + 1 ))
+			c2=$_bt_c
+			if [ -n "$c2" ]; then
+				i=$_bt_i
+				_bt_ord "$c1"; lo=$_bt_n
+				_bt_ord "$c2"; hi=$_bt_n
+				for (( k = lo; k <= hi; k++ )); do
+					_bt_chr "$k"
+					_bt_set+=("$_bt_c")
+				done
+				continue
+			fi
+		fi
+		[ -n "$c1" ] && _bt_set+=("$c1")
+	done
+	return 0
+}
+
+tr () {
+	local LC_ALL=C
+	local arg opt comp=0 del=0 squeeze=0 i k c t out fill
+	local -a set1=() set2=() _bt_set=()
+	local _bt_set_nul _bt_set_fill _bt_c _bt_n _bt_cnul _bt_i
+	local _bt_buf _bt_nul rc
+	local nul1=0 nul2=0 del_nul=0 sq_nul=0 map_nul= map_nul_isnul=0
+	local lastout= lastisnul=0 have_last=0
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-[cCds]*)
+			arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				c|C)	comp=1 ;;
+				d)	del=1 ;;
+				s)	squeeze=1 ;;
+				esac
+			done ;;
+		-*)	_bt_err "tr: illegal option -- ${1#-}"
+			_bt_err "usage: tr [-c|-C] [-s] string1 string2"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+
+	if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+		_bt_err "usage: tr [-c|-C] [-s] string1 string2"
+		return 1
+	fi
+	if [ "$del" = 0 ] && [ "$#" -lt 2 ] && [ "$squeeze" = 0 ]; then
+		_bt_err "usage: tr [-c|-C] [-s] string1 string2"
+		return 1
+	fi
+
+	_bt_tr_expand "$1"
+	set1=(${_bt_set[@]+"${_bt_set[@]}"})
+	nul1=$_bt_set_nul
+	if [ "$#" -eq 2 ]; then
+		_bt_tr_expand "$2"
+		set2=(${_bt_set[@]+"${_bt_set[@]}"})
+		nul2=$_bt_set_nul
+		fill=$_bt_set_fill
+	fi
+
+	if [ "$comp" = 1 ]; then
+		# The complement of set1 over every byte value.
+		local -A in1=()
+		for c in ${set1[@]+"${set1[@]}"}; do in1[$c]=1; done
+		set1=()
+		[ "$nul1" = 1 ] && nul1=0 || nul1=1
+		for (( k = 1; k < 256; k++ )); do
+			_bt_chr "$k"
+			[ -n "${in1[$_bt_c]-}" ] || set1+=("$_bt_c")
+		done
+	fi
+
+	local -A dset=() sset=() map=()
+	if [ "$del" = 1 ]; then
+		for c in ${set1[@]+"${set1[@]}"}; do dset[$c]=1; done
+		del_nul=$nul1
+		if [ "$squeeze" = 1 ] && [ "$#" -eq 2 ]; then
+			for c in ${set2[@]+"${set2[@]}"}; do sset[$c]=1; done
+			sq_nul=$nul2
+		fi
+	else
+		if [ "$#" -eq 2 ]; then
+			# A short set2 is padded with its last character.
+			[ -n "$fill" ] || fill=${set2[${#set2[@]}-1]-}
+			for (( i = 0; i < ${#set1[@]}; i++ )); do
+				if [ "$i" -lt "${#set2[@]}" ]; then
+					map[${set1[i]}]=${set2[i]}
+				elif [ -n "$fill" ]; then
+					map[${set1[i]}]=$fill
+				fi
+			done
+			if [ "$nul1" = 1 ]; then
+				map_nul=${set2[0]-}
+				map_nul_isnul=$nul2
+			fi
+			if [ "$squeeze" = 1 ]; then
+				for c in ${set2[@]+"${set2[@]}"}; do sset[$c]=1; done
+				sq_nul=$nul2
+			fi
+		elif [ "$squeeze" = 1 ]; then
+			for c in ${set1[@]+"${set1[@]}"}; do sset[$c]=1; done
+			sq_nul=$nul1
+		fi
+	fi
+
+	# One pass over the input.  NUL cannot live in a bash string, so the
+	# accumulated output is flushed whenever a NUL has to go out.
+	out=
+	while :; do
+		if _bt_read 0; then rc=0; else rc=1; fi
+		for (( i = 0; i < ${#_bt_buf}; i++ )); do
+			c=${_bt_buf:i:1}
+			[ -n "${dset[$c]-}" ] && continue
+			t=${map[$c]-$c}
+			if [ -n "${sset[$t]-}" ] && [ "$have_last" = 1 ] &&
+			   [ "$lastisnul" = 0 ] && [ "$t" = "$lastout" ]; then
+				continue
+			fi
+			out=$out$t
+			lastout=$t lastisnul=0 have_last=1
+		done
+		if [ "$rc" = 0 ] && [ "$_bt_nul" = 1 ]; then
+			if [ "$del_nul" = 0 ]; then
+				if [ -n "$map_nul" ]; then
+					t=$map_nul
+					if [ -n "${sset[$t]-}" ] && [ "$have_last" = 1 ] &&
+					   [ "$lastisnul" = 0 ] && [ "$t" = "$lastout" ]; then
+						:
+					else
+						out=$out$t
+						lastout=$t lastisnul=0 have_last=1
+					fi
+				elif [ "$sq_nul" = 1 ] && [ "$have_last" = 1 ] && [ "$lastisnul" = 1 ]; then
+					:
+				else
+					printf '%s' "$out"
+					out=
+					printf '\000'
+					lastisnul=1 have_last=1
+				fi
+			fi
+		fi
+		printf '%s' "$out"
+		out=
+		[ "$rc" = 1 ] && break
+	done
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# cmp -- POSIX.1-2017: cmp [-l|-s] file1 file2
+# ---------------------------------------------------------------------------
+
+# Make sure the pending buffer for one side holds data, or is known to be at
+# end of file.  $2/$3/$4 name the pending, NUL-pending and eof variables.
+_bt_cmp_fill() {
+	local -n _p=$2 _n=$3 _e=$4
+	[ -z "$_p" ] || return 0
+	[ "$_n" = 0 ] || return 0
+	[ "$_e" = 0 ] || return 0
+	if _bt_read "$1"; then
+		_p=$_bt_buf
+		_n=$_bt_nul
+	else
+		_p=$_bt_buf
+		_n=0
+		_e=1
+	fi
+	return 0
+}
+
+cmp () {
+	local LC_ALL=C
+	local arg opt listall=0 silent=0 fd1 fd2 f1 f2 _bt_reason
+	local p1= p2= n1=0 n2=0 e1=0 e2=0
+	local off=0 line=1 k lo hi mid v1 v2 x1 x2 rc=0
+	local _bt_buf _bt_nul _bt_n _bt_c
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				l)	listall=1 ;;
+				s)	silent=1 ;;
+				*)	_bt_err "cmp: illegal option -- $opt"
+					_bt_err "usage: cmp [-l|-s] file1 file2"
+					return 2 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -ne 2 ]; then
+		_bt_err "usage: cmp [-l|-s] file1 file2"
+		return 2
+	fi
+	f1=$1 f2=$2
+
+	if [ "$f1" = - ]; then
+		fd1=0
+	elif [ -d "$f1" ] || ! { exec {fd1}<"$f1"; } 2>/dev/null; then
+		_bt_why "$f1"; _bt_err "cmp: $f1: $_bt_reason"; return 2
+	fi
+	if [ "$f2" = - ]; then
+		fd2=0
+	elif [ -d "$f2" ] || ! { exec {fd2}<"$f2"; } 2>/dev/null; then
+		_bt_why "$f2"; _bt_err "cmp: $f2: $_bt_reason"
+		[ "$fd1" = 0 ] || exec {fd1}<&-
+		return 2
+	fi
+
+	while :; do
+		_bt_cmp_fill "$fd1" p1 n1 e1
+		_bt_cmp_fill "$fd2" p2 n2 e2
+		x1=0 x2=0
+		[ -z "$p1" ] && [ "$n1" = 0 ] && [ "$e1" = 1 ] && x1=1
+		[ -z "$p2" ] && [ "$n2" = 0 ] && [ "$e2" = 1 ] && x2=1
+		if [ "$x1" = 1 ] && [ "$x2" = 1 ]; then
+			break
+		fi
+		if [ "$x1" = 1 ] || [ "$x2" = 1 ]; then
+			# One is a prefix of the other.  The wording of this
+			# diagnostic is not specified by the standard.
+			if [ "$silent" = 0 ]; then
+				if [ "$x1" = 1 ]; then
+					_bt_err "cmp: EOF on $f1 after byte $off"
+				else
+					_bt_err "cmp: EOF on $f2 after byte $off"
+				fi
+			fi
+			rc=1
+			break
+		fi
+
+		if [ -n "$p1" ] && [ -n "$p2" ]; then
+			k=${#p1}
+			[ "${#p2}" -lt "$k" ] && k=${#p2}
+			if [ "${p1:0:k}" = "${p2:0:k}" ]; then
+				_bt_count "${p1:0:k}"
+				line=$(( line + _bt_n ))
+				off=$(( off + k ))
+				p1=${p1:k} p2=${p2:k}
+				continue
+			fi
+			# Longest common prefix, by bisection.
+			lo=0 hi=$k
+			while [ "$lo" -lt "$hi" ]; do
+				mid=$(( (lo + hi + 1) / 2 ))
+				if [ "${p1:0:mid}" = "${p2:0:mid}" ]; then
+					lo=$mid
+				else
+					hi=$(( mid - 1 ))
+				fi
+			done
+			if [ "$lo" -gt 0 ]; then
+				_bt_count "${p1:0:lo}"
+				line=$(( line + _bt_n ))
+				off=$(( off + lo ))
+				p1=${p1:lo} p2=${p2:lo}
+			fi
+			_bt_ord "${p1:0:1}"; v1=$_bt_n
+			_bt_ord "${p2:0:1}"; v2=$_bt_n
+		else
+			# At least one side is sitting on a NUL, which cannot
+			# be held in the pending string.
+			if [ -z "$p1" ]; then v1=0; else _bt_ord "${p1:0:1}"; v1=$_bt_n; fi
+			if [ -z "$p2" ]; then v2=0; else _bt_ord "${p2:0:1}"; v2=$_bt_n; fi
+			if [ "$v1" = 0 ] && [ "$v2" = 0 ]; then
+				off=$(( off + 1 ))
+				n1=0 n2=0
+				continue
+			fi
+		fi
+
+		rc=1
+		off=$(( off + 1 ))
+		if [ "$silent" = 1 ]; then
+			break
+		fi
+		if [ "$listall" = 1 ]; then
+			# The standard's format is "%d %o %o\n"; GNU pads the
+			# byte number to the width of the file size.
+			printf '%d %o %o\n' "$off" "$v1" "$v2"
+		else
+			printf '%s %s differ: char %d, line %d\n' "$f1" "$f2" "$off" "$line"
+			break
+		fi
+		# Step over the differing byte on both sides.
+		if [ -z "$p1" ]; then n1=0; else
+			[ "${p1:0:1}" = $'\n' ] && line=$(( line + 1 ))
+			p1=${p1:1}
+		fi
+		if [ -z "$p2" ]; then n2=0; else p2=${p2:1}; fi
+	done
+
+	[ "$fd1" = 0 ] || exec {fd1}<&-
+	[ "$fd2" = 0 ] || exec {fd2}<&-
+	return "$rc"
+}
