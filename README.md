@@ -54,8 +54,8 @@ Run the test suite with:
 | --- | --- |
 | `asa` | `asa [file...]` |
 | `basename` | `basename string [suffix]` |
-| `cat` | `cat [-u] [file...]` |
 | `cal` | `cal [[month] year]` |
+| `cat` | `cat [-u] [file...]` |
 | `cksum` | `cksum [file...]` |
 | `cmp` | `cmp [-l\|-s] file1 file2` |
 | `comm` | `comm [-123] file1 file2` |
