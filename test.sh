@@ -28,7 +28,7 @@ for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          nohup pr dd sed who logname diff cal fuser ipcs patch tput \
          what uuencode uudecode write ps ed m4 iconv ar locale nm \
          admin delta get prs rmdel sact sccs unget val \
-         compress uncompress zcat; do
+         compress uncompress zcat bc make; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -2271,6 +2271,315 @@ if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "uncompress should re
 if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "compress should refuse 20 bits"; fi
 
 cd .. || exit 1
+
+# --- bc ---------------------------------------------------------------------
+# Every expression is put to both calculators and the answers compared, digit
+# for digit.  The library behind -l is written in bc itself and read by the same
+# parser as everything else, so it is checked the same way.
+echo "### bc"
+if command -v bc > /dev/null 2>&1; then
+	RBC=$(real_of bc)
+	bcchk() {	# bcchk expression [-l]
+		local a b
+		a=$( printf '%s\n' "$1" | ( . "$BT"; bc $2 ) 2>&1 )
+		b=$( printf '%s\n' "$1" | "$RBC" $2 2>&1 )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1))
+		else note_fail "bc $2 [$1]: [$a] not [$b]"; fi
+	}
+
+	bcchk '1+2'
+	bcchk '2*3+4'
+	bcchk '10/3'
+	bcchk 'scale=3; 10/3'
+	bcchk 'scale=10; 1/7'
+	bcchk 'scale=20; 1/3*3'
+	bcchk '2^10'
+	bcchk '2^200'
+	bcchk 'scale=10; 2^-3'
+	bcchk '-2^2'
+	bcchk '1.5*1.5'
+	bcchk '100000000000000000000 + 1'
+	bcchk '99999999999999999999 * 99999999999999999999'
+	bcchk 'scale=5; 22/7'
+	bcchk 'scale=0; 22/7'
+	bcchk '10 % 3'
+	bcchk 'scale=5; 10 % 3'
+	bcchk 'scale=5; 1 % 6.28318'
+	bcchk '-10 % 3'
+	bcchk 'sqrt(16)'
+	bcchk 'scale=30; sqrt(2)'
+	bcchk 'scale=10; sqrt(1000)'
+	bcchk 'length(12345)'
+	bcchk 'length(0.001)'
+	bcchk 'scale(1.234)'
+	bcchk 'scale=20; scale'
+	bcchk 'x=5; x*2'
+	bcchk 'x=3; x+=4; x'
+	bcchk 'x=3; x*=4; x'
+	bcchk 'x=10; x/=4; x'
+	bcchk 'y=5; y++; y'
+	bcchk 'y=5; y--; y'
+	bcchk '++x'
+	bcchk 'x[0]=1; x[1]=2; x[0]+x[1]'
+	bcchk 'if (1 < 2) 42'
+	bcchk 'if (0) 1 else 2'
+	bcchk 'i=0; while (i<3) { i; i=i+1 }'
+	bcchk 'for (i=0;i<3;i++) i'
+	bcchk 'for (i=1;i<=5;i++) { if (i==3) continue; i }'
+	bcchk 'for (i=1;i<=5;i++) { if (i==3) break; i }'
+	bcchk 'define f(x) { return (x*x) } f(7)'
+	bcchk 'define g(a,b) { auto c; c=a+b; return (c*2) } g(3,4)'
+	bcchk 'define f(n) { if (n<2) return (1); return (n*f(n-1)) } f(10)'
+	bcchk '"hello"'
+	bcchk '1==1'
+	bcchk '3<2'
+	bcchk '(2+3)*4'
+	bcchk 'ibase=16; FF'
+	bcchk 'obase=16; 255'
+	bcchk 'obase=2; 10'
+	bcchk '/* a comment */ 7'
+	bcchk 'quit'
+	bcchk '1;quit;2'
+	bcchk 'x'
+
+	# the library, at a scale that does not take all afternoon
+	bcchk 'scale=10; a(1)' -l
+	bcchk 'scale=10; e(1)' -l
+	bcchk 'scale=10; l(2)' -l
+	bcchk 'scale=10; s(1)' -l
+	bcchk 'scale=10; c(1)' -l
+	bcchk 'scale=10; e(l(5))' -l
+	bcchk 'a(1)' -l
+fi
+
+# --- make -------------------------------------------------------------------
+# Compared against the real make with -r, so that both start from the same
+# (empty) set of built-in rules and only what the makefile says counts.
+echo "### make"
+if command -v make > /dev/null 2>&1; then
+	RMAKE=$(real_of make)
+	mkdir -p mkt
+	cd mkt || exit 1
+
+	MKCLEAN=
+	mkchk() {	# mkchk description makefile-name [args...]
+		local desc=$1 mf=$2 a b
+		shift 2
+		# both sides must start from the same files, or whichever runs
+		# first leaves the other with nothing to do
+		# shellcheck disable=SC2086
+		[ -n "$MKCLEAN" ] && rm -f $MKCLEAN
+		# shellcheck disable=SC2086
+		a=$( . "$BT"; make -r -f "$mf" "$@" 2>&1 |
+		     "$(real_of sed)" 's/\[[^]]*\]/[T]/'; echo "rc=${PIPESTATUS[0]}" )
+		# shellcheck disable=SC2086
+		[ -n "$MKCLEAN" ] && rm -f $MKCLEAN
+		# shellcheck disable=SC2086
+		b=$( "$RMAKE" -r -f "$mf" "$@" 2>&1 |
+		     "$(real_of sed)" 's/\[[^]]*\]/[T]/'; echo "rc=${PIPESTATUS[0]}" )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1))
+		else note_fail "make -f $mf $*: [$a] not [$b]"; fi
+	}
+
+	cat > mf1 <<'MKEOF'
+CC = echo cc
+OBJS = a.o b.o
+
+all: prog
+	@echo done $(OBJS)
+
+prog: $(OBJS)
+	$(CC) -o prog $(OBJS)
+
+a.o: a.c
+	$(CC) -c a.c
+
+b.o: b.c
+	$(CC) -c b.c
+MKEOF
+	touch a.c b.c
+	mkchk "a small build" mf1
+	mkchk "the same build, not run" mf1 -n
+	mkchk "one target of it" mf1 a.o
+	mkchk "silently" mf1 -s
+
+	cat > mf2 <<'MKEOF'
+out: a b
+	@echo target=$@ first=$< newer=$? stem=$*
+MKEOF
+	touch a b
+	mkchk "the internal macros" mf2
+
+	cat > mf3 <<'MKEOF'
+.SUFFIXES: .in .out
+
+all: x.out
+
+.in.out:
+	@echo making $@ from $< stem $*
+	cp $< $@
+MKEOF
+	printf 'data\n' > x.in
+	rm -f x.out
+	( . "$BT"; make -r -f mf3 ) > /dev/null 2>&1
+	cp -f x.out mkours 2>/dev/null
+	rm -f x.out
+	"$RMAKE" -r -f mf3 > /dev/null 2>&1
+	if cmp -s mkours x.out; then pass=$((pass + 1))
+	else note_fail "make should make x.out from x.in"; fi
+	rm -f x.out
+	MKCLEAN=x.out
+	mkchk "an inference rule" mf3
+	MKCLEAN=
+
+	cat > mf4 <<'MKEOF'
+.SUFFIXES:
+.SUFFIXES: .p .q
+
+SRC = one.p two.p
+OBJ = $(SRC:.p=.q)
+
+all: $(OBJ)
+	@echo built $(OBJ)
+
+.p.q:
+	@echo compiling $< to $@
+	cp $< $@
+MKEOF
+	printf 'p1\n' > one.p
+	printf 'p2\n' > two.p
+	rm -f one.q two.q
+	MKCLEAN="one.q two.q"
+	mkchk "substitution in a macro" mf4
+	MKCLEAN=
+	rm -f one.q two.q
+
+	cat > mf5 <<'MKEOF'
+X = one
+Y += first
+Y += second
+show:
+	@echo X=$(X) Y=$(Y) Z=$(Z)
+MKEOF
+	mkchk "macros" mf5
+	mkchk "a macro from the command line" mf5 X=two
+	Z=fromenv; export Z
+	mkchk "a macro from the environment" mf5
+	mkchk "the environment winning with -e" mf5 -e
+	unset Z
+
+	cat > mf6 <<'MKEOF'
+bad:
+	false
+	@echo not reached
+
+ignored:
+	-false
+	@echo reached
+
+quiet:
+	@false
+	@echo after
+MKEOF
+	mkchk "a command that fails" mf6 bad
+	mkchk "a failure that is ignored" mf6 ignored
+	mkchk "failing quietly" mf6 quiet
+	mkchk "ignoring every failure" mf6 -i bad
+
+	cat > mf7 <<'MKEOF'
+all: t1 t2
+t1:
+	@echo t1; false
+t2:
+	@echo t2
+MKEOF
+	mkchk "stopping at the first error" mf7
+	mkchk "carrying on past it" mf7 -k
+
+	cat > mf8 <<'MKEOF'
+LONG = one \
+       two \
+       three
+
+all:; @echo $(LONG)
+MKEOF
+	mkchk "a line that carries on" mf8
+	mkchk "a command on the rule line" mf8
+
+	cat > mf9 <<'MKEOF'
+all: made
+	@echo all
+made:
+	@echo making
+MKEOF
+	mkchk "a target with no file" mf9
+	mkchk "asking for a target that is not there" mf9 nosuch
+
+	# a real build, twice over, to see that the second time nothing happens
+	cat > mfa <<'MKEOF'
+out.txt: in1.txt in2.txt
+	cat in1.txt in2.txt > out.txt
+MKEOF
+	printf 'one\n' > in1.txt
+	printf 'two\n' > in2.txt
+	rm -f out.txt
+	a=$( . "$BT"; make -r -f mfa 2>&1; make -r -f mfa 2>&1; echo "rc=$?" )
+	cp -f out.txt mkours 2>/dev/null
+	rm -f out.txt
+	b=$( "$RMAKE" -r -f mfa 2>&1; "$RMAKE" -r -f mfa 2>&1; echo "rc=$?" )
+	if [ "$a" = "$b" ] && cmp -s mkours out.txt; then pass=$((pass + 1))
+	else note_fail "make twice over: [$a] not [$b]"; fi
+
+	mkdir -p mkempty
+	( cd mkempty && . "$BT"; make -r ) > /dev/null 2>&1; a=$?
+	( cd mkempty && "$RMAKE" -r ) > /dev/null 2>&1; b=$?
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "make with no makefile ($a vs $b)"; fi
+
+	# -q asks the question without doing the work, -t answers it by moving
+	# the timestamps
+	cat > mfq <<'MKEOF'
+all: q.out
+	@echo all
+
+q.out: q.in
+	cat q.in > q.out
+MKEOF
+	mkq() {	# mkq description [args...]
+		local desc=$1 a b
+		shift
+		rm -f q.out; printf 'in\n' > q.in
+		a=$( . "$BT"; make -r -f mfq "$@" 2>&1; echo "rc=$?" )
+		rm -f q.out; printf 'in\n' > q.in
+		b=$( "$RMAKE" -r -f mfq "$@" 2>&1; echo "rc=$?" )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1))
+		else note_fail "make $*: [$a] not [$b]"; fi
+	}
+	mkq "asking whether it is up to date" -q
+	mkq "touching instead of building" -t
+	mkq "touching quietly" -t -s
+
+	# -t leaves the file it touches alone
+	printf 'keep\nthis\n' > q.out
+	printf 'in\n' > q.in
+	( . "$BT"; make -r -f mfq -t q.out ) > /dev/null 2>&1
+	if [ "$( cat q.out )" = "keep
+this" ]; then pass=$((pass + 1)); else note_fail "make -t changed the file"; fi
+	rm -f q.out; printf 'in\n' > q.in
+	( . "$BT"; make -r -f mfq -t q.out ) > /dev/null 2>&1
+	a=$( . "$BT"; make -r -f mfq -q q.out > /dev/null 2>&1; echo $? )
+	if [ "$a" = 0 ]; then pass=$((pass + 1)); else note_fail "make -t did not bring the target up to date"; fi
+
+	# -p writes out what it read: every macro and every rule
+	a=$( . "$BT"; make -r -f mfq -q -p 2>&1 )
+	case $a in
+	*"# Macros"*"# Targets"*"all: q.out"*"q.out: q.in"*)
+		pass=$((pass + 1)) ;;
+	*)	note_fail "make -p: [$a]" ;;
+	esac
+
+	cd .. || exit 1
+fi
+
 
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"

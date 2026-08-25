@@ -12522,3 +12522,2123 @@ zcat () {
 	uncompress -c "$@"
 	return $?
 }
+
+# ---------------------------------------------------------------------------
+# bc -- POSIX.1-2017: bc [-l] [file...]
+#
+# The numbers are decimal strings and the arithmetic is done on them a digit at
+# a time, which is what arbitrary precision comes to when the only integers
+# available are the shell's.  A number is written the way bc writes it: an
+# optional minus, the digits, and a point with as many digits after it as the
+# number's scale.
+# ---------------------------------------------------------------------------
+
+# Take number $1 apart into _bc_sign, _bc_int and _bc_frac.
+_bt_bc_split() {
+	local n=$1
+	_bc_sign=
+	case $n in
+	-*)	_bc_sign=-; n=${n#-} ;;
+	+*)	n=${n#+} ;;
+	esac
+	case $n in
+	*.*)	_bc_int=${n%%.*}; _bc_frac=${n#*.} ;;
+	*)	_bc_int=$n; _bc_frac= ;;
+	esac
+	[ -n "$_bc_int" ] || _bc_int=0
+	return 0
+}
+
+# Strip the leading zeros off digit string $1, leaving at least one digit.
+_bt_bc_trim() {
+	local d=$1
+	while [ "${#d}" -gt 1 ] && [ "${d:0:1}" = 0 ]; do d=${d:1}; done
+	_bc_str=$d
+	return 0
+}
+
+# Build a number out of sign $1, digits $2 and scale $3.
+_bt_bc_make() {
+	local sign=$1 d=$2 sc=$3 ip fp
+	while [ "${#d}" -lt $(( sc + 1 )) ]; do d=0$d; done
+	if [ "$sc" = 0 ]; then
+		ip=$d; fp=
+	else
+		ip=${d:0:${#d}-sc}
+		fp=${d:${#d}-sc}
+	fi
+	_bt_bc_trim "$ip"
+	ip=$_bc_str
+	# a zero is just zero: no sign in front of it and no scale behind it
+	case $ip$fp in
+	*[1-9]*)	;;
+	*)		_bc_num=0; return 0 ;;
+	esac
+	# and a number smaller than one is written without the nought
+	[ "$ip" = 0 ] && [ -n "$fp" ] && ip=
+	if [ -n "$fp" ]; then _bc_num=$sign$ip.$fp; else _bc_num=$sign$ip; fi
+	return 0
+}
+
+# The scale of number $1, in _bc_int.
+_bt_bc_scale() {
+	local n=$1
+	case $n in
+	*.*)	_bc_i=${#n}
+		n=${n#*.}
+		_bc_i=${#n} ;;
+	*)	_bc_i=0 ;;
+	esac
+	return 0
+}
+
+# Compare digit strings $1 and $2 as integers: -1, 0 or 1 in _bc_i.
+_bt_bc_icmp() {
+	local a b
+	_bt_bc_trim "$1"; a=$_bc_str
+	_bt_bc_trim "$2"; b=$_bc_str
+	if [ "${#a}" -ne "${#b}" ]; then
+		if [ "${#a}" -lt "${#b}" ]; then _bc_i=-1; else _bc_i=1; fi
+		return 0
+	fi
+	if [ "$a" = "$b" ]; then _bc_i=0
+	elif [[ $a < $b ]]; then _bc_i=-1
+	else _bc_i=1; fi
+	return 0
+}
+
+# Add digit strings $1 and $2, into _bc_str.
+_bt_bc_iadd() {
+	local a=$1 b=$2 i carry=0 s out= da db
+	while [ "${#a}" -lt "${#b}" ]; do a=0$a; done
+	while [ "${#b}" -lt "${#a}" ]; do b=0$b; done
+	for (( i = ${#a} - 1; i >= 0; i-- )); do
+		s=$(( ${a:i:1} + ${b:i:1} + carry ))
+		carry=$(( s / 10 ))
+		out=$(( s % 10 ))$out
+	done
+	[ "$carry" -gt 0 ] && out=$carry$out
+	_bc_str=$out
+	return 0
+}
+
+# Subtract digit string $2 from $1, which must not be smaller, into _bc_str.
+_bt_bc_isub() {
+	local a=$1 b=$2 i borrow=0 s out=
+	while [ "${#b}" -lt "${#a}" ]; do b=0$b; done
+	for (( i = ${#a} - 1; i >= 0; i-- )); do
+		s=$(( ${a:i:1} - ${b:i:1} - borrow ))
+		if [ "$s" -lt 0 ]; then s=$(( s + 10 )); borrow=1; else borrow=0; fi
+		out=$s$out
+	done
+	_bt_bc_trim "$out"
+	return 0
+}
+
+# Multiply digit strings $1 and $2, into _bc_str.
+_bt_bc_imul() {
+	local a=$1 b=$2 i j carry s out
+	local -a acc=()
+	_bt_bc_trim "$a"; a=$_bc_str
+	_bt_bc_trim "$b"; b=$_bc_str
+	if [ "$a" = 0 ] || [ "$b" = 0 ]; then _bc_str=0; return 0; fi
+	for (( i = 0; i < ${#a} + ${#b}; i++ )); do acc[i]=0; done
+	for (( i = ${#a} - 1; i >= 0; i-- )); do
+		carry=0
+		for (( j = ${#b} - 1; j >= 0; j-- )); do
+			s=$(( acc[i+j+1] + ${a:i:1} * ${b:j:1} + carry ))
+			acc[i+j+1]=$(( s % 10 ))
+			carry=$(( s / 10 ))
+		done
+		acc[i]=$(( acc[i] + carry ))
+	done
+	out=
+	for (( i = 0; i < ${#acc[@]}; i++ )); do out=$out${acc[i]}; done
+	_bt_bc_trim "$out"
+	return 0
+}
+
+# Multiply digit string $1 by the single digit $2, into _bc_str.
+_bt_bc_imul1() {
+	local a=$1 d=$2 i carry=0 s out=
+	if [ "$d" = 0 ]; then _bc_str=0; return 0; fi
+	for (( i = ${#a} - 1; i >= 0; i-- )); do
+		s=$(( ${a:i:1} * d + carry ))
+		out=$(( s % 10 ))$out
+		carry=$(( s / 10 ))
+	done
+	[ "$carry" -gt 0 ] && out=$carry$out
+	_bt_bc_trim "$out"
+	return 0
+}
+
+# Divide digit string $1 by $2, leaving the quotient in _bc_str and the
+# remainder in _bc_rem.  Long division, a digit at a time; where the divisor is
+# short enough the shell can do the digit outright, and where it is not the
+# leading digits give an estimate that needs a correction or two at most.
+_bt_bc_idivmod() {
+	local a b rem= q= i d bl short rt bt prod
+	_bt_bc_trim "$1"; a=$_bc_str
+	_bt_bc_trim "$2"; b=$_bc_str
+	if [ "$b" = 0 ]; then _bc_str=0 _bc_rem=0; return 1; fi
+	bl=${#b}
+	if [ "$bl" -le 17 ]; then short=1; else short=0; bt=${b:0:17}; fi
+	rem=0
+	for (( i = 0; i < ${#a}; i++ )); do
+		if [ "$rem" = 0 ]; then rem=${a:i:1}; else rem=$rem${a:i:1}; fi
+		_bt_bc_trim "$rem"; rem=$_bc_str
+		if [ "$short" = 1 ]; then
+			d=$(( 10#$rem / 10#$b ))
+			if [ "$d" -gt 0 ]; then
+				_bt_bc_imul1 "$b" "$d"
+				_bt_bc_isub "$rem" "$_bc_str"
+				rem=$_bc_str
+			fi
+			q=$q$d
+			continue
+		fi
+		if [ "${#rem}" -gt "$bl" ]; then rt=${rem:0:18}
+		elif [ "${#rem}" -lt "$bl" ]; then rt=0
+		else rt=0${rem:0:17}; fi
+		d=$(( 10#$rt / 10#$bt ))
+		[ "$d" -gt 9 ] && d=9
+		while [ "$d" -gt 0 ]; do
+			_bt_bc_imul1 "$b" "$d"
+			prod=$_bc_str
+			_bt_bc_icmp "$prod" "$rem"
+			[ "$_bc_i" -le 0 ] && break
+			d=$(( d - 1 ))
+		done
+		while [ "$d" -lt 9 ]; do
+			_bt_bc_imul1 "$b" $(( d + 1 ))
+			_bt_bc_icmp "$_bc_str" "$rem"
+			[ "$_bc_i" -gt 0 ] && break
+			d=$(( d + 1 ))
+		done
+		if [ "$d" -gt 0 ]; then
+			_bt_bc_imul1 "$b" "$d"
+			_bt_bc_isub "$rem" "$_bc_str"
+			rem=$_bc_str
+		fi
+		q=$q$d
+	done
+	_bt_bc_trim "$q"
+	_bc_rem=$rem
+	return 0
+}
+
+# The two numbers $1 and $2 as integers over a common scale: _bc_a, _bc_b and
+# _bc_sc, with the signs in _bc_sa and _bc_sb.
+_bt_bc_align() {
+	local sa ia fa sb ib fb sc
+	_bt_bc_split "$1"; sa=$_bc_sign ia=$_bc_int fa=$_bc_frac
+	_bt_bc_split "$2"; sb=$_bc_sign ib=$_bc_int fb=$_bc_frac
+	sc=${#fa}
+	[ "${#fb}" -gt "$sc" ] && sc=${#fb}
+	while [ "${#fa}" -lt "$sc" ]; do fa=${fa}0; done
+	while [ "${#fb}" -lt "$sc" ]; do fb=${fb}0; done
+	_bc_a=$ia$fa _bc_b=$ib$fb _bc_sc=$sc _bc_sa=$sa _bc_sb=$sb
+	return 0
+}
+
+# $1 + $2, into _bc_num.
+_bt_bc_add() {
+	local a b sc sa sb
+	_bt_bc_align "$1" "$2"
+	a=$_bc_a b=$_bc_b sc=$_bc_sc sa=$_bc_sa sb=$_bc_sb
+	if [ "$sa" = "$sb" ]; then
+		_bt_bc_iadd "$a" "$b"
+		_bt_bc_make "$sa" "$_bc_str" "$sc"
+		return 0
+	fi
+	_bt_bc_icmp "$a" "$b"
+	if [ "$_bc_i" -ge 0 ]; then
+		_bt_bc_isub "$a" "$b"
+		_bt_bc_make "$sa" "$_bc_str" "$sc"
+	else
+		_bt_bc_isub "$b" "$a"
+		_bt_bc_make "$sb" "$_bc_str" "$sc"
+	fi
+	return 0
+}
+
+# $1 - $2, into _bc_num.
+_bt_bc_sub() {
+	local b=$2
+	case $b in
+	-*)	b=${b#-} ;;
+	*)	b=-$b ;;
+	esac
+	_bt_bc_add "$1" "$b"
+	return 0
+}
+
+# $1 * $2 with the scale the standard asks for, into _bc_num.
+_bt_bc_mul() {
+	local sa ia fa sb ib fb sc want
+	_bt_bc_split "$1"; sa=$_bc_sign ia=$_bc_int fa=$_bc_frac
+	_bt_bc_split "$2"; sb=$_bc_sign ib=$_bc_int fb=$_bc_frac
+	_bt_bc_imul "$ia$fa" "$ib$fb"
+	sc=$(( ${#fa} + ${#fb} ))
+	# the scale of a product is a + b, but no more than needed and never
+	# less than the larger of the two or the current scale
+	want=$scale
+	[ "${#fa}" -gt "$want" ] && want=${#fa}
+	[ "${#fb}" -gt "$want" ] && want=${#fb}
+	[ "$sc" -lt "$want" ] && want=$sc
+	local sign=
+	[ "$sa" != "$sb" ] && sign=-
+	_bt_bc_round "$_bc_str" "$sc" "$want"
+	_bt_bc_make "$sign" "$_bc_str" "$want"
+	return 0
+}
+
+# Cut digit string $1, which has scale $2, down to scale $3.
+_bt_bc_round() {
+	local d=$1 from=$2 to=$3 cut
+	if [ "$to" -ge "$from" ]; then
+		cut=$(( to - from ))
+		while [ "$cut" -gt 0 ]; do d=${d}0; cut=$(( cut - 1 )); done
+	else
+		cut=$(( from - to ))
+		if [ "$cut" -ge "${#d}" ]; then d=0
+		else d=${d:0:${#d}-cut}; fi
+	fi
+	_bc_str=$d
+	return 0
+}
+
+# $1 / $2 to the current scale, into _bc_num.
+_bt_bc_div() {
+	local sa ia fa sb ib fb i sign= n d
+	_bt_bc_split "$1"; sa=$_bc_sign ia=$_bc_int fa=$_bc_frac
+	_bt_bc_split "$2"; sb=$_bc_sign ib=$_bc_int fb=$_bc_frac
+	n=$ia$fa
+	d=$ib$fb
+	_bt_bc_trim "$d"
+	if [ "$_bc_str" = 0 ]; then
+		_bt_bc_err "divide by zero"
+		_bc_num=0
+		return 1
+	fi
+	# line the two up, then make room for the digits the scale asks for
+	while [ "${#fa}" -lt "${#fb}" ]; do n=${n}0; fa=${fa}0; done
+	while [ "${#fb}" -lt "${#fa}" ]; do d=${d}0; fb=${fb}0; done
+	for (( i = 0; i < scale; i++ )); do n=${n}0; done
+	_bt_bc_idivmod "$n" "$d" || return 1
+	[ "$sa" != "$sb" ] && sign=-
+	_bt_bc_make "$sign" "$_bc_str" "$scale"
+	return 0
+}
+
+# $1 * $2 with nothing thrown away: the scale of the answer is the sum of the
+# two, which is what the remainder below needs.
+_bt_bc_mulx() {
+	local sa ia fa sb ib fb sign=
+	_bt_bc_split "$1"; sa=$_bc_sign ia=$_bc_int fa=$_bc_frac
+	_bt_bc_split "$2"; sb=$_bc_sign ib=$_bc_int fb=$_bc_frac
+	_bt_bc_imul "$ia$fa" "$ib$fb"
+	[ "$sa" != "$sb" ] && sign=-
+	_bt_bc_make "$sign" "$_bc_str" $(( ${#fa} + ${#fb} ))
+	return 0
+}
+
+# $1 % $2, which the standard defines as a - (a/b)*b with the division taken to
+# the current scale and nothing rounded off the multiplication.
+_bt_bc_mod() {
+	local q
+	_bt_bc_div "$1" "$2" || return 1
+	q=$_bc_num
+	_bt_bc_mulx "$q" "$2"
+	_bt_bc_sub "$1" "$_bc_num"
+	return 0
+}
+
+# $1 raised to the integer power $2, into _bc_num.  The exponent is taken as a
+# whole number, as the standard says, and the scale of the answer is the scale
+# of the base times the exponent, but no more than the current scale asks for.
+_bt_bc_pow() {
+	local base=$1 e neg=0 result=1 keep=$scale want q sc
+	local fa
+	_bt_bc_split "$2"
+	e=$_bc_int
+	[ "$_bc_sign" = - ] && neg=1
+	_bt_bc_trim "$e"; e=$_bc_str
+	_bt_bc_split "$base"; fa=$_bc_frac
+	if [ "$neg" = 1 ]; then
+		want=$scale
+	else
+		want=$(( ${#fa} * e ))
+		sc=$scale
+		[ "${#fa}" -gt "$sc" ] && sc=${#fa}
+		[ "$want" -gt "$sc" ] && want=$sc
+	fi
+	# squaring, with room to spare kept until the end
+	scale=$(( want + 20 ))
+	while :; do
+		_bt_bc_trim "$e"; e=$_bc_str
+		[ "$e" = 0 ] && break
+		_bt_bc_idivmod "$e" 2
+		q=$_bc_str
+		if [ "$_bc_rem" = 1 ]; then
+			_bt_bc_mul "$result" "$base"
+			result=$_bc_num
+		fi
+		e=$q
+		_bt_bc_trim "$e"; e=$_bc_str
+		[ "$e" = 0 ] && break
+		_bt_bc_mul "$base" "$base"
+		base=$_bc_num
+	done
+	scale=$keep
+	if [ "$neg" = 1 ]; then
+		_bt_bc_div 1 "$result"
+	else
+		_bt_bc_split "$result"
+		_bt_bc_round "$_bc_int$_bc_frac" "${#_bc_frac}" "$want"
+		_bt_bc_make "$_bc_sign" "$_bc_str" "$want"
+	fi
+	return 0
+}
+
+# The square root of $1, into _bc_num.
+_bt_bc_sqrt() {
+	local n=$1 x last keep=$scale sc
+	_bt_bc_split "$n"
+	if [ "$_bc_sign" = - ]; then
+		_bt_bc_err "square root of a negative number"
+		_bc_num=0
+		return 1
+	fi
+	_bt_bc_trim "$_bc_int$_bc_frac"
+	if [ "$_bc_str" = 0 ]; then _bc_num=0; return 0; fi
+	sc=$scale
+	_bt_bc_scale "$n"
+	[ "$_bc_i" -gt "$sc" ] && sc=$_bc_i
+	scale=$(( sc + 3 ))
+	# Newton's method, starting from something roughly the right size
+	x=$n
+	while :; do
+		last=$x
+		_bt_bc_div "$n" "$x" || { scale=$keep; return 1; }
+		_bt_bc_add "$x" "$_bc_num"
+		_bt_bc_div "$_bc_num" 2
+		x=$_bc_num
+		_bt_bc_sub "$x" "$last"
+		_bt_bc_split "$_bc_num"
+		_bt_bc_trim "$_bc_int$_bc_frac"
+		[ "$_bc_str" = 0 ] && break
+	done
+	scale=$sc
+	_bt_bc_split "$x"
+	_bt_bc_round "$_bc_int$_bc_frac" "${#_bc_frac}" "$sc"
+	_bt_bc_make "$_bc_sign" "$_bc_str" "$sc"
+	scale=$keep
+	return 0
+}
+
+# Compare numbers $1 and $2: -1, 0 or 1 in _bc_i.
+_bt_bc_cmp() {
+	local a b sc sa sb
+	_bt_bc_align "$1" "$2"
+	a=$_bc_a b=$_bc_b sa=$_bc_sa sb=$_bc_sb
+	_bt_bc_trim "$a"; a=$_bc_str
+	_bt_bc_trim "$b"; b=$_bc_str
+	if [ "$a" = 0 ] && [ "$b" = 0 ]; then _bc_i=0; return 0; fi
+	if [ "$sa" != "$sb" ]; then
+		if [ "$sa" = - ]; then _bc_i=-1; else _bc_i=1; fi
+		return 0
+	fi
+	_bt_bc_icmp "$a" "$b"
+	[ "$sa" = - ] && _bc_i=$(( -_bc_i ))
+	return 0
+}
+
+# The tokens of $1, into the parallel arrays `tk` (kind) and `tv` (text).
+# Kinds: N a number, I a name or keyword, S a string, O anything else.
+_bt_bc_lex() {
+	# ${#1}, not ${#s}: every word on a local line is expanded before any
+	# assignment on it takes effect
+	local s=$1 i=0 n=${#1} c d
+	tk=() tv=()
+	while [ "$i" -lt "$n" ]; do
+		c=${s:i:1}
+		case $c in
+		' '|$'\t')	i=$(( i + 1 )); continue ;;
+		'\')	if [ "${s:i+1:1}" = $'\n' ]; then i=$(( i + 2 )); continue; fi
+			i=$(( i + 1 )); continue ;;
+		'#')	while [ "$i" -lt "$n" ] && [ "${s:i:1}" != $'\n' ]; do i=$(( i + 1 )); done
+			continue ;;
+		'/')	if [ "${s:i+1:1}" = '*' ]; then
+				i=$(( i + 2 ))
+				while [ "$i" -lt "$n" ]; do
+					if [ "${s:i:2}" = '*/' ]; then i=$(( i + 2 )); break; fi
+					i=$(( i + 1 ))
+				done
+				continue
+			fi
+			if [ "${s:i+1:1}" = '=' ]; then
+				tk+=(O); tv+=('/='); i=$(( i + 2 )); continue
+			fi
+			tk+=(O); tv+=(/); i=$(( i + 1 )); continue ;;
+		'"')	i=$(( i + 1 ))
+			d=
+			while [ "$i" -lt "$n" ] && [ "${s:i:1}" != '"' ]; do
+				d=$d${s:i:1}
+				i=$(( i + 1 ))
+			done
+			i=$(( i + 1 ))
+			tk+=(S); tv+=("$d"); continue ;;
+		[0-9.A-F])
+			d=
+			while [ "$i" -lt "$n" ]; do
+				case ${s:i:1} in
+				[0-9A-F.])	d=$d${s:i:1}; i=$(( i + 1 )) ;;
+				'\')	if [ "${s:i+1:1}" = $'\n' ]; then i=$(( i + 2 )); continue; fi
+					break ;;
+				*)	break ;;
+				esac
+			done
+			tk+=(N); tv+=("$d"); continue ;;
+		[a-z_])	d=
+			while [ "$i" -lt "$n" ]; do
+				case ${s:i:1} in
+				[a-z0-9_])	d=$d${s:i:1}; i=$(( i + 1 )) ;;
+				*)		break ;;
+				esac
+			done
+			tk+=(I); tv+=("$d"); continue ;;
+		$'\n')	tk+=(O); tv+=($'\n'); i=$(( i + 1 )); continue ;;
+		esac
+		case ${s:i:2} in
+		'=='|'!='|'<='|'>='|'&&'|'||'|'++'|'--'|'+='|'-='|'*='|'/='|'%='|'^=')
+			tk+=(O); tv+=("${s:i:2}"); i=$(( i + 2 )); continue ;;
+		esac
+		tk+=(O); tv+=("$c")
+		i=$(( i + 1 ))
+	done
+	tk+=(O); tv+=('')
+	return 0
+}
+
+# Is the token at `tp` the operator $1?
+_bt_bc_is() {
+	[ "${tk[tp]}" = O ] && [ "${tv[tp]}" = "$1" ]
+	return $?
+}
+
+# Is the token at `tp` the word $1?
+_bt_bc_isw() {
+	[ "${tk[tp]}" = I ] && [ "${tv[tp]}" = "$1" ]
+	return $?
+}
+
+# Step over any newlines.
+_bt_bc_skipnl() {
+	while _bt_bc_is $'\n'; do tp=$(( tp + 1 )); done
+	return 0
+}
+
+# Read a number written in base `ibase`, into _bc_num.
+_bt_bc_innum() {
+	local t=$1 ip fp i d v
+	if [ "$ibase" = 10 ]; then
+		case $t in
+		.*)	t=0$t ;;
+		esac
+		case $t in
+		*.)	t=${t}0 ;;
+		esac
+		_bc_num=$t
+		return 0
+	fi
+	case $t in
+	*.*)	ip=${t%%.*}; fp=${t#*.} ;;
+	*)	ip=$t; fp= ;;
+	esac
+	v=0
+	for (( i = 0; i < ${#ip}; i++ )); do
+		d=${ip:i:1}
+		case $d in
+		[A-F])	_bt_bc_hex "$d"; d=$_bc_i ;;
+		esac
+		_bt_bc_mul "$v" "$ibase"
+		_bt_bc_add "$_bc_num" "$d"
+		v=$_bc_num
+	done
+	if [ -n "$fp" ]; then
+		local den=1 num=0
+		for (( i = 0; i < ${#fp}; i++ )); do
+			d=${fp:i:1}
+			case $d in
+			[A-F])	_bt_bc_hex "$d"; d=$_bc_i ;;
+			esac
+			_bt_bc_mul "$num" "$ibase"
+			_bt_bc_add "$_bc_num" "$d"
+			num=$_bc_num
+			_bt_bc_mul "$den" "$ibase"
+			den=$_bc_num
+		done
+		local keep=$scale
+		scale=$(( ${#fp} + 2 ))
+		_bt_bc_div "$num" "$den"
+		scale=$keep
+		_bt_bc_add "$v" "$_bc_num"
+		v=$_bc_num
+	fi
+	_bc_num=$v
+	return 0
+}
+
+# The value of hex digit $1, in _bc_i.
+_bt_bc_hex() {
+	case $1 in
+	A)	_bc_i=10 ;;
+	B)	_bc_i=11 ;;
+	C)	_bc_i=12 ;;
+	D)	_bc_i=13 ;;
+	E)	_bc_i=14 ;;
+	F)	_bc_i=15 ;;
+	*)	_bc_i=$1 ;;
+	esac
+	return 0
+}
+
+# Write number $1 in base `obase`, into _bc_str.
+_bt_bc_outnum() {
+	local n=$1 sign= ip fp digits=0123456789ABCDEF out= d keep i
+	if [ "$obase" = 10 ]; then _bc_str=$n; return 0; fi
+	case $n in
+	-*)	sign=-; n=${n#-} ;;
+	esac
+	_bt_bc_split "$n"
+	ip=$_bc_int fp=$_bc_frac
+	_bt_bc_trim "$ip"; ip=$_bc_str
+	if [ "$ip" = 0 ]; then out=0; fi
+	while [ "$ip" != 0 ]; do
+		_bt_bc_idivmod "$ip" "$obase"
+		d=$_bc_rem
+		if [ "$obase" -le 16 ]; then out=${digits:d:1}$out
+		else out=" $d$out"; fi
+		_bt_bc_trim "$_bc_str"; ip=$_bc_str
+	done
+	if [ -n "$fp" ]; then
+		out=$out.
+		local v=0.$fp
+		for (( i = 0; i < scale; i++ )); do
+			keep=$scale
+			scale=$(( ${#fp} + 2 ))
+			_bt_bc_mul "$v" "$obase"
+			scale=$keep
+			_bt_bc_split "$_bc_num"
+			d=$_bc_int
+			_bt_bc_trim "$d"; d=$_bc_str
+			if [ "$obase" -le 16 ]; then out=$out${digits:d:1}
+			else out="$out $d"; fi
+			v=0.$_bc_frac
+			case $_bc_frac in
+			*[1-9]*)	;;
+			*)		break ;;
+			esac
+		done
+	fi
+	_bc_str=$sign$out
+	return 0
+}
+
+# --- the evaluator ----------------------------------------------------------
+# One recursive descent over the token array, evaluating as it goes.  `tp` is
+# where it has got to; `ctl` says whether a break or a return is on its way out.
+
+# expression -> _bc_num
+_bt_bc_expr() {
+	_bt_bc_assign
+	return 0
+}
+
+_bt_bc_assign() {
+	local name idx save op
+	# an assignment is a name, possibly subscripted, then = or an op=
+	if [ "${tk[tp]}" = I ]; then
+		case ${tv[tp]} in
+		define|if|while|for|break|continue|return|quit|halt|print|auto|else)	;;
+		length|sqrt|scale|read)	;;
+		*)	save=$tp
+			name=${tv[tp]}
+			tp=$(( tp + 1 ))
+			idx=
+			if _bt_bc_is '['; then
+				tp=$(( tp + 1 ))
+				_bt_bc_expr
+				idx=$_bc_num
+				_bt_bc_is ']' && tp=$(( tp + 1 ))
+			fi
+			if [ "${tk[tp]}" = O ]; then
+				case ${tv[tp]} in
+				'='|'+='|'-='|'*='|'/='|'%='|'^=')
+					op=${tv[tp]}
+					tp=$(( tp + 1 ))
+					_bt_bc_assign
+					_bt_bc_store "$name" "$idx" "$op" "$_bc_num"
+					_bc_wasassign=1
+					return 0 ;;
+				esac
+			fi
+			tp=$save ;;
+		esac
+	fi
+	case ${tv[tp]}:${tk[tp]} in
+	ibase:I|obase:I|scale:I|last:I)
+		save=$tp
+		name=${tv[tp]}
+		tp=$(( tp + 1 ))
+		if [ "${tk[tp]}" = O ]; then
+			case ${tv[tp]} in
+			'='|'+='|'-='|'*='|'/='|'%='|'^=')
+				op=${tv[tp]}
+				tp=$(( tp + 1 ))
+				_bt_bc_assign
+				_bt_bc_store "$name" '' "$op" "$_bc_num"
+				_bc_wasassign=1
+				return 0 ;;
+			esac
+		fi
+		tp=$save ;;
+	esac
+	_bt_bc_or
+	return 0
+}
+
+# Put $4 into the name $1 (subscript $2) the way operator $3 says.
+_bt_bc_store() {
+	local name=$1 idx=$2 op=$3 val=$4 old
+	if [ "$op" != '=' ]; then
+		_bt_bc_load "$name" "$idx"
+		old=$_bc_num
+		case $op in
+		'+=')	_bt_bc_add "$old" "$val" ;;
+		'-=')	_bt_bc_sub "$old" "$val" ;;
+		'*=')	_bt_bc_mul "$old" "$val" ;;
+		'/=')	_bt_bc_div "$old" "$val" ;;
+		'%=')	_bt_bc_mod "$old" "$val" ;;
+		'^=')	_bt_bc_pow "$old" "$val" ;;
+		esac
+		val=$_bc_num
+	fi
+	case $name in
+	scale|ibase|obase)
+		_bt_bc_split "$val"
+		_bt_bc_trim "$_bc_int"
+		case $name in
+		scale)	scale=$(( 10#$_bc_str )) ;;
+		ibase)	ibase=$(( 10#$_bc_str )) ;;
+		obase)	obase=$(( 10#$_bc_str )) ;;
+		esac
+		_bc_num=$val
+		return 0 ;;
+	last)	last=$val; _bc_num=$val; return 0 ;;
+	esac
+	if [ -n "$idx" ]; then
+		_bt_bc_split "$idx"
+		_bt_bc_trim "$_bc_int"
+		_bc_arr[$name,$(( 10#$_bc_str ))]=$val
+	else
+		_bc_var[$name]=$val
+	fi
+	_bc_num=$val
+	return 0
+}
+
+# The value of name $1 (subscript $2), into _bc_num.
+_bt_bc_load() {
+	local name=$1 idx=$2
+	case $name in
+	scale)	_bc_num=$scale; return 0 ;;
+	ibase)	_bc_num=$ibase; return 0 ;;
+	obase)	_bc_num=$obase; return 0 ;;
+	last)	_bc_num=$last; return 0 ;;
+	esac
+	if [ -n "$idx" ]; then
+		_bt_bc_split "$idx"
+		_bt_bc_trim "$_bc_int"
+		_bc_num=${_bc_arr[$name,$(( 10#$_bc_str ))]-0}
+	else
+		_bc_num=${_bc_var[$name]-0}
+	fi
+	return 0
+}
+
+_bt_bc_or() {
+	local a
+	_bt_bc_and
+	while _bt_bc_is '||'; do
+		a=$_bc_num
+		tp=$(( tp + 1 ))
+		_bt_bc_and
+		if _bt_bc_true "$a" || _bt_bc_true "$_bc_num"; then _bc_num=1; else _bc_num=0; fi
+	done
+	return 0
+}
+
+_bt_bc_and() {
+	local a
+	_bt_bc_not
+	while _bt_bc_is '&&'; do
+		a=$_bc_num
+		tp=$(( tp + 1 ))
+		_bt_bc_not
+		if _bt_bc_true "$a" && _bt_bc_true "$_bc_num"; then _bc_num=1; else _bc_num=0; fi
+	done
+	return 0
+}
+
+_bt_bc_not() {
+	if _bt_bc_is '!'; then
+		tp=$(( tp + 1 ))
+		_bt_bc_not
+		if _bt_bc_true "$_bc_num"; then _bc_num=0; else _bc_num=1; fi
+		return 0
+	fi
+	_bt_bc_rel
+	return 0
+}
+
+# Is $1 anything other than zero?
+_bt_bc_true() {
+	local n=$1
+	_bt_bc_split "$n"
+	_bt_bc_trim "$_bc_int$_bc_frac"
+	[ "$_bc_str" != 0 ]
+	return $?
+}
+
+_bt_bc_rel() {
+	local a op
+	_bt_bc_addsub
+	while :; do
+		if [ "${tk[tp]}" != O ]; then break; fi
+		case ${tv[tp]} in
+		'<'|'<='|'>'|'>='|'=='|'!=')	op=${tv[tp]} ;;
+		*)				break ;;
+		esac
+		a=$_bc_num
+		tp=$(( tp + 1 ))
+		_bt_bc_addsub
+		_bt_bc_cmp "$a" "$_bc_num"
+		case $op in
+		'<')	[ "$_bc_i" -lt 0 ] && _bc_num=1 || _bc_num=0 ;;
+		'<=')	[ "$_bc_i" -le 0 ] && _bc_num=1 || _bc_num=0 ;;
+		'>')	[ "$_bc_i" -gt 0 ] && _bc_num=1 || _bc_num=0 ;;
+		'>=')	[ "$_bc_i" -ge 0 ] && _bc_num=1 || _bc_num=0 ;;
+		'==')	[ "$_bc_i" = 0 ] && _bc_num=1 || _bc_num=0 ;;
+		'!=')	[ "$_bc_i" != 0 ] && _bc_num=1 || _bc_num=0 ;;
+		esac
+	done
+	return 0
+}
+
+_bt_bc_addsub() {
+	local a op
+	_bt_bc_muldiv
+	while :; do
+		if [ "${tk[tp]}" != O ]; then break; fi
+		case ${tv[tp]} in
+		'+'|'-')	op=${tv[tp]} ;;
+		*)		break ;;
+		esac
+		a=$_bc_num
+		tp=$(( tp + 1 ))
+		_bt_bc_muldiv
+		if [ "$op" = '+' ]; then _bt_bc_add "$a" "$_bc_num"
+		else _bt_bc_sub "$a" "$_bc_num"; fi
+	done
+	return 0
+}
+
+_bt_bc_muldiv() {
+	local a op
+	_bt_bc_unary
+	while :; do
+		if [ "${tk[tp]}" != O ]; then break; fi
+		case ${tv[tp]} in
+		'*'|'/'|'%')	op=${tv[tp]} ;;
+		*)		break ;;
+		esac
+		a=$_bc_num
+		tp=$(( tp + 1 ))
+		_bt_bc_unary
+		case $op in
+		'*')	_bt_bc_mul "$a" "$_bc_num" ;;
+		'/')	_bt_bc_div "$a" "$_bc_num" || return 1 ;;
+		'%')	_bt_bc_mod "$a" "$_bc_num" || return 1 ;;
+		esac
+	done
+	return 0
+}
+
+# A minus sign binds tighter than ^ here, so -2^2 is (-2)^2, which is 4, and ^
+# leans to the right, so 2^3^2 is 2^9.
+_bt_bc_unary() {
+	local neg=0 a
+	while [ "${tk[tp]}" = O ] && { [ "${tv[tp]}" = '-' ] || [ "${tv[tp]}" = '+' ]; }; do
+		[ "${tv[tp]}" = '-' ] && neg=$(( 1 - neg ))
+		tp=$(( tp + 1 ))
+	done
+	_bt_bc_postfix
+	if [ "$neg" = 1 ]; then _bt_bc_sub 0 "$_bc_num"; fi
+	if _bt_bc_is '^'; then
+		a=$_bc_num
+		tp=$(( tp + 1 ))
+		_bt_bc_unary
+		_bt_bc_pow "$a" "$_bc_num"
+	fi
+	return 0
+}
+
+_bt_bc_postfix() {
+	local name idx save
+	# ++x and --x change the value before it is used
+	if _bt_bc_is '++' || _bt_bc_is '--'; then
+		local op=${tv[tp]}
+		tp=$(( tp + 1 ))
+		name=${tv[tp]}
+		tp=$(( tp + 1 ))
+		idx=
+		if _bt_bc_is '['; then
+			tp=$(( tp + 1 )); _bt_bc_expr; idx=$_bc_num
+			_bt_bc_is ']' && tp=$(( tp + 1 ))
+		fi
+		if [ "$op" = '++' ]; then _bt_bc_store "$name" "$idx" '+=' 1
+		else _bt_bc_store "$name" "$idx" '-=' 1; fi
+		return 0
+	fi
+	_bt_bc_primary
+	# x++ and x-- change it afterwards
+	if [ "${tk[tp]}" = O ] && { [ "${tv[tp]}" = '++' ] || [ "${tv[tp]}" = '--' ]; } &&
+	   [ -n "$_bc_lastname" ]; then
+		local op=${tv[tp]} was=$_bc_num
+		tp=$(( tp + 1 ))
+		if [ "$op" = '++' ]; then _bt_bc_store "$_bc_lastname" "$_bc_lastidx" '+=' 1
+		else _bt_bc_store "$_bc_lastname" "$_bc_lastidx" '-=' 1; fi
+		_bc_num=$was
+	fi
+	return 0
+}
+
+_bt_bc_primary() {
+	local name idx t
+	_bc_lastname= _bc_lastidx=
+	case ${tk[tp]} in
+	N)	t=${tv[tp]}
+		tp=$(( tp + 1 ))
+		_bt_bc_innum "$t"
+		return 0 ;;
+	I)	name=${tv[tp]}
+		case $name in
+		scale)	# scale is a variable as well as a function, and which
+			# it is depends on whether a bracket follows
+			if [ "${tk[tp+1]}" != O ] || [ "${tv[tp+1]}" != '(' ]; then
+				tp=$(( tp + 1 ))
+				_bc_lastname=$name
+				_bt_bc_load "$name" ''
+				return 0
+			fi ;;
+		esac
+		case $name in
+		length|sqrt|scale)
+			tp=$(( tp + 1 ))
+			_bt_bc_is '(' && tp=$(( tp + 1 ))
+			_bt_bc_expr
+			t=$_bc_num
+			_bt_bc_is ')' && tp=$(( tp + 1 ))
+			case $name in
+			length)	_bt_bc_split "$t"
+				_bt_bc_trim "$_bc_int"
+				if [ "$_bc_str" = 0 ] && [ -n "$_bc_frac" ]; then
+					_bc_num=${#_bc_frac}
+				else
+					_bc_num=$(( ${#_bc_str} + ${#_bc_frac} ))
+				fi ;;
+			scale)	_bt_bc_scale "$t"; _bc_num=$_bc_i ;;
+			sqrt)	_bt_bc_sqrt "$t" || return 1 ;;
+			esac
+			return 0 ;;
+		read)	tp=$(( tp + 1 ))
+			_bt_bc_is '(' && tp=$(( tp + 1 ))
+			_bt_bc_is ')' && tp=$(( tp + 1 ))
+			_bc_num=0
+			return 0 ;;
+		esac
+		tp=$(( tp + 1 ))
+		if _bt_bc_is '('; then
+			_bt_bc_call "$name"
+			return 0
+		fi
+		idx=
+		if _bt_bc_is '['; then
+			tp=$(( tp + 1 ))
+			_bt_bc_expr
+			idx=$_bc_num
+			_bt_bc_is ']' && tp=$(( tp + 1 ))
+		fi
+		_bc_lastname=$name _bc_lastidx=$idx
+		_bt_bc_load "$name" "$idx"
+		return 0 ;;
+	O)	if _bt_bc_is '('; then
+			tp=$(( tp + 1 ))
+			_bt_bc_expr
+			_bt_bc_is ')' && tp=$(( tp + 1 ))
+			return 0
+		fi ;;
+	esac
+	_bc_num=0
+	return 0
+}
+
+# Call function $1, the arguments still to be read from the token stream.
+_bt_bc_call() {
+	local name=$1 i n p
+	local -a args=()
+	tp=$(( tp + 1 ))
+	if ! _bt_bc_is ')'; then
+		while :; do
+			_bt_bc_expr
+			args+=("$_bc_num")
+			_bt_bc_is ',' || break
+			tp=$(( tp + 1 ))
+		done
+	fi
+	_bt_bc_is ')' && tp=$(( tp + 1 ))
+	if [ -z "${_bc_fnstart[$name]+x}" ]; then
+		_bt_bc_err "function $name is not defined"
+		_bc_num=0
+		return 1
+	fi
+	# the parameters and the autos are put back the way they were afterwards
+	local -a saved=() names=()
+	# shellcheck disable=SC2206
+	local -a params=(${_bc_fnparm[$name]})
+	# shellcheck disable=SC2206
+	local -a autos=(${_bc_fnauto[$name]})
+	for p in ${params[@]+"${params[@]}"} ${autos[@]+"${autos[@]}"}; do
+		names+=("$p")
+		saved+=("${_bc_var[$p]-}")
+	done
+	for (( i = 0; i < ${#params[@]}; i++ )); do
+		_bc_var[${params[i]}]=${args[i]-0}
+	done
+	for p in ${autos[@]+"${autos[@]}"}; do
+		_bc_var[$p]=0
+	done
+	# what the caller was in the middle of has to survive the call
+	local savetp=$tp savectl=$ctl saveret=$_bc_ret saveass=$_bc_wasassign
+	tp=${_bc_fnstart[$name]}
+	ctl=
+	_bc_ret=0
+	_bt_bc_statements "${_bc_fnend[$name]}"
+	tp=$savetp
+	for (( i = 0; i < ${#names[@]}; i++ )); do
+		if [ -n "${saved[i]}" ]; then
+			_bc_var[${names[i]}]=${saved[i]}
+		else
+			unset "_bc_var[${names[i]}]"
+		fi
+	done
+	ctl=$savectl
+	_bc_num=$_bc_ret
+	_bc_ret=$saveret
+	_bc_wasassign=$saveass
+	return 0
+}
+
+# Run statements until the token at `tp` reaches $1.
+_bt_bc_statements() {
+	local stop=$1 before
+	while [ "$tp" -lt "$stop" ]; do
+		_bt_bc_skipnl
+		[ "$tp" -ge "$stop" ] && break
+		# the empty token at the end is the end of the input
+		[ "${tk[tp]}" = O ] && [ -z "${tv[tp]}" ] && break
+		if [ "$_bc_quitat" -ge 0 ] && [ "$tp" -ge "$_bc_quitat" ]; then
+			ctl=quit
+			return 0
+		fi
+		if _bt_bc_is ';'; then tp=$(( tp + 1 )); continue; fi
+		if _bt_bc_is '}'; then break; fi
+		before=$tp
+		_bt_bc_statement
+		[ -n "$ctl" ] && return 0
+		# nothing should stand still, but if it does, move on rather than
+		# going round for ever
+		[ "$tp" = "$before" ] && tp=$(( tp + 1 ))
+	done
+	return 0
+}
+
+# One statement.
+_bt_bc_statement() {
+	local n body start depth
+	if [ "${tk[tp]}" = S ]; then
+		printf '%s' "${tv[tp]}"
+		tp=$(( tp + 1 ))
+		return 0
+	fi
+	if _bt_bc_is '{'; then
+		tp=$(( tp + 1 ))
+		_bt_bc_statements "${#tk[@]}"
+		_bt_bc_is '}' && tp=$(( tp + 1 ))
+		return 0
+	fi
+	if [ "${tk[tp]}" = I ]; then
+		case ${tv[tp]} in
+		quit|halt)	tp=$(( tp + 1 )); ctl=quit; return 0 ;;
+		break)		tp=$(( tp + 1 )); ctl=break; return 0 ;;
+		continue)	tp=$(( tp + 1 )); ctl=continue; return 0 ;;
+		return)		tp=$(( tp + 1 ))
+				if _bt_bc_is ';' || _bt_bc_is $'\n' || _bt_bc_is '}' ||
+				   [ -z "${tv[tp]}${tk[tp]}" ]; then
+					_bc_ret=0
+				else
+					_bt_bc_expr
+					_bc_ret=$_bc_num
+				fi
+				ctl=return
+				return 0 ;;
+		print)		tp=$(( tp + 1 ))
+				while :; do
+					if [ "${tk[tp]}" = S ]; then
+						printf '%s' "${tv[tp]}"
+						tp=$(( tp + 1 ))
+					else
+						_bt_bc_expr
+						_bt_bc_outnum "$_bc_num"
+						printf '%s' "$_bc_str"
+					fi
+					_bt_bc_is ',' || break
+					tp=$(( tp + 1 ))
+				done
+				return 0 ;;
+		if)		_bt_bc_if; return 0 ;;
+		while)		_bt_bc_while; return 0 ;;
+		for)		_bt_bc_for; return 0 ;;
+		define)		_bt_bc_define; return 0 ;;
+		esac
+	fi
+	_bc_wasassign=0
+	_bt_bc_expr
+	if [ "$_bc_wasassign" = 0 ]; then
+		last=$_bc_num
+		_bt_bc_outnum "$_bc_num"
+		_bt_bc_write "$_bc_str"
+	fi
+	return 0
+}
+
+# Write $1, folded at 70 characters the way bc folds it.
+_bt_bc_write() {
+	local s=$1
+	while [ "${#s}" -gt 69 ]; do
+		printf '%s\\\n' "${s:0:69}"
+		s=${s:69}
+	done
+	printf '%s\n' "$s"
+	return 0
+}
+
+_bt_bc_if() {
+	local truth
+	tp=$(( tp + 1 ))
+	_bt_bc_is '(' && tp=$(( tp + 1 ))
+	_bt_bc_expr
+	truth=$_bc_num
+	_bt_bc_is ')' && tp=$(( tp + 1 ))
+	_bt_bc_skipnl
+	if _bt_bc_true "$truth"; then
+		_bt_bc_statement
+		_bt_bc_skipelse 1
+	else
+		_bt_bc_skipstatement
+		_bt_bc_skipelse 0
+	fi
+	return 0
+}
+
+# Deal with an else that may follow: run it if $1 is 0, step over it if not.
+_bt_bc_skipelse() {
+	local save=$tp
+	_bt_bc_skipnl
+	if _bt_bc_isw else; then
+		tp=$(( tp + 1 ))
+		_bt_bc_skipnl
+		if [ "$1" = 0 ]; then
+			_bt_bc_statement
+		else
+			_bt_bc_skipstatement
+		fi
+		return 0
+	fi
+	tp=$save
+	return 0
+}
+
+# Step over a statement without running it.
+_bt_bc_skipstatement() {
+	local depth=0
+	if _bt_bc_is '{'; then
+		depth=0
+		while [ "$tp" -lt "${#tk[@]}" ]; do
+			if _bt_bc_is '{'; then depth=$(( depth + 1 )); fi
+			if _bt_bc_is '}'; then
+				depth=$(( depth - 1 ))
+				tp=$(( tp + 1 ))
+				[ "$depth" = 0 ] && return 0
+				continue
+			fi
+			tp=$(( tp + 1 ))
+		done
+		return 0
+	fi
+	if [ "${tk[tp]}" = I ]; then
+		case ${tv[tp]} in
+		if|while|for)
+			tp=$(( tp + 1 ))
+			if _bt_bc_is '('; then
+				depth=0
+				while [ "$tp" -lt "${#tk[@]}" ]; do
+					_bt_bc_is '(' && depth=$(( depth + 1 ))
+					if _bt_bc_is ')'; then
+						depth=$(( depth - 1 ))
+						tp=$(( tp + 1 ))
+						[ "$depth" = 0 ] && break
+						continue
+					fi
+					tp=$(( tp + 1 ))
+				done
+			fi
+			_bt_bc_skipnl
+			_bt_bc_skipstatement
+			_bt_bc_skipelse 1
+			return 0 ;;
+		esac
+	fi
+	while [ "$tp" -lt "${#tk[@]}" ]; do
+		if _bt_bc_is ';' || _bt_bc_is $'\n'; then tp=$(( tp + 1 )); return 0; fi
+		if _bt_bc_is '}'; then return 0; fi
+		_bt_bc_isw else && return 0
+		[ -z "${tv[tp]}" ] && [ "${tk[tp]}" = O ] && return 0
+		tp=$(( tp + 1 ))
+	done
+	return 0
+}
+
+# Step over an expression without running it.
+_bt_bc_skipexpr() {
+	local depth=0
+	while [ "$tp" -lt "${#tk[@]}" ]; do
+		if [ "${tk[tp]}" != O ]; then tp=$(( tp + 1 )); continue; fi
+		case ${tv[tp]} in
+		'(')	depth=$(( depth + 1 )) ;;
+		')')	[ "$depth" = 0 ] && return 0
+			depth=$(( depth - 1 )) ;;
+		';')	[ "$depth" = 0 ] && return 0 ;;
+		'')	return 0 ;;
+		esac
+		tp=$(( tp + 1 ))
+	done
+	return 0
+}
+
+_bt_bc_while() {
+	local condstart bodystart
+	tp=$(( tp + 1 ))
+	_bt_bc_is '(' && tp=$(( tp + 1 ))
+	condstart=$tp
+	while :; do
+		tp=$condstart
+		_bt_bc_expr
+		_bt_bc_is ')' && tp=$(( tp + 1 ))
+		_bt_bc_skipnl
+		bodystart=$tp
+		if ! _bt_bc_true "$_bc_num"; then
+			_bt_bc_skipstatement
+			return 0
+		fi
+		_bt_bc_statement
+		if [ "$ctl" = break ]; then ctl=; tp=$bodystart; _bt_bc_skipstatement; return 0; fi
+		if [ "$ctl" = continue ]; then ctl=; fi
+		[ -n "$ctl" ] && return 0
+	done
+	return 0
+}
+
+_bt_bc_for() {
+	local condstart incstart bodystart cond
+	tp=$(( tp + 1 ))
+	_bt_bc_is '(' && tp=$(( tp + 1 ))
+	_bt_bc_expr
+	_bt_bc_is ';' && tp=$(( tp + 1 ))
+	condstart=$tp
+	while :; do
+		tp=$condstart
+		_bt_bc_expr
+		cond=$_bc_num
+		_bt_bc_is ';' && tp=$(( tp + 1 ))
+		# the increment belongs after the body, so step over it for now
+		incstart=$tp
+		_bt_bc_skipexpr
+		_bt_bc_is ')' && tp=$(( tp + 1 ))
+		_bt_bc_skipnl
+		bodystart=$tp
+		if ! _bt_bc_true "$cond"; then
+			_bt_bc_skipstatement
+			return 0
+		fi
+		_bt_bc_statement
+		if [ "$ctl" = break ]; then
+			ctl=
+			tp=$bodystart
+			_bt_bc_skipstatement
+			return 0
+		fi
+		[ "$ctl" = continue ] && ctl=
+		[ -n "$ctl" ] && return 0
+		tp=$incstart
+		_bt_bc_expr
+	done
+	return 0
+}
+
+_bt_bc_define() {
+	local name depth start
+	local -a params=() autos=()
+	tp=$(( tp + 1 ))
+	name=${tv[tp]}
+	tp=$(( tp + 1 ))
+	_bt_bc_is '(' && tp=$(( tp + 1 ))
+	while ! _bt_bc_is ')' && [ "$tp" -lt "${#tk[@]}" ]; do
+		if [ "${tk[tp]}" = I ]; then params+=("${tv[tp]}"); fi
+		tp=$(( tp + 1 ))
+	done
+	_bt_bc_is ')' && tp=$(( tp + 1 ))
+	_bt_bc_skipnl
+	_bt_bc_is '{' && tp=$(( tp + 1 ))
+	_bt_bc_skipnl
+	if _bt_bc_isw auto; then
+		tp=$(( tp + 1 ))
+		while ! _bt_bc_is ';' && ! _bt_bc_is $'\n' && [ "$tp" -lt "${#tk[@]}" ]; do
+			if [ "${tk[tp]}" = I ]; then autos+=("${tv[tp]}"); fi
+			tp=$(( tp + 1 ))
+		done
+		tp=$(( tp + 1 ))
+	fi
+	start=$tp
+	depth=1
+	while [ "$tp" -lt "${#tk[@]}" ]; do
+		if _bt_bc_is '{'; then depth=$(( depth + 1 )); fi
+		if _bt_bc_is '}'; then
+			depth=$(( depth - 1 ))
+			[ "$depth" = 0 ] && break
+		fi
+		tp=$(( tp + 1 ))
+	done
+	_bc_fnstart[$name]=$start
+	_bc_fnend[$name]=$tp
+	_bc_fnparm[$name]=${params[*]}
+	_bc_fnauto[$name]=${autos[*]}
+	tp=$(( tp + 1 ))
+	return 0
+}
+
+_bt_bc_err() {
+	printf 'bc: %s\n' "$*" >&2
+	return 0
+}
+
+bc () {
+	local LC_ALL=C
+	local arg opt mathlib=0 file text= line fd status=0
+	local scale=0 ibase=10 obase=10 last=0 tp=0 ctl= _bc_ret=0
+	local _bc_num _bc_str _bc_sign _bc_int _bc_frac _bc_i _bc_rem
+	local _bc_a _bc_b _bc_sc _bc_sa _bc_sb _bc_wasassign=0
+	local _bc_lastname= _bc_lastidx= _bc_quitat=-1
+	local -a tk=() tv=()
+	local -A _bc_var=() _bc_arr=() _bc_fnstart=() _bc_fnend=()
+	local -A _bc_fnparm=() _bc_fnauto=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-l)	mathlib=1; shift ;;
+		-q|-s|-w)	shift ;;
+		-*)	[ "$1" = - ] && break
+			_bt_err "bc: illegal option -- ${1#-}"
+			_bt_err "usage: bc [-l] [file...]"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+
+	if [ "$mathlib" = 1 ]; then
+		scale=20
+		text=$_BT_BC_LIB
+	fi
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			line=
+			while IFS= read -r line; do text=$text$line$'\n'; line=; done
+			[ -n "$line" ] && text=$text$line$'\n'
+		elif { exec {fd}<"$file"; } 2>/dev/null; then
+			line=
+			while IFS= read -r line <&"$fd"; do text=$text$line$'\n'; line=; done
+			[ -n "$line" ] && text=$text$line$'\n'
+			exec {fd}<&-
+		else
+			_bt_err "bc: cannot open $file"
+			return 1
+		fi
+	done
+	if [ "$#" = 0 ]; then
+		line=
+		while IFS= read -r line; do text=$text$line$'\n'; line=; done
+		[ -n "$line" ] && text=$text$line$'\n'
+	fi
+
+	_bt_bc_lex "$text"
+	# quit ends things when it is read rather than when it is run, so find
+	# the line it stands on: nothing on that line ever runs
+	for (( _bc_i = 0; _bc_i < ${#tk[@]}; _bc_i++ )); do
+		[ "${tk[_bc_i]}" = I ] && [ "${tv[_bc_i]}" = quit ] || continue
+		_bc_quitat=$_bc_i
+		while [ "$_bc_quitat" -gt 0 ]; do
+			_bc_quitat=$(( _bc_quitat - 1 ))
+			if [ "${tk[_bc_quitat]}" = O ] && [ "${tv[_bc_quitat]}" = $'\n' ]; then
+				_bc_quitat=$(( _bc_quitat + 1 ))
+				break
+			fi
+		done
+		break
+	done
+	tp=0
+	_bt_bc_statements "${#tk[@]}"
+	[ "$ctl" = quit ] && return 0
+	return "$status"
+}
+
+# The library -l asks for, written in bc itself and read by the same parser as
+# anything else.  Every one of them works to more digits than it shows and cuts
+# the answer down at the end, which is what bc does.
+_BT_BC_LIB='
+scale = 20
+define e(x) {
+	auto s, n, t, i, k
+	s = scale
+	scale = s + 10
+	k = 0
+	while (x > 1) { x = x / 2; k = k + 1 }
+	while (x < -1) { x = x / 2; k = k + 1 }
+	t = 1
+	n = 1
+	i = 1
+	while (1) {
+		n = n * x / i
+		if (n == 0) break
+		t = t + n
+		i = i + 1
+	}
+	while (k > 0) { t = t * t; k = k - 1 }
+	scale = s
+	return (t / 1)
+}
+define _atanh1(y) {
+	auto z, t, n, i
+	z = y * y
+	t = y
+	n = y
+	i = 1
+	while (1) {
+		n = n * z
+		i = i + 2
+		if (n / i == 0) break
+		t = t + n / i
+	}
+	return (t)
+}
+define _ln2() {
+	auto s, t
+	s = scale
+	if (_ln2_s >= s) return (_ln2_v / 1)
+	scale = s + 5
+	t = 2 * _atanh1(1/3)
+	_ln2_v = t
+	_ln2_s = s
+	scale = s
+	return (t / 1)
+}
+define l(x) {
+	auto s, k, t, l2
+	if (x <= 0) return (0)
+	s = scale
+	scale = s + 10
+	k = 0
+	while (x > 2) { x = x / 2; k = k + 1 }
+	while (x < 0.5) { x = x * 2; k = k - 1 }
+	t = 2 * _atanh1((x - 1) / (x + 1))
+	l2 = _ln2()
+	t = t + k * l2
+	scale = s
+	return (t / 1)
+}
+define a(x) {
+	auto s, t, z, n, i, neg, k
+	s = scale
+	scale = s + 10
+	neg = 0
+	if (x < 0) { x = -x; neg = 1 }
+	k = 0
+	while (x > 0.2) {
+		x = x / (1 + sqrt(1 + x * x))
+		k = k + 1
+	}
+	z = x * x
+	t = x
+	n = x
+	i = 1
+	while (1) {
+		n = -n * z
+		i = i + 2
+		if (n / i == 0) break
+		t = t + n / i
+	}
+	while (k > 0) { t = t * 2; k = k - 1 }
+	scale = s
+	if (neg) return (-t / 1)
+	return (t / 1)
+}
+define _pi() {
+	auto s, t
+	s = scale
+	if (_pi_s >= s) return (_pi_v / 1)
+	scale = s + 5
+	t = 4 * a(1)
+	_pi_v = t
+	_pi_s = s
+	scale = s
+	return (t / 1)
+}
+define s(x) {
+	auto s, t, n, i, z, p, q
+	s = scale
+	scale = s + 10
+	p = _pi()
+	q = x / (2 * p)
+	scale = 0
+	q = q / 1
+	scale = s + 10
+	x = x - q * 2 * p
+	z = x * x
+	t = x
+	n = x
+	i = 1
+	while (1) {
+		n = -n * z / ((i + 1) * (i + 2))
+		i = i + 2
+		if (n == 0) break
+		t = t + n
+	}
+	scale = s
+	return (t / 1)
+}
+define c(x) {
+	auto s, t, n, i, z, p, q
+	s = scale
+	scale = s + 10
+	p = _pi()
+	q = x / (2 * p)
+	scale = 0
+	q = q / 1
+	scale = s + 10
+	x = x - q * 2 * p
+	z = x * x
+	t = 1
+	n = 1
+	i = 0
+	while (1) {
+		n = -n * z / ((i + 1) * (i + 2))
+		i = i + 2
+		if (n == 0) break
+		t = t + n
+	}
+	scale = s
+	return (t / 1)
+}
+define j(n, x) {
+	auto s, t, k, term, num, den, i, sign
+	s = scale
+	scale = s + 10
+	if (n < 0) { n = -n; sign = n % 2 } 
+	t = 0
+	k = 0
+	while (1) {
+		num = 1
+		for (i = 0; i < 2 * k + n; i++) num = num * (x / 2)
+		den = 1
+		for (i = 2; i <= k; i++) den = den * i
+		for (i = 2; i <= k + n; i++) den = den * i
+		term = num / den
+		if (k % 2 == 1) term = -term
+		if (term == 0) break
+		t = t + term
+		k = k + 1
+		if (k > 40) break
+	}
+	scale = s
+	return (t / 1)
+}
+'
+
+
+# ---------------------------------------------------------------------------
+# make -- POSIX.1-2017:
+#	make [-eiknpqrSst] [-f makefile]... [-j maxjobs] [macro=value]...
+#	     [target_name...]
+#
+# Whether a target is out of date is settled with the shell's own -nt test,
+# which is the one thing about make that a shell can answer directly.  The
+# commands themselves are handed to a subshell, which is what make is for.
+# ---------------------------------------------------------------------------
+
+# Expand the macros in $1, into _bt_str.
+_bt_make_expand() {
+	local s=$1 out= i n c name rest pat sub v
+	n=${#1}
+	i=0
+	while [ "$i" -lt "$n" ]; do
+		c=${s:i:1}
+		if [ "$c" != '$' ]; then
+			out=$out$c
+			i=$(( i + 1 ))
+			continue
+		fi
+		i=$(( i + 1 ))
+		c=${s:i:1}
+		case $c in
+		'$')	out=$out'$'; i=$(( i + 1 )); continue ;;
+		'('|'{')
+			local close=')'
+			[ "$c" = '{' ] && close='}'
+			i=$(( i + 1 ))
+			name=
+			local depth=1
+			while [ "$i" -lt "$n" ]; do
+				c=${s:i:1}
+				[ "$c" = "$close" ] && { depth=$(( depth - 1 )); [ "$depth" = 0 ] && break; }
+				[ "$c" = '(' ] || [ "$c" = '{' ] && depth=$(( depth + 1 ))
+				name=$name$c
+				i=$(( i + 1 ))
+			done
+			i=$(( i + 1 ))
+			case $name in
+			*:*=*)	pat=${name#*:}
+				sub=${pat#*=}
+				pat=${pat%%=*}
+				name=${name%%:*}
+				_bt_make_value "$name"
+				v=
+				for c in $_bt_str; do
+					case $c in
+					*"$pat")	v="$v ${c%"$pat"}$sub" ;;
+					*)		v="$v $c" ;;
+					esac
+				done
+				out=$out${v# }
+				continue ;;
+			esac
+			_bt_make_value "$name"
+			out=$out$_bt_str
+			continue ;;
+		'')	out=$out'$'; continue ;;
+		*)	_bt_make_value "$c"
+			out=$out$_bt_str
+			i=$(( i + 1 ))
+			continue ;;
+		esac
+	done
+	_bt_str=$out
+	return 0
+}
+
+# The value of macro $1, expanded, into _bt_str.
+_bt_make_value() {
+	local name=$1 v
+	case $name in
+	@|'<'|'*'|'?'|'%')	_bt_str=${_mk_int[$name]-}; return 0 ;;
+	esac
+	# what was given on the command line wins over everything; -e puts the
+	# environment above the makefile, and without it below
+	local fromenv=
+	case $name in
+	[A-Za-z_]*)	case $name in
+			*[!A-Za-z0-9_]*)	;;
+			*)			fromenv=${!name+set} ;;
+			esac ;;
+	esac
+	if [ -n "${_mk_ovr[$name]+x}" ]; then v=${_mk_ovr[$name]}
+	elif [ "$useenv" = 1 ] && [ -n "$fromenv" ]; then v=${!name}
+	elif [ -n "${_mk_mac[$name]+x}" ]; then v=${_mk_mac[$name]}
+	elif [ -n "$fromenv" ]; then v=${!name}
+	else _bt_str=; return 0
+	fi
+	case $v in
+	*'$'*)	_bt_make_expand "$v" ;;
+	*)	_bt_str=$v ;;
+	esac
+	return 0
+}
+
+# Read makefile $1 into the macro and rule tables.
+_bt_make_read() {
+	local fd line cont= target prereqs cmd t i
+	local -a targets=()
+	if ! { exec {fd}<"$1"; } 2>/dev/null; then
+		return 1
+	fi
+	targets=()
+	while IFS= read -r line || [ -n "$line" ]; do
+		# a line ending in a backslash carries on
+		while [ "${line%\\}" != "$line" ]; do
+			line=${line%\\}
+			IFS= read -r cont <&"$fd" || break
+			case $line in
+			$'\t'*)	line=$line$cont ;;
+			*)	cont=${cont#"${cont%%[! 	]*}"}
+				line="$line $cont" ;;
+			esac
+		done
+		case $line in
+		$'\t'*)	# a command line belongs to whatever was named last
+			if [ "${#targets[@]}" -gt 0 ]; then
+				for t in "${targets[@]}"; do
+					if [ -n "${_mk_cmd[$t]+x}" ]; then
+						_mk_cmd[$t]=${_mk_cmd[$t]}$'\n'${line#?}
+					else
+						_mk_cmd[$t]=${line#?}
+					fi
+				done
+			fi
+			line=
+			continue ;;
+		esac
+		# comments and blank lines say nothing
+		case $line in
+		'#'*)	line=; continue ;;
+		esac
+		line=${line%%[ 	]#*}
+		case $line in
+		'')	line=; continue ;;
+		esac
+		case $line in
+		*=*)
+			# a macro, unless a colon comes first
+			t=${line%%=*}
+			case $t in
+			*:*)	;;
+			*)	t=${t%"${t##*[! 	]}"}
+				case $t in
+				*+)	t=${t%+}
+					t=${t%"${t##*[! 	]}"}
+					cmd=${line#*=}
+					cmd=${cmd#"${cmd%%[! 	]*}"}
+					if [ -n "${_mk_mac[$t]+x}" ]; then
+						_mk_mac[$t]="${_mk_mac[$t]} $cmd"
+					else
+						_mk_mac[$t]=$cmd
+					fi ;;
+				*)	cmd=${line#*=}
+					cmd=${cmd#"${cmd%%[! 	]*}"}
+					case $t in
+					*:)	t=${t%:} ;;
+					esac
+					_mk_mac[$t]=$cmd ;;
+				esac
+				targets=()
+				line=
+				continue ;;
+			esac ;;
+		esac
+		case $line in
+		*:*)
+			target=${line%%:*}
+			prereqs=${line#*:}
+			case $prereqs in
+			=*)	prereqs=${prereqs#=} ;;
+			esac
+			cmd=
+			case $prereqs in
+			*';'*)	cmd=${prereqs#*;}; prereqs=${prereqs%%;*} ;;
+			esac
+			_bt_make_expand "$target"
+			target=$_bt_str
+			_bt_make_expand "$prereqs"
+			prereqs=$_bt_str
+			targets=()
+			for t in $target; do
+				targets+=("$t")
+				if [ -n "${_mk_pre[$t]+x}" ]; then
+					_mk_pre[$t]="${_mk_pre[$t]} $prereqs"
+				else
+					_mk_pre[$t]=$prereqs
+					_mk_order="$_mk_order $t"
+				fi
+				[ -n "$cmd" ] && _mk_cmd[$t]=${cmd#"${cmd%%[! 	]*}"}
+			done ;;
+		esac
+		line=
+	done <&"$fd"
+	exec {fd}<&-
+	return 0
+}
+
+# Give $1 a new modification time.  There is no utime() to call, so the file
+# is read into memory and written straight back: the write is what moves the
+# time.  A file that is not there yet is simply created.
+_bt_make_touch() {
+	local fd i rc
+	local _bt_buf _bt_nul
+	local -a part=() nul=()
+	if [ ! -e "$1" ]; then
+		: > "$1"
+		return $?
+	fi
+	{ exec {fd}<"$1"; } 2>/dev/null || return 1
+	while :; do
+		if _bt_read "$fd"; then rc=0; else rc=1; fi
+		part+=("$_bt_buf")
+		if [ "$rc" = 0 ] && [ "$_bt_nul" = 1 ]; then nul+=(1); else nul+=(0); fi
+		[ "$rc" = 1 ] && break
+	done
+	exec {fd}<&-
+	{
+		for (( i = 0; i < ${#part[@]}; i++ )); do
+			printf '%s' "${part[i]}"
+			[ "${nul[i]}" = 1 ] && printf '\000'
+		done
+	} > "$1"
+	return 0
+}
+
+# Write out every macro and every rule, which is what -p is for.  The layout
+# is this one's own: no two makes agree on it.
+_bt_make_print() {
+	local name t line
+	printf '# Macros\n'
+	for name in $( printf '%s\n' "${!_mk_mac[@]}" | _bt_make_sort ); do
+		printf '%s = %s\n' "$name" "${_mk_mac[$name]}"
+	done
+	for name in $( printf '%s\n' "${!_mk_ovr[@]}" | _bt_make_sort ); do
+		printf '%s = %s\n' "$name" "${_mk_ovr[$name]}"
+	done
+	printf '\n# Targets\n'
+	for t in $_mk_order; do
+		name=${_mk_pre[$t]}
+		name=${name#"${name%%[! 	]*}"}
+		printf '%s:%s\n' "$t" "${name:+ $name}"
+		if [ -n "${_mk_cmd[$t]+x}" ]; then
+			while IFS= read -r line; do
+				printf '\t%s\n' "$line"
+			done <<< "${_mk_cmd[$t]}"
+		fi
+	done
+	return 0
+}
+
+# The names in alphabetical order, since an associative array keeps none.
+_bt_make_sort() {
+	local -a names=()
+	local n
+	while IFS= read -r n; do
+		[ -n "$n" ] && names+=("$n")
+	done
+	[ "${#names[@]}" = 0 ] && return 0
+	local i j tmp
+	for (( i = 1; i < ${#names[@]}; i++ )); do
+		tmp=${names[i]}
+		j=$(( i - 1 ))
+		while [ "$j" -ge 0 ] && [[ ${names[j]} > $tmp ]]; do
+			names[j+1]=${names[j]}
+			j=$(( j - 1 ))
+		done
+		names[j+1]=$tmp
+	done
+	printf '%s\n' "${names[@]}"
+	return 0
+}
+
+# Run the commands of target $1, whose recipe is $2.
+_bt_make_run() {
+	local target=$1 body=$2 line silentline ignore rc
+	# -q asks whether anything is out of date and runs nothing
+	if [ "$question" = 1 ]; then
+		status=1
+		return 0
+	fi
+	# -t moves the target's timestamp instead of making it
+	if [ "$touchonly" = 1 ]; then
+		[ "$silent" = 1 ] || printf 'touch %s\n' "$target"
+		_bt_make_touch "$target"
+		return 0
+	fi
+	while IFS= read -r line; do
+		[ -n "$line" ] || continue
+		_bt_make_expand "$line"
+		line=$_bt_str
+		silentline=$silent
+		ignore=$ignoreerr
+		while :; do
+			case $line in
+			'@'*)	silentline=1; line=${line#?} ;;
+			'-'*)	ignore=1; line=${line#?} ;;
+			'+'*)	line=${line#?} ;;
+			*)	break ;;
+			esac
+		done
+		[ -n "$line" ] || continue
+		if [ "$dryrun" = 1 ]; then
+			printf '%s\n' "$line"
+			continue
+		fi
+		[ "$silentline" = 1 ] || printf '%s\n' "$line"
+		( eval "$line" )
+		rc=$?
+		if [ "$rc" != 0 ]; then
+			if [ "$ignore" = 1 ]; then
+				_bt_err "make: [$target] Error $rc (ignored)"
+			else
+				_bt_err "make: *** [$target] Error $rc"
+				status=2
+				return 1
+			fi
+		fi
+	done <<< "$body"
+	return 0
+}
+
+# Make target $1.  _bt_int comes back 1 when anything was done.
+_bt_make_build() {
+	local target=$1 p newer= did=0 rc=0 base suf stem src anydone=0 failed=0
+	case " $_mk_doing " in
+	*" $target "*)	_bt_int=0; return 0 ;;
+	esac
+	if [ -n "${_mk_done[$target]+x}" ]; then
+		_bt_int=${_mk_done[$target]}
+		return 0
+	fi
+	_mk_doing="$_mk_doing $target"
+	if [ -n "${_mk_pre[$target]+x}" ]; then
+		for p in ${_mk_pre[$target]}; do
+			if ! _bt_make_build "$p"; then
+				# -k means carry on with what can still be made
+				[ "$keepgoing" = 1 ] || { _mk_doing=${_mk_doing% $target}; return 1; }
+				failed=1
+				continue
+			fi
+			[ "$_bt_int" = 1 ] && anydone=1
+			if [ ! -e "$target" ] || [ "$p" -nt "$target" ] || [ "$_bt_int" = 1 ]; then
+				newer="$newer $p"
+			fi
+		done
+	fi
+	_mk_doing=${_mk_doing% $target}
+	if [ "$failed" = 1 ]; then
+		_bt_err "make: Target '$target' not remade because of errors."
+		return 1
+	fi
+
+	if [ -n "${_mk_cmd[$target]+x}" ]; then
+		if [ ! -e "$target" ] || [ -n "$newer" ] ||
+		   [ -z "${_mk_pre[$target]}" ]; then
+			_mk_int[@]=$target
+			_mk_int[?]=${newer# }
+			set -- ${_mk_pre[$target]-}
+			_mk_int[<]=${1-}
+			# the stem belongs to inference rules; a rule written out
+			# in full has none
+			_mk_int[*]=
+			_bt_make_run "$target" "${_mk_cmd[$target]}" || return 1
+			did=1
+		fi
+		_mk_done[$target]=$did
+		_bt_int=$did
+		return 0
+	fi
+
+	# no commands of its own: an inference rule may know how to make it
+	if [ -z "${_mk_pre[$target]+x}" ] || [ -z "${_mk_cmd[$target]+x}" ]; then
+		for suf in $_mk_suffixes; do
+			case $target in
+			*"$suf")	;;
+			*)		continue ;;
+			esac
+			base=${target%"$suf"}
+			for src in $_mk_suffixes; do
+				[ "$src" = "$suf" ] && continue
+				[ -n "${_mk_cmd[$src$suf]+x}" ] || continue
+				[ -e "$base$src" ] || continue
+				_bt_make_build "$base$src" || return 1
+				if [ ! -e "$target" ] || [ "$base$src" -nt "$target" ] ||
+				   [ "$_bt_int" = 1 ]; then
+					_mk_int[@]=$target
+					_mk_int[<]=$base$src
+					_mk_int[*]=$base
+					_mk_int[?]=$base$src
+					_bt_make_run "$target" "${_mk_cmd[$src$suf]}" || return 1
+					did=1
+				fi
+				_mk_done[$target]=$did
+				_bt_int=$did
+				return 0
+			done
+		done
+	fi
+
+	if [ -e "$target" ]; then
+		_mk_done[$target]=$anydone
+		_bt_int=$anydone
+		return 0
+	fi
+	if [ -n "${_mk_pre[$target]+x}" ]; then
+		# a target with prerequisites but nothing to do is just a name,
+		# though the work its prerequisites needed still counts
+		_mk_done[$target]=$anydone
+		_bt_int=$anydone
+		return 0
+	fi
+	_bt_err "make: *** No rule to make target '$target'.  Stop."
+	status=2
+	return 1
+}
+
+make () {
+	local LC_ALL=C
+	local arg opt i f line status=0 dryrun=0 silent=0 ignoreerr=0 keepgoing=0
+	local useenv=0 norules=0 question=0 touchonly=0 printdb=0
+	local first= t _bt_str _bt_int
+	local -a files=() goals=()
+	local -A _mk_mac=() _mk_ovr=() _mk_env=() _mk_pre=() _mk_cmd=() _mk_done=()
+	local -A _mk_int=()
+	local _mk_order= _mk_doing= _mk_suffixes
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-f)	shift
+			[ "$#" = 0 ] && { _bt_err "make: option requires an argument -- f"; return 2; }
+			files+=("$1"); shift ;;
+		-f*)	files+=("${1#-f}"); shift ;;
+		-*)	[ "$1" = - ] && break
+			arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				n)	dryrun=1 ;;
+				s)	silent=1 ;;
+				i)	ignoreerr=1 ;;
+				k)	keepgoing=1 ;;
+				e)	useenv=1 ;;
+				r)	norules=1 ;;
+				q)	question=1 ;;
+				t)	touchonly=1 ;;
+				p)	printdb=1 ;;
+				S|B|w)	;;
+				*)	_bt_err "make: illegal option -- $opt"
+					_bt_err "usage: make [-eiknpqrSst] [-f makefile]... [macro=value]... [target]..."
+					return 2 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	# the suffixes and rules the standard asks for, unless -r says otherwise
+	if [ "$norules" = 1 ]; then
+		_mk_suffixes=
+	else
+		_mk_suffixes='.o .c .y .l .a .sh .f'
+		_mk_mac[CC]=c99
+		_mk_mac[CFLAGS]='-O 1'
+		_mk_mac[YACC]=yacc
+		_mk_mac[LEX]=lex
+		_mk_mac[AR]=ar
+		_mk_mac[ARFLAGS]='-rv'
+		_mk_cmd['.c.o']='$(CC) $(CFLAGS) -c $<'
+		_mk_cmd['.c']='$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $<'
+		_mk_cmd['.sh']='cp $< $@'
+	fi
+
+	for arg in "$@"; do
+		case $arg in
+		*=*)	_mk_ovr[${arg%%=*}]=${arg#*=} ;;
+		*)	goals+=("$arg") ;;
+		esac
+	done
+
+	if [ "${#files[@]}" = 0 ]; then
+		for f in makefile Makefile; do
+			[ -f "$f" ] && { files=("$f"); break; }
+		done
+	fi
+	if [ "${#files[@]}" = 0 ]; then
+		_bt_err "make: *** No targets specified and no makefile found.  Stop."
+		return 2
+	fi
+	for f in "${files[@]}"; do
+		if ! _bt_make_read "$f"; then
+			_bt_err "make: $f: No such file or directory"
+			return 2
+		fi
+	done
+
+	# .SUFFIXES in the makefile replaces the list, and an empty one clears it
+	if [ -n "${_mk_pre[.SUFFIXES]+x}" ]; then
+		if [ -z "${_mk_pre[.SUFFIXES]// /}" ]; then
+			_mk_suffixes=
+		else
+			_mk_suffixes="${_mk_pre[.SUFFIXES]} $_mk_suffixes"
+		fi
+	fi
+	[ -n "${_mk_pre[.SILENT]+x}" ] && silent=1
+	[ -n "${_mk_pre[.IGNORE]+x}" ] && ignoreerr=1
+
+	[ "$printdb" = 1 ] && _bt_make_print
+
+	if [ "${#goals[@]}" = 0 ]; then
+		for t in $_mk_order; do
+			case $t in
+			.*)	continue ;;
+			esac
+			first=$t
+			break
+		done
+		[ -n "$first" ] && goals=("$first")
+	fi
+	if [ "${#goals[@]}" = 0 ]; then
+		_bt_err "make: *** No targets.  Stop."
+		return 2
+	fi
+
+	for t in "${goals[@]}"; do
+		_mk_done=()
+		if _bt_make_build "$t"; then
+			if [ "$_bt_int" = 0 ] && [ "$dryrun" = 0 ] &&
+			   [ "$question" = 0 ]; then
+				if [ -n "${_mk_cmd[$t]+x}" ] || [ -n "${_mk_pre[$t]+x}" ]; then
+					printf "make: '%s' is up to date.\n" "$t"
+				fi
+			fi
+		else
+			[ "$keepgoing" = 1 ] || return "$status"
+		fi
+	done
+	return "$status"
+}

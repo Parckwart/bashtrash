@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-72 of the 160 utilities in POSIX.1-2017, as of now.
+74 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -56,6 +56,7 @@ Run the test suite with:
 | `ar` | `ar -d\|-m\|-p\|-q\|-r\|-t\|-x [-abcisuv] [posname] archive [file...]` |
 | `asa` | `asa [file...]` |
 | `basename` | `basename string [suffix]` |
+| `bc` | `bc [-l] [file...]` |
 | `cal` | `cal [[month] year]` |
 | `cat` | `cat [-u] [file...]` |
 | `cksum` | `cksum [file...]` |
@@ -85,6 +86,7 @@ Run the test suite with:
 | `locale` | `locale [-a\|-m]` · `locale [-ck] name...` |
 | `logname` | `logname` |
 | `m4` | `m4 [-s] [-D name[=value]]... [-U name]... [file...]` |
+| `make` | `make [-eiknpqrSst] [-f makefile]... [macro=value]... [target_name...]` |
 | `nl` | `nl [-p] [-b type] [-d delim] [-f type] [-h type] [-i incr] [-l num] [-n format] [-s sep] [-v start] [-w width] [file]` |
 | `nm` | `nm [-APv] [-efox] [-g\|-u] [-t format] file...` |
 | `nohup` | `nohup utility [argument...]` |
@@ -188,6 +190,16 @@ right, and the next column with padding to spare takes the shift back. Nothing
 else reproduces the two-space gap in `SLl  process_api` and the one-space gap in
 `Sl claude` from the same listing.
 
+**`bc` counts on its fingers.** The numbers are decimal strings and the
+arithmetic is done on them a digit at a time, which is what arbitrary precision
+comes to when the only integers available are the shell's: 2^200 comes out to
+all sixty-one digits. The `%` operator follows the standard's rule to the
+letter — `a - (a/b)*b`, with the division taken to the current scale and nothing
+rounded off the multiplication — which is why `1 % 6.28318` has ten digits after
+the point rather than five. The library behind `-l` is written in bc itself and
+read by the same parser as anything else; `a(1)`, `e(1)`, `l(2)`, `s(1)` and
+`c(1)` all agree with the real bc to every one of the twenty digits it prints.
+
 **`m4` puts what a macro expanded to back in front of the cursor** and reads it
 again, which is m4's whole model and the reason a macro can call itself. The
 arguments of a call are collected with their quoting intact and expanded on
@@ -279,17 +291,17 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 72 |
+| implemented here | 74 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **52** |
-| reachable, not yet written | 14 |
+| reachable, not yet written | 12 |
 
 **The ceiling is 86 of 160**, or about 54% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 14 that remain are wildly uneven. `awk`, `bc`, `make`, `lex` and `yacc`
-are interpreters and compilers, each larger than everything here put together,
+The 12 that remain are wildly uneven. `awk`, `lex` and `yacc` are
+interpreters and compilers, each larger than everything here put together,
 written in a language with no arrays of structs and no way to turn a character
 into an integer except `printf '%d' "'$c"`.
 
@@ -329,6 +341,18 @@ into an integer except `printf '%d' "'$c"`.
   `ar` itself writes in the deterministic mode it defaults to now — and just as
   well, since `stat()` is unreachable. It does not build the symbol table that
   `ar s` and `ranlib` maintain for archives of object files.
+* `make` hands each command line to a subshell of the shell it is running in,
+  rather than to `/bin/sh`, so a recipe can use anything this library defines
+  and nothing it does not. Whether a target is out of date is decided with the
+  shell's own `-nt`, which is the one question about a file's timestamp a shell
+  can answer. `-t` has no `utime()` to call, so it reads the file and writes it
+  straight back; the write is what moves the timestamp. `-p` prints every macro
+  and every rule, in a layout of its own — no two makes agree on that one.
+  `-S` and `-j` are accepted and ignored: there is nothing here to run in
+  parallel anyway.
+* `bc` is slow, in the way everything here is slow: `a(1)` to twenty digits
+  takes about four seconds, and `c(1)` about fifteen. Every operation goes
+  through the same parser and the same digit-at-a-time arithmetic.
 * `compress` writes the LZW format the standard describes, and `gzip` -- which
   still reads it -- gets exactly what it expects out of every setting from 9 to
   16 bits. `uncompress` and `zcat` read it back. The original file would be
