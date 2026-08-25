@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-78 of the 160 utilities in POSIX.1-2017, as of now.
+79 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -68,6 +68,7 @@ Run the test suite with:
 | `csplit` | `csplit [-ks] [-f prefix] [-n number] file arg...` |
 | `ctags` | `ctags [-a] [-f tagsfile] pathname...`<br>`ctags -x pathname...` |
 | `cut` | `cut -b list [-n] [file...]` · `cut -c list [file...]` · `cut -f list [-d delim] [-s] [file...]` |
+| `cxref` | `cxref [-cs] [-o file] [-w num] [-D name[=def]]... [-I dir]... [-U name]... file...` |
 | `date` | `date [-u] [+format]` |
 | `dd` | `dd [operand...]` (`if` `of` `bs` `ibs` `obs` `count` `skip` `conv`) |
 | `delta` | `delta [-nps] [-r SID] [-y comment] [-m mrlist] s.file...` |
@@ -330,16 +331,16 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 78 |
+| implemented here | 79 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **52** |
-| reachable, not yet written | 8 |
+| reachable, not yet written | 7 |
 
 **The ceiling is 86 of 160**, or about 54% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 8 that remain are wildly uneven. `lex` and `yacc` are compilers whose
+The 7 that remain are wildly uneven. `lex` and `yacc` are compilers whose
 output is C, and `sh` would be a shell written in a shell.
 
 ### Smaller deviations, all deliberate
@@ -388,6 +389,12 @@ output is C, and `sh` would be a shell written in a shell.
   does and not what mawk does; a `printf` given fewer arguments than
   conversions treats the missing ones as empty, as the standard says, rather
   than stopping.
+* `cxref` has no format to match: the standard leaves the layout of the
+  listing open and asks only that the name, the file, the function the name
+  was written in and the line numbers all be there, with a star on the
+  declaring reference, so the layout here is this one's own. A name is taken
+  to be declared where a type stands in front of it, which is a guess, but the
+  same guess a reader makes. `-D`, `-I` and `-U` are accepted and ignored.
 * `cflow` reads C source, which is what there is to read: object files and
   assembler, which the standard also allows as input, would need a symbol
   table walk and an assembler's idea of a call. `-D`, `-I` and `-U` are

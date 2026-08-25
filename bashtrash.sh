@@ -19064,3 +19064,398 @@ cflow () {
 	done
 	return "$status"
 }
+
+# ---------------------------------------------------------------------------
+# cxref -- POSIX.1-2017:
+#	cxref [-cs] [-o file] [-w num] [-D name[=def]]... [-I dir]...
+#	      [-U name]... file...
+#
+# Every name in the file, where it was written, and which function it was
+# written in.  The standard leaves the layout to whoever writes the utility
+# and asks only that the name, the file, the function and the line numbers all
+# be there, with a star on the line that declares the name.
+# ---------------------------------------------------------------------------
+
+_bt_cxref_kw() {
+	case $1 in
+	if|while|for|switch|return|sizeof|do|else|case|goto|break|continue|\
+	default|typedef|struct|union|enum|static|extern|const|volatile|\
+	register|inline|signed|unsigned|void|char|short|int|long|float|double|\
+	auto|restrict)	return 0 ;;
+	esac
+	return 1
+}
+
+# Does $1 begin a declaration?
+_bt_cxref_type() {
+	case $1 in
+	struct|union|enum|static|extern|const|volatile|register|inline|signed|\
+	unsigned|void|char|short|int|long|float|double|auto|restrict|typedef)
+		return 0 ;;
+	esac
+	case " $_cx_typedefs " in
+	*" $1 "*)	return 0 ;;
+	esac
+	return 1
+}
+
+# Note that $1 was written on line $2, inside function $3, and that $4 says
+# whether this is where it was declared.
+_bt_cxref_note() {
+	local name=$1 line=$2 fn=$3 decl=$4 key mark=
+	key=$name$'\001'$_cx_cur$'\001'$fn
+	[ "$decl" = 1 ] && mark='*'
+	case " ${_cx_refs[$key]-} " in
+	*" $mark$line "*)	return 0 ;;
+	esac
+	if [ -z "${_cx_refs[$key]+x}" ]; then
+		_cx_keys+=("$key")
+	fi
+	_cx_refs[$key]="${_cx_refs[$key]-} $mark$line"
+	return 0
+}
+
+# Walk one C file, noting every name in it.
+_bt_cxref_scan() {
+	local n=${#_cx_lines[@]} ln s i len c d word
+	local depth=0 paren=0 lastid= lastline=0 cand= candline=0 closed=0
+	local instr= incomment=0 bol=1 pp=0 ppword= sawdecl=0
+	local cur=-- indecl=0 intypedef=0 pending= pendline=0
+	local -a held=()
+	for (( ln = 0; ln < n; ln++ )); do
+		s=${_cx_lines[ln]}
+		len=${#s}
+		i=0
+		bol=1
+		pp=0
+		ppword=
+		while [ "$i" -lt "$len" ]; do
+			c=${s:i:1}
+			if [ "$incomment" = 1 ]; then
+				if [ "${s:i:2}" = '*/' ]; then incomment=0; i=$(( i + 2 )); continue; fi
+				i=$(( i + 1 ))
+				continue
+			fi
+			if [ -n "$instr" ]; then
+				if [ "$c" = '\' ]; then i=$(( i + 2 )); continue; fi
+				[ "$c" = "$instr" ] && instr=
+				i=$(( i + 1 ))
+				continue
+			fi
+			case $c in
+			' '|$'\t')	i=$(( i + 1 )); continue ;;
+			esac
+			if [ "${s:i:2}" = '/*' ]; then incomment=1; i=$(( i + 2 )); continue; fi
+			if [ "${s:i:2}" = '//' ]; then break; fi
+			case $c in
+			'"'|"'")	instr=$c; i=$(( i + 1 )); bol=0; continue ;;
+			esac
+			if [ "$bol" = 1 ] && [ "$c" = '#' ]; then
+				pp=1
+				i=$(( i + 1 ))
+				bol=0
+				continue
+			fi
+			bol=0
+			case $c in
+			[A-Za-z_])
+				word=
+				while [ "$i" -lt "$len" ]; do
+					d=${s:i:1}
+					case $d in
+					[A-Za-z0-9_])	word=$word$d; i=$(( i + 1 )) ;;
+					*)		break ;;
+					esac
+				done
+				if [ "$pp" = 1 ]; then
+					if [ -z "$ppword" ]; then
+						ppword=$word
+					elif [ "$ppword" = define ]; then
+						_bt_cxref_note "$word" "$(( ln + 1 ))" -- 1
+						ppword=done
+					elif [ "$ppword" != done ] && ! _bt_cxref_kw "$word"; then
+						_bt_cxref_note "$word" "$(( ln + 1 ))" "$cur" 0
+					fi
+					continue
+				fi
+				if _bt_cxref_kw "$word"; then
+					_bt_cxref_type "$word" && indecl=1
+					[ "$word" = typedef ] && intypedef=1
+					lastid=$word
+					lastline=$ln
+					continue
+				fi
+				if _bt_cxref_type "$word"; then
+					indecl=1
+					_bt_cxref_note "$word" "$(( ln + 1 ))" "$cur" 0
+					lastid=$word
+					lastline=$ln
+					continue
+				fi
+				# a name at the head of a definition is written
+				# down when the brace turns up, not before
+				if [ "$depth" = 0 ] && [ "$paren" = 0 ]; then
+					pending=$word
+					pendline=$ln
+				fi
+				if [ "$depth" = 0 ] && [ "$paren" -gt 0 ] && [ -n "$cand" ]; then
+					# a name between the brackets of what may
+					# be a definition: whose it is depends on
+					# whether a body follows
+					held+=("$word $(( ln + 1 )) $indecl")
+					lastid=$word
+					lastline=$ln
+					continue
+				fi
+				if [ "$indecl" = 1 ]; then
+					_bt_cxref_note "$word" "$(( ln + 1 ))" "$cur" 1
+					[ "$intypedef" = 1 ] && _cx_typedefs="$_cx_typedefs $word"
+				else
+					_bt_cxref_note "$word" "$(( ln + 1 ))" "$cur" 0
+				fi
+				lastid=$word
+				lastline=$ln
+				continue ;;
+			[0-9])	while [ "$i" -lt "$len" ]; do
+					case ${s:i:1} in
+					[0-9A-Za-z._])	i=$(( i + 1 )) ;;
+					*)		break ;;
+					esac
+				done
+				continue ;;
+			'(')	if [ "$depth" = 0 ] && [ "$paren" = 0 ] &&
+				   [ -n "$lastid" ] && ! _bt_cxref_kw "$lastid"; then
+					cand=$lastid
+					candline=$lastline
+					closed=0
+				fi
+				paren=$(( paren + 1 ))
+				i=$(( i + 1 ))
+				continue ;;
+			')')	paren=$(( paren - 1 ))
+				[ "$paren" -lt 0 ] && paren=0
+				if [ "$paren" = 0 ]; then
+					[ -n "$cand" ] && { closed=1; sawdecl=0; }
+					indecl=0
+				fi
+				i=$(( i + 1 ))
+				continue ;;
+			'{')	if [ "$depth" = 0 ] && [ "$closed" = 1 ]; then
+					cur=$cand
+					cand= closed=0
+					_bt_cxref_flush "$cur"
+				fi
+				depth=$(( depth + 1 ))
+				indecl=0
+				i=$(( i + 1 ))
+				continue ;;
+			'}')	_bt_cxref_flush --
+				depth=$(( depth - 1 ))
+				if [ "$depth" -le 0 ]; then
+					depth=0
+					cur=--
+					cand= closed=0
+				fi
+				indecl=0
+				i=$(( i + 1 ))
+				continue ;;
+			';')	indecl=0
+				intypedef=0
+				if [ "$depth" = 0 ]; then
+					_bt_cxref_flush --
+					if [ "$closed" = 0 ] || [ "$sawdecl" = 0 ]; then
+						cand=
+						closed=0
+					fi
+				fi
+				i=$(( i + 1 ))
+				continue ;;
+			'=')	indecl=0
+				i=$(( i + 1 ))
+				continue ;;
+			esac
+			i=$(( i + 1 ))
+		done
+	done
+	return 0
+}
+
+# Write down the names that were waiting on a function's name, now that it is
+# known.  Relies on its caller's locals.
+_bt_cxref_flush() {
+	local who=$1 entry set
+	for entry in ${held[@]+"${held[@]}"}; do
+		set=${entry#* }
+		_bt_cxref_note "${entry%% *}" "${set%% *}" "$who" "${set#* }"
+	done
+	held=()
+	return 0
+}
+
+# Sort the keys, which are name, file and function with a byte between them.
+_bt_cxref_sort() {
+	local n=${#_cx_keys[@]} width lo mid hi i j k a b
+	local -a tmp=()
+	[ "$n" -lt 2 ] && return 0
+	width=1
+	while [ "$width" -lt "$n" ]; do
+		lo=0
+		while [ "$lo" -lt "$n" ]; do
+			mid=$(( lo + width ))
+			hi=$(( mid + width ))
+			[ "$mid" -gt "$n" ] && mid=$n
+			[ "$hi" -gt "$n" ] && hi=$n
+			i=$lo j=$mid k=$lo
+			while [ "$i" -lt "$mid" ] && [ "$j" -lt "$hi" ]; do
+				a=${_cx_keys[i]} b=${_cx_keys[j]}
+				if [[ $a > $b ]]; then
+					tmp[k]=$b; j=$(( j + 1 ))
+				else
+					tmp[k]=$a; i=$(( i + 1 ))
+				fi
+				k=$(( k + 1 ))
+			done
+			while [ "$i" -lt "$mid" ]; do tmp[k]=${_cx_keys[i]}; i=$(( i + 1 )); k=$(( k + 1 )); done
+			while [ "$j" -lt "$hi" ]; do tmp[k]=${_cx_keys[j]}; j=$(( j + 1 )); k=$(( k + 1 )); done
+			lo=$hi
+		done
+		for (( i = 0; i < n; i++ )); do _cx_keys[i]=${tmp[i]}; done
+		width=$(( width * 2 ))
+	done
+	return 0
+}
+
+# One line of the listing, folded to the width asked for.
+_bt_cxref_line() {
+	local name=$1 file=$2 fn=$3 refs=$4 room head pad= i out=
+	printf -v head '%-*s %-*s %-*s ' "$col" "$name" "$col" "$file" "$col" "$fn"
+	room=$(( width - ${#head} ))
+	[ "$room" -lt 4 ] && room=4
+	for (( i = 0; i < ${#head}; i++ )); do pad=$pad' '; done
+	out=
+	for i in $refs; do
+		if [ -n "$out" ] && [ $(( ${#out} + 1 + ${#i} )) -gt "$room" ]; then
+			_cx_outlines+=("$head$out")
+			head=$pad
+			out=$i
+			continue
+		fi
+		out=${out:+$out }$i
+	done
+	_cx_outlines+=("$head$out")
+	return 0
+}
+
+cxref () {
+	local LC_ALL=C
+	local arg opt f fd line status=0 combined=0 silent=0 outfile= width=80
+	local key name file fn refs cur col=15
+	local _cx_cur= _cx_typedefs=
+	local -a _cx_lines=() _cx_keys=() _cx_outlines=()
+	local -A _cx_refs=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-o)	shift
+			[ "$#" = 0 ] && { _bt_err "cxref: -o wants a file"; return 1; }
+			outfile=$1; shift ;;
+		-o*)	outfile=${1#-o}; shift ;;
+		-w)	shift
+			[ "$#" = 0 ] && { _bt_err "cxref: -w wants a number"; return 1; }
+			case $1 in
+			''|*[!0-9]*)	;;
+			*)	[ "$1" -ge 51 ] && width=$1 ;;
+			esac
+			shift ;;
+		-w*)	arg=${1#-w}
+			case $arg in
+			''|*[!0-9]*)	;;
+			*)	[ "$arg" -ge 51 ] && width=$arg ;;
+			esac
+			shift ;;
+		-D|-I|-U)	shift; shift ;;
+		-D*|-I*|-U*)	shift ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				c)	combined=1 ;;
+				s)	silent=1 ;;
+				*)	_bt_err "cxref: illegal option -- $opt"
+					_bt_err "usage: cxref [-cs] [-o file] [-w num] [-D name[=def]]... [-I dir]... [-U name]... file..."
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" = 0 ]; then
+		_bt_err "usage: cxref [-cs] [-o file] [-w num] file..."
+		return 1
+	fi
+
+	# the columns give way when the width asked for is narrow
+	while [ $(( col * 3 + 3 + 8 )) -gt "$width" ] && [ "$col" -gt 6 ]; do
+		col=$(( col - 1 ))
+	done
+
+	for f in "$@"; do
+		if ! { exec {fd}<"$f"; } 2>/dev/null; then
+			_bt_err "cxref: cannot open $f"
+			status=1
+			continue
+		fi
+		_cx_lines=()
+		line=
+		while IFS= read -r line; do
+			_cx_lines+=("$line")
+			line=
+		done <&"$fd"
+		[ -n "$line" ] && _cx_lines+=("$line")
+		exec {fd}<&-
+		_cx_cur=$f
+		if [ "$combined" = 0 ]; then
+			_cx_keys=()
+			_cx_refs=()
+			_bt_cxref_scan
+			_bt_cxref_sort
+			[ "$silent" = 0 ] && _cx_outlines+=("$f")
+			for key in ${_cx_keys[@]+"${_cx_keys[@]}"}; do
+				name=${key%%$'\001'*}
+				cur=${key#*$'\001'}
+				file=${cur%%$'\001'*}
+				fn=${cur#*$'\001'}
+				_bt_cxref_line "$name" "$file" "$fn" "${_cx_refs[$key]}"
+			done
+		else
+			_bt_cxref_scan
+		fi
+	done
+
+	if [ "$combined" = 1 ]; then
+		_bt_cxref_sort
+		for key in ${_cx_keys[@]+"${_cx_keys[@]}"}; do
+			name=${key%%$'\001'*}
+			cur=${key#*$'\001'}
+			file=${cur%%$'\001'*}
+			fn=${cur#*$'\001'}
+			_bt_cxref_line "$name" "$file" "$fn" "${_cx_refs[$key]}"
+		done
+	fi
+	if [ "${#_cx_outlines[@]}" -gt 0 ]; then
+		if [ -n "$outfile" ]; then
+			if ! { exec {fd}>"$outfile"; } 2>/dev/null; then
+				_bt_err "cxref: cannot open $outfile"
+				return 1
+			fi
+			printf '%s\n' "${_cx_outlines[@]}" >&"$fd"
+			exec {fd}>&-
+		else
+			printf '%s\n' "${_cx_outlines[@]}"
+		fi
+	fi
+	return "$status"
+}

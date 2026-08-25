@@ -28,7 +28,7 @@ for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          nohup pr dd sed who logname diff cal fuser ipcs patch tput \
          what uuencode uudecode write ps ed m4 iconv ar locale nm \
          admin delta get prs rmdel sact sccs unget val \
-         compress uncompress zcat bc make awk gencat ctags cflow; do
+         compress uncompress zcat bc make awk gencat ctags cflow cxref; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -3130,6 +3130,127 @@ else note_fail "cflow types: [$got]"; fi
 a=$( . "$BT"; cflow nosuch.c 2>/dev/null; echo "rc=$?" )
 if [ "$a" = "rc=1" ]; then pass=$((pass + 1))
 else note_fail "cflow with a missing file: [$a]"; fi
+
+cd .. || exit 1
+
+# --- cxref ------------------------------------------------------------------
+# The standard leaves the layout of the listing open and asks only for the
+# name, the file, the function it was written in and the line numbers, with a
+# star on the declaring reference.  What is checked here is that those are
+# right, and that every line number really holds the name.
+echo "### cxref"
+mkdir -p cxt
+cd cxt || exit 1
+
+cat > y1.c <<'CEOF'
+#define LIMIT 10
+int total;
+
+int add(int a, int b)
+{
+	int sum;
+	sum = a + b;
+	return sum;
+}
+
+int main(void)
+{
+	total = add(1, LIMIT);
+	return total;
+}
+CEOF
+
+want='y1.c
+LIMIT           y1.c            --              *1
+LIMIT           y1.c            main            13
+a               y1.c            add             *4 7
+add             y1.c            --              *4
+add             y1.c            main            13
+b               y1.c            add             *4 7
+main            y1.c            --              *11
+sum             y1.c            add             *6 7 8
+total           y1.c            --              *2
+total           y1.c            main            13 14'
+got=$( . "$BT"; cxref y1.c )
+if [ "$got" = "$want" ]; then pass=$((pass + 1))
+else note_fail "cxref listing: [$got]"; fi
+
+# -s leaves the file name out, the rest is the same
+got=$( . "$BT"; cxref -s y1.c )
+if [ "$got" = "$( printf '%s\n' "$want" | "$(real_of tail)" -n +2 )" ]; then pass=$((pass + 1))
+else note_fail "cxref -s: [$got]"; fi
+
+# every line a name is said to be on has to hold that name
+bad=0
+while read -r name file fn rest; do
+	[ "$file" = "$fn" ] && continue
+	case $name in
+	*.c)	continue ;;
+	esac
+	for ref in $rest; do
+		ref=${ref#\*}
+		"$(real_of sed)" -n "${ref}p" "$file" | "$(real_of grep)" -q "$name" ||
+			{ bad=1; note_fail "cxref says $name is on line $ref of $file"; }
+	done
+done < <( . "$BT"; cxref -s y1.c )
+[ "$bad" = 0 ] && pass=$((pass + 1))
+
+# a second file gets its own heading, and -c runs them together
+cat > y2.c <<'CEOF'
+extern int total;
+int helper(int x)
+{
+	return total + x;
+}
+CEOF
+got=$( . "$BT"; cxref y1.c y2.c | "$(real_of grep)" -c '^y[12]\.c$' )
+if [ "$got" = 2 ]; then pass=$((pass + 1))
+else note_fail "cxref over two files headed [$got] of them"; fi
+got=$( . "$BT"; cxref -c y1.c y2.c )
+case $got in
+y1.c*|*$'\n'y2.c$'\n'*)	note_fail "cxref -c wrote a file heading" ;;
+*)			pass=$((pass + 1)) ;;
+esac
+# combined, the names run in one order across both files
+got=$( . "$BT"; cxref -c y1.c y2.c | "$(real_of awk)" '{print $1}' | "$(real_of uniq)" | "$(real_of tr)" '\n' ' ' )
+if [ "$got" = "LIMIT a add b helper main sum total x " ]; then pass=$((pass + 1))
+else note_fail "cxref -c order: [$got]"; fi
+
+# -w folds the line numbers to the width asked for
+cat > y3.c <<'CEOF'
+int spread(void)
+{
+	int x;
+	x = 1; x = 2; x = 3; x = 4; x = 5; x = 6; x = 7; x = 8;
+	x = 9;
+	x = 10;
+	x = 11;
+	x = 12;
+	return x;
+}
+CEOF
+got=$( . "$BT"; cxref -w 51 y3.c | "$(real_of awk)" '{ if (length($0) > n) n = length($0) } END { print n }' )
+if [ "$got" -le 51 ]; then pass=$((pass + 1))
+else note_fail "cxref -w 51 wrote a line $got wide"; fi
+got=$( . "$BT"; cxref y3.c | "$(real_of grep)" -c '^x ' )
+if [ "$got" = 1 ]; then pass=$((pass + 1))
+else note_fail "cxref folded when it did not need to"; fi
+# a width below 51 is ignored, as the standard says
+a=$( . "$BT"; cxref -w 10 y3.c )
+b=$( . "$BT"; cxref y3.c )
+if [ "$a" = "$b" ]; then pass=$((pass + 1))
+else note_fail "cxref -w 10 should have been ignored"; fi
+
+# -o writes to the file instead of the standard output
+rm -f y.out
+a=$( . "$BT"; cxref -o y.out y1.c )
+if [ -z "$a" ] && [ "$( "$(real_of cat)" y.out )" = "$want" ]; then pass=$((pass + 1))
+else note_fail "cxref -o"; fi
+
+# a file that is not there
+a=$( . "$BT"; cxref nosuch.c 2>/dev/null; echo "rc=$?" )
+if [ "$a" = "rc=1" ]; then pass=$((pass + 1))
+else note_fail "cxref with a missing file: [$a]"; fi
 
 cd .. || exit 1
 
