@@ -26,7 +26,9 @@ for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          fold head id nl od paste pathchk sleep sort split strings tabs \
          tail tee tr tsort tty uname unexpand uniq wc join csplit grep xargs \
          nohup pr dd sed who logname diff cal fuser ipcs patch tput \
-         what uuencode uudecode write ps ed m4 iconv ar locale; do
+         what uuencode uudecode write ps ed m4 iconv ar locale nm \
+         admin delta get prs rmdel sact sccs unget val \
+         compress uncompress zcat; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -1983,6 +1985,292 @@ if command -v locale > /dev/null 2>&1; then
 	b=$( "$RLOCALE" nosuchname 2>&1 | "$(real_of sed)" 's|^.*/locale:|locale:|'; echo "rc=$?" )
 	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "locale on an unknown name"; fi
 fi
+
+# --- nm ---------------------------------------------------------------------
+# Object files are compiled on the spot when there is a compiler, and whatever
+# object files the machine already has are read as well.
+echo "### nm"
+if command -v nm > /dev/null 2>&1; then
+	RNM=$(real_of nm)
+	objs=
+	if command -v cc > /dev/null 2>&1; then
+		cat > nm1.c <<'CEOF'
+#include <stdio.h>
+int global_var = 42;
+static int static_var = 7;
+int uninit_var;
+static int static_uninit;
+const char *ro_string = "hello";
+extern int missing_func(int);
+int add(int a, int b) { return a + b + static_var; }
+static int helper(void) { return static_uninit; }
+int main(void) { printf("%d\n", add(global_var, helper())); return missing_func(1); }
+CEOF
+		cat > nm2.c <<'CEOF'
+__attribute__((weak)) int weak_func(void) { return 1; }
+__attribute__((weak)) int weak_var = 3;
+const int const_var = 5;
+const char msg[] = "readonly";
+extern int und_var;
+int use(void) { return und_var + const_var + msg[0]; }
+CEOF
+		cat > nm3.c <<'CEOF'
+#include <stdio.h>
+static int s = 1;
+int g = 2;
+int f(void) { return s; }
+int main(void) { printf("%d %d\n", g, f()); return 0; }
+CEOF
+		cc -c -o nm1.o nm1.c 2>/dev/null && objs="$objs nm1.o"
+		cc -c -o nm2.o nm2.c 2>/dev/null && objs="$objs nm2.o"
+		cc -o nmprog nm3.c 2>/dev/null && objs="$objs nmprog"
+	fi
+	for f in /usr/lib/x86_64-linux-gnu/crt1.o /usr/lib/x86_64-linux-gnu/Scrt1.o \
+		 /usr/lib/gcc/x86_64-linux-gnu/*/crtbegin.o; do
+		[ -f "$f" ] && objs="$objs $f"
+	done
+	if [ -n "$objs" ]; then
+		for f in $objs; do
+			for o in "" -a -n -P -g -u -p "-t d" "-t o" -A "-P -t d" -an -Pg -au; do
+				# shellcheck disable=SC2086
+				a=$( . "$BT"; nm $o "$f" 2>&1 | "$(real_of sed)" 's|^.*/nm:|nm:|' )
+				# shellcheck disable=SC2086
+				b=$( "$RNM" $o "$f" 2>&1 | "$(real_of sed)" 's|^.*/nm:|nm:|' )
+				if [ "$a" = "$b" ]; then pass=$((pass + 1))
+				else note_fail "nm $o $f"; fi
+			done
+		done
+		# several files at once, which changes the headings
+		set -- $objs
+		if [ "$#" -ge 2 ]; then
+			a=$( . "$BT"; nm "$1" "$2" 2>&1 )
+			b=$( "$RNM" "$1" "$2" 2>&1 )
+			if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "nm over two files"; fi
+		fi
+	fi
+	a=$( . "$BT"; nm nm1.c 2>&1 | "$(real_of sed)" 's|^.*/nm:|nm:|'; echo "rc=$?" )
+	b=$( "$RNM" nm1.c 2>&1 | "$(real_of sed)" 's|^.*/nm:|nm:|'; echo "rc=$?" )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "nm on something that is not an object"; fi
+	if [ -f /bin/true ]; then
+		a=$( . "$BT"; nm /bin/true 2>&1 | "$(real_of sed)" 's|^.*/nm:|nm:|' )
+		b=$( "$RNM" /bin/true 2>&1 | "$(real_of sed)" 's|^.*/nm:|nm:|' )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "nm on a stripped binary"; fi
+	fi
+fi
+
+# --- the SCCS utilities -----------------------------------------------------
+# Nothing on this machine has an SCCS to compare against, so these are held to
+# the property that matters: whatever went in has to come back out. A file is
+# put under SCCS, edited and delta'd several times over, and then every version
+# it ever had is retrieved and compared with what was recorded at the time.
+echo "### admin delta get prs rmdel sact unget val sccs"
+mkdir -p sccst
+cd sccst || exit 1
+
+for seed in 1 2 3 4 5 6 7 8; do
+	rm -rf "r$seed"
+	mkdir "r$seed"
+	cd "r$seed" || exit 1
+	RANDOM=$seed
+	: > w.txt
+	n=$(( 3 + RANDOM % 12 ))
+	i=1
+	while [ "$i" -le "$n" ]; do
+		printf 'line %d value %d\n' "$i" "$((RANDOM % 9))" >> w.txt
+		i=$((i + 1))
+	done
+	cp w.txt v1.txt
+	( . "$BT"; admin -iw.txt s.w.txt ) > /dev/null 2>&1
+	vers=1
+	for round in 1 2 3 4; do
+		( . "$BT"; get -e -s s.w.txt ) > /dev/null 2>&1
+		: > tmp.txt
+		while IFS= read -r ln; do
+			r=$(( RANDOM % 6 ))
+			[ "$r" = 0 ] && continue
+			[ "$r" = 1 ] && printf 'INSERT-%d-%d\n' "$round" "$RANDOM" >> tmp.txt
+			printf '%s\n' "$ln" >> tmp.txt
+		done < w.txt
+		[ $(( RANDOM % 2 )) = 0 ] && printf 'TAIL-%d\n' "$round" >> tmp.txt
+		cp tmp.txt w.txt
+		vers=$((vers + 1))
+		cp w.txt "v$vers.txt"
+		( . "$BT"; delta -y"round $round" s.w.txt ) > /dev/null 2>&1
+	done
+	bad=0
+	v=1
+	while [ "$v" -le "$vers" ]; do
+		rm -f w.txt
+		( . "$BT"; get -s -r"1.$v" s.w.txt ) > /dev/null 2>&1
+		cmp -s w.txt "v$v.txt" || bad=$((bad + 1))
+		v=$((v + 1))
+	done
+	( . "$BT"; val s.w.txt ) > /dev/null 2>&1 || bad=$((bad + 1))
+	if [ "$bad" = 0 ]; then pass=$((pass + 1))
+	else note_fail "sccs round trip (seed $seed): $bad of $vers versions wrong"; fi
+	cd .. || exit 1
+done
+
+# the pieces, one at a time
+rm -rf one
+mkdir one
+cd one || exit 1
+printf 'alpha\nbravo\ncharlie\n' > m.txt
+( . "$BT"; admin -im.txt s.m.txt ) > /dev/null 2>&1
+if [ -s s.m.txt ]; then pass=$((pass + 1)); else note_fail "admin should create the SCCS file"; fi
+a=$( "$(real_of sed)" -n '1p' s.m.txt | "$(real_of tr)" -d '\001' )
+case $a in
+h[0-9][0-9][0-9][0-9][0-9])	pass=$((pass + 1)) ;;
+*)				note_fail "admin should write a checksum line: [$a]" ;;
+esac
+( . "$BT"; val s.m.txt ) > /dev/null 2>&1
+if [ "$?" = 0 ]; then pass=$((pass + 1)); else note_fail "val should accept a fresh SCCS file"; fi
+( . "$BT"; val nosuch.txt ) > /dev/null 2>&1
+if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "val should refuse a name that is not an SCCS name"; fi
+a=$( . "$BT"; val s.m.txt -r9.9 > /dev/null 2>&1; echo $? )
+if [ "$a" -ne 0 ]; then pass=$((pass + 1)); else note_fail "val should refuse an SID that is not there"; fi
+
+rm -f m.txt
+a=$( . "$BT"; get s.m.txt 2>&1 )
+if [ "$a" = "$(printf '1.1\n3 lines')" ]; then pass=$((pass + 1))
+else note_fail "get should report the SID and the count: [$a]"; fi
+if [ "$(cat m.txt)" = "$(printf 'alpha\nbravo\ncharlie')" ]; then pass=$((pass + 1))
+else note_fail "get should write the file back"; fi
+
+a=$( . "$BT"; get -e s.m.txt 2>&1 )
+if [ "$a" = "$(printf '1.1\nnew delta 1.2\n3 lines')" ]; then pass=$((pass + 1))
+else note_fail "get -e should announce the new delta: [$a]"; fi
+a=$( . "$BT"; sact s.m.txt 2>&1 )
+case $a in
+"1.1 1.2 "*)	pass=$((pass + 1)) ;;
+*)		note_fail "sact should report the pending edit: [$a]" ;;
+esac
+( . "$BT"; unget s.m.txt ) > /dev/null 2>&1
+a=$( . "$BT"; sact s.m.txt 2>&1 )
+case $a in
+*"no edits pending")	pass=$((pass + 1)) ;;
+*)			note_fail "unget should clear the pending edit: [$a]" ;;
+esac
+
+( . "$BT"; get -e -s s.m.txt ) > /dev/null 2>&1
+printf 'alpha\nBRAVO\ncharlie\ndelta\n' > m.txt
+a=$( . "$BT"; delta -y'a change' s.m.txt 2>&1 )
+if [ "$a" = "$(printf '1.2\n2 inserted\n1 deleted\n2 unchanged')" ]; then pass=$((pass + 1))
+else note_fail "delta should count what changed: [$a]"; fi
+rm -f m.txt
+( . "$BT"; get -s s.m.txt ) > /dev/null 2>&1
+if [ "$(cat m.txt)" = "$(printf 'alpha\nBRAVO\ncharlie\ndelta')" ]; then pass=$((pass + 1))
+else note_fail "get should hand back what delta recorded"; fi
+rm -f m.txt
+( . "$BT"; get -s -r1.1 s.m.txt ) > /dev/null 2>&1
+if [ "$(cat m.txt)" = "$(printf 'alpha\nbravo\ncharlie')" ]; then pass=$((pass + 1))
+else note_fail "get -r should hand back the older version"; fi
+a=$( . "$BT"; get -p -s -r1.1 s.m.txt 2>/dev/null )
+if [ "$a" = "$(printf 'alpha\nbravo\ncharlie')" ]; then pass=$((pass + 1))
+else note_fail "get -p should write to standard output"; fi
+
+a=$( . "$BT"; prs -d':I: :P:' s.m.txt 2>&1 )
+case $a in
+"1.2 "*)	pass=$((pass + 1)) ;;
+*)		note_fail "prs -d should expand the data specification: [$a]" ;;
+esac
+a=$( . "$BT"; prs -e s.m.txt 2>&1 | "$(real_of grep)" -c '^D 1\.' )
+if [ "$a" = 2 ]; then pass=$((pass + 1)); else note_fail "prs -e should report both deltas"; fi
+
+( . "$BT"; rmdel -r1.2 s.m.txt ) > /dev/null 2>&1
+a=$( . "$BT"; prs -d:I: s.m.txt 2>&1 )
+if [ "$a" = 1.1 ]; then pass=$((pass + 1)); else note_fail "rmdel should take the newest delta away: [$a]"; fi
+rm -f m.txt
+( . "$BT"; get -s s.m.txt ) > /dev/null 2>&1
+if [ "$(cat m.txt)" = "$(printf 'alpha\nbravo\ncharlie')" ]; then pass=$((pass + 1))
+else note_fail "what is left after rmdel should be the older text"; fi
+( . "$BT"; val s.m.txt ) > /dev/null 2>&1
+if [ "$?" = 0 ]; then pass=$((pass + 1)); else note_fail "val should still accept the file after rmdel"; fi
+
+# a checksum that no longer matches is what val is for
+"$(real_of sed)" '$a tampered' s.m.txt > s.bad.txt
+( . "$BT"; val s.bad.txt ) > /dev/null 2>&1
+if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "val should notice a file that was meddled with"; fi
+
+# the front end, which finds the SCCS directory itself
+mkdir -p SCCS
+printf 'one\ntwo\n' > front.txt
+( . "$BT"; sccs create -ifront.txt front.txt ) > /dev/null 2>&1
+if [ -s SCCS/s.front.txt ]; then pass=$((pass + 1)); else note_fail "sccs create should make SCCS/s.front.txt"; fi
+rm -f front.txt
+a=$( . "$BT"; sccs get front.txt 2>&1 )
+if [ "$a" = "$(printf '1.1\n2 lines')" ]; then pass=$((pass + 1))
+else note_fail "sccs get should retrieve through the front end: [$a]"; fi
+a=$( . "$BT"; sccs cat front.txt 2>/dev/null )
+if [ "$a" = "$(printf 'one\ntwo')" ]; then pass=$((pass + 1))
+else note_fail "sccs cat should print the file: [$a]"; fi
+( . "$BT"; sccs nosuchcommand front.txt ) > /dev/null 2>&1
+if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "sccs should refuse a command it does not have"; fi
+
+cd .. || exit 1
+cd .. || exit 1
+
+# --- compress, uncompress, zcat ---------------------------------------------
+# Nothing here writes the .Z format any more, but gzip still reads it, so what
+# compress produces is handed to gzip to check; uncompress is then asked to read
+# it back, and to read a stream this suite builds for itself.
+echo "### compress uncompress zcat"
+mkdir -p zt
+cd zt || exit 1
+printf 'a\n' > z1
+head -c 3000 /dev/urandom > z2
+i=1
+: > z3
+while [ "$i" -le 200 ]; do
+	printf 'line %d of some text with repetition repetition\n' "$i" >> z3
+	i=$((i + 1))
+done
+i=1
+: > z4
+while [ "$i" -le 500 ]; do printf 'aaaaaaaaaabbbbbbbbbb' >> z4; i=$((i + 1)); done
+i=1
+: > z5
+while [ "$i" -le 400 ]; do
+	printf 'a longer line number %d with some words and %d numbers\n' "$i" "$((i * 7))" >> z5
+	i=$((i + 1))
+done
+: > z6
+printf '' > z6
+
+for f in z1 z2 z3 z4 z5 z6; do
+	for b in 9 10 12 14 16; do
+		( . "$BT"; compress -b "$b" -c "$f" ) > zc.Z 2>/dev/null
+		if command -v gzip > /dev/null 2>&1; then
+			if "$(real_of gzip)" -dc < zc.Z > zg.out 2>/dev/null && cmp -s "$f" zg.out
+			then pass=$((pass + 1))
+			else note_fail "compress -b$b $f is not what gzip reads back"; fi
+		fi
+		( . "$BT"; uncompress -c zc.Z ) > zu.out 2>/dev/null
+		if cmp -s "$f" zu.out; then pass=$((pass + 1))
+		else note_fail "compress -b$b $f does not survive uncompress"; fi
+		a=$( . "$BT"; zcat zc.Z 2>/dev/null | wc -c )
+		if [ "$a" = "$(wc -c < "$f")" ]; then pass=$((pass + 1))
+		else note_fail "zcat -b$b $f"; fi
+	done
+done
+
+# a file rather than a pipe, and the suffix rules that go with it
+cp z3 zf
+( . "$BT"; compress zf ) > /dev/null 2>&1
+if [ -s zf.Z ]; then pass=$((pass + 1)); else note_fail "compress should write zf.Z"; fi
+( . "$BT"; uncompress -c zf.Z ) > zu.out 2>/dev/null
+if cmp -s z3 zu.out; then pass=$((pass + 1)); else note_fail "the file compress wrote does not read back"; fi
+( . "$BT"; uncompress -f zf.Z ) > /dev/null 2>&1
+if cmp -s z3 zf; then pass=$((pass + 1)); else note_fail "uncompress should write the file back"; fi
+( . "$BT"; compress -c z3 ) 2>/dev/null | ( . "$BT"; uncompress -c ) > zu.out 2>/dev/null
+if cmp -s z3 zu.out; then pass=$((pass + 1)); else note_fail "compress into uncompress down a pipe"; fi
+printf 'not compressed at all\n' > znot
+( . "$BT"; uncompress -c znot ) > /dev/null 2>&1
+if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "uncompress should refuse what is not compressed"; fi
+( . "$BT"; compress -b 20 -c z1 ) > /dev/null 2>&1
+if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "compress should refuse 20 bits"; fi
+
+cd .. || exit 1
 
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"

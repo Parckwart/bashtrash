@@ -10716,3 +10716,1809 @@ _bt_locale_charmaps() {
 	[ "${#names[@]}" -gt 0 ] && printf '%s\n' "${names[@]}" | _bt_locale_sort
 	return 0
 }
+
+# ---------------------------------------------------------------------------
+# nm -- POSIX.1-2017: nm [-APv] [-efox] [-g|-u] [-t format] file...
+#
+# An ELF file is a header, a table of section headers, and among the sections a
+# symbol table and the strings its names live in.  All of that is fixed-width
+# little- or big-endian integers at known offsets, which is exactly the sort of
+# thing that can be picked out of an array of bytes.
+# ---------------------------------------------------------------------------
+
+# Read $2 bytes at offset $1 of _bt_b as an integer, honouring `elfbe`.
+_bt_elf_num() {
+	local off=$1 n=$2 i v=0
+	if [ "$elfbe" = 1 ]; then
+		for (( i = 0; i < n; i++ )); do v=$(( (v << 8) | _bt_b[off+i] )); done
+	else
+		for (( i = n - 1; i >= 0; i-- )); do v=$(( (v << 8) | _bt_b[off+i] )); done
+	fi
+	_bt_int=$v
+	return 0
+}
+
+# The letter nm gives a symbol, in _bt_str.  Relies on its caller's locals.
+_bt_nm_type() {
+	local bind=$1 styp=$2 shndx=$3 c
+	case $shndx in
+	0)	if [ "$bind" = 2 ]; then
+			if [ "$styp" = 1 ]; then _bt_str=v; else _bt_str=w; fi
+		else
+			_bt_str=U
+		fi
+		return 0 ;;
+	65521)	c=A ;;
+	65522)	_bt_str=C; return 0 ;;
+	*)	if [ "$bind" = 2 ]; then
+			if [ "$styp" = 1 ]; then _bt_str=V; else _bt_str=W; fi
+			return 0
+		fi
+		if [ $(( shflags[shndx] & 4 )) != 0 ]; then c=T
+		elif [ "${shtype[shndx]}" = 8 ]; then c=B
+		elif [ $(( shflags[shndx] & 1 )) != 0 ]; then c=D
+		else c=R
+		fi ;;
+	esac
+	if [ "$bind" = 0 ]; then
+		_bt_str=${c,}
+	else
+		_bt_str=$c
+	fi
+	return 0
+}
+
+# Sort the parallel symbol arrays by name, or by value when `bynum` says so.
+_bt_nm_sort() {
+	local n=${#snames[@]} width=1 i j k lo mid hi
+	local -a idx=() tmp=()
+	for (( i = 0; i < n; i++ )); do idx+=("$i"); done
+	while [ "$width" -lt "$n" ]; do
+		tmp=()
+		lo=0
+		while [ "$lo" -lt "$n" ]; do
+			mid=$(( lo + width ))
+			hi=$(( mid + width ))
+			[ "$mid" -gt "$n" ] && mid=$n
+			[ "$hi" -gt "$n" ] && hi=$n
+			i=$lo j=$mid
+			while [ "$i" -lt "$mid" ] || [ "$j" -lt "$hi" ]; do
+				if [ "$i" -ge "$mid" ]; then
+					tmp+=("${idx[j]}"); j=$(( j + 1 ))
+				elif [ "$j" -ge "$hi" ]; then
+					tmp+=("${idx[i]}"); i=$(( i + 1 ))
+				elif _bt_nm_before "${idx[j]}" "${idx[i]}"; then
+					tmp+=("${idx[j]}"); j=$(( j + 1 ))
+				else
+					tmp+=("${idx[i]}"); i=$(( i + 1 ))
+				fi
+			done
+			lo=$hi
+		done
+		idx=("${tmp[@]}")
+		width=$(( width * 2 ))
+	done
+	order=("${idx[@]}")
+	return 0
+}
+
+# Does symbol $1 come before symbol $2?  Relies on its caller's locals.
+_bt_nm_before() {
+	if [ "$bynum" = 1 ]; then
+		# the ones with no address at all come first, and anything that
+		# ends up level is settled by name
+		if [ "${sundef[$1]}" != "${sundef[$2]}" ]; then
+			[ "${sundef[$1]}" = 1 ] && return 0
+			return 1
+		fi
+		if [ "${sundef[$1]}" = 0 ] && [ "${svalue[$1]}" != "${svalue[$2]}" ]; then
+			[ "${svalue[$1]}" -lt "${svalue[$2]}" ] && return 0
+			return 1
+		fi
+	fi
+	[ "${snames[$1]}" \< "${snames[$2]}" ] && return 0
+	return 1
+}
+
+nm () {
+	local LC_ALL=C
+	local arg opt file fd status=0 base=x posix=0 prefix=0 bynum=0 nosort=0
+	local onlyext=0 onlyundef=0 showall=0 first=1 many=0 dynamic=0
+	local elfbe=0 elfclass i j n off shoff shnum shentsize shstrndx
+	local symtab=-1 symsize symcount stroff name value size info bind styp shndx
+	local _bt_int _bt_str _bt_c _bt_reason fmt val
+	local -a _bt_b=() shtype=() shflags=() shoffset=() shsize=() shlink=() shentsz=()
+	local -a shname=()
+	local -a snames=() svalue=() ssize=() stype=() sundef=() order=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-t)	shift
+			[ "$#" = 0 ] && { _bt_err "nm: option requires an argument -- t"; return 1; }
+			base=$1; shift ;;
+		-t*)	base=${1#-t}; shift ;;
+		-f)	shift
+			[ "$#" = 0 ] && { _bt_err "nm: option requires an argument -- f"; return 1; }
+			[ "$1" = posix ] && posix=1
+			shift ;;
+		-*)	[ "$1" = - ] && break
+			arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				A|o)	prefix=1 ;;
+				D)	dynamic=1 ;;
+				P)	posix=1 ;;
+				v|n)	bynum=1 ;;
+				p)	nosort=1 ;;
+				g)	onlyext=1 ;;
+				u)	onlyundef=1 ;;
+				a)	showall=1 ;;
+				e|f|x|C|B|S|s|r)	;;
+				*)	_bt_err "nm: illegal option -- $opt"
+					_bt_err "usage: nm [-APv] [-efox] [-g|-u] [-t format] file..."
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" = 0 ]; then set -- a.out; fi
+	[ "$#" -gt 1 ] && many=1
+
+	case $base in
+	d|o|x)	;;
+	*)	_bt_err "nm: invalid radix -- $base"
+		return 1 ;;
+	esac
+
+	for file in "$@"; do
+		if ! _bt_file_bytes "$file"; then
+			_bt_why "$file"
+			_bt_err "nm: $file: $_bt_reason"
+			status=1
+			continue
+		fi
+		n=${#_bt_b[@]}
+		if [ "$n" -lt 64 ] || [ "${_bt_b[0]}" != 127 ] || [ "${_bt_b[1]}" != 69 ] ||
+		   [ "${_bt_b[2]}" != 76 ] || [ "${_bt_b[3]}" != 70 ]; then
+			_bt_err "nm: $file: file format not recognized"
+			status=1
+			continue
+		fi
+		elfclass=${_bt_b[4]}
+		if [ "${_bt_b[5]}" = 2 ]; then elfbe=1; else elfbe=0; fi
+		if [ "$elfclass" = 2 ]; then
+			_bt_elf_num 40 8; shoff=$_bt_int
+			_bt_elf_num 58 2; shentsize=$_bt_int
+			_bt_elf_num 60 2; shnum=$_bt_int
+			_bt_elf_num 62 2; shstrndx=$_bt_int
+		else
+			_bt_elf_num 32 4; shoff=$_bt_int
+			_bt_elf_num 46 2; shentsize=$_bt_int
+			_bt_elf_num 48 2; shnum=$_bt_int
+			_bt_elf_num 50 2; shstrndx=$_bt_int
+		fi
+
+		shtype=() shflags=() shoffset=() shsize=() shlink=() shentsz=() shname=()
+		symtab=-1
+		for (( i = 0; i < shnum; i++ )); do
+			off=$(( shoff + i * shentsize ))
+			_bt_elf_num "$off" 4; shname+=("$_bt_int")
+			if [ "$elfclass" = 2 ]; then
+				_bt_elf_num $(( off + 4 )) 4;  shtype+=("$_bt_int")
+				_bt_elf_num $(( off + 8 )) 8;  shflags+=("$_bt_int")
+				_bt_elf_num $(( off + 24 )) 8; shoffset+=("$_bt_int")
+				_bt_elf_num $(( off + 32 )) 8; shsize+=("$_bt_int")
+				_bt_elf_num $(( off + 40 )) 4; shlink+=("$_bt_int")
+				_bt_elf_num $(( off + 56 )) 8; shentsz+=("$_bt_int")
+			else
+				_bt_elf_num $(( off + 4 )) 4;  shtype+=("$_bt_int")
+				_bt_elf_num $(( off + 8 )) 4;  shflags+=("$_bt_int")
+				_bt_elf_num $(( off + 16 )) 4; shoffset+=("$_bt_int")
+				_bt_elf_num $(( off + 20 )) 4; shsize+=("$_bt_int")
+				_bt_elf_num $(( off + 24 )) 4; shlink+=("$_bt_int")
+				_bt_elf_num $(( off + 36 )) 4; shentsz+=("$_bt_int")
+			fi
+			if [ "$dynamic" = 1 ]; then
+				[ "${shtype[i]}" = 11 ] && symtab=$i
+			else
+				[ "${shtype[i]}" = 2 ] && symtab=$i
+			fi
+		done
+		if [ "$symtab" -lt 0 ]; then
+			_bt_err "nm: $file: no symbols"
+			status=1
+			continue
+		fi
+		stroff=${shoffset[${shlink[symtab]}]}
+		symsize=${shentsz[symtab]}
+		[ "$symsize" -gt 0 ] || symsize=24
+		symcount=$(( shsize[symtab] / symsize ))
+
+		snames=() svalue=() ssize=() stype=() sundef=()
+		for (( i = 1; i < symcount; i++ )); do
+			off=$(( shoffset[symtab] + i * symsize ))
+			if [ "$elfclass" = 2 ]; then
+				_bt_elf_num "$off" 4; name=$_bt_int
+				info=${_bt_b[off+4]}
+				_bt_elf_num $(( off + 6 )) 2; shndx=$_bt_int
+				_bt_elf_num $(( off + 8 )) 8; value=$_bt_int
+				_bt_elf_num $(( off + 16 )) 8; size=$_bt_int
+			else
+				_bt_elf_num "$off" 4; name=$_bt_int
+				_bt_elf_num $(( off + 4 )) 4; value=$_bt_int
+				_bt_elf_num $(( off + 8 )) 4; size=$_bt_int
+				info=${_bt_b[off+12]}
+				_bt_elf_num $(( off + 14 )) 2; shndx=$_bt_int
+			fi
+			bind=$(( info >> 4 ))
+			styp=$(( info & 15 ))
+			_bt_b_str $(( stroff + name )) 4096
+			name=$_bt_str
+			if [ -z "$name" ] && [ "$styp" = 3 ] &&
+			   [ "$shndx" -lt "$shnum" ]; then
+				# a section's symbol carries no name of its own;
+				# the section header has it
+				_bt_b_str $(( shoffset[shstrndx] + shname[shndx] )) 4096
+				name=$_bt_str
+			fi
+			[ -n "$name" ] || [ "$showall" = 1 ] || continue
+			if [ "$showall" = 0 ]; then
+				# section and file names are not symbols anyone asked for
+				[ "$styp" = 3 ] && continue
+				[ "$styp" = 4 ] && continue
+			fi
+			[ "$onlyext" = 1 ] && [ "$bind" = 0 ] && continue
+			if [ "$styp" = 4 ]; then
+				_bt_str=a
+			else
+				_bt_nm_type "$bind" "$styp" "$shndx"
+			fi
+			[ "$onlyundef" = 1 ] && [ "$shndx" != 0 ] && continue
+			snames+=("$name")
+			svalue+=("$value")
+			ssize+=("$size")
+			stype+=("$_bt_str")
+			if [ "$shndx" = 0 ]; then sundef+=(1); else sundef+=(0); fi
+		done
+
+		if [ "$nosort" = 1 ]; then
+			order=()
+			for (( i = 0; i < ${#snames[@]}; i++ )); do order+=("$i"); done
+		else
+			_bt_nm_sort
+		fi
+
+		if [ "$many" = 1 ] && [ "$prefix" = 0 ] && [ "$posix" = 0 ]; then
+			printf '\n%s:\n' "$file"
+		fi
+		fmt=$base
+		for i in ${order[@]+"${order[@]}"}; do
+			if [ "$posix" = 1 ]; then
+				[ "$prefix" = 1 ] && printf '%s:' "$file"
+				if [ "${sundef[i]}" = 1 ]; then
+					printf '%s %s         \n' "${snames[i]}" "${stype[i]}"
+				else
+					printf -v val "%$fmt" "${svalue[i]}"
+					printf '%s %s %s ' "${snames[i]}" "${stype[i]}" "$val"
+					# a symbol of no size gets no size printed
+					if [ "${ssize[i]}" = 0 ]; then
+						printf '\n'
+					else
+						printf -v val "%$fmt" "${ssize[i]}"
+						printf '%s\n' "$val"
+					fi
+				fi
+				continue
+			fi
+			[ "$prefix" = 1 ] && printf '%s:' "$file"
+			if [ "${sundef[i]}" = 1 ]; then
+				printf '%16s %s %s\n' '' "${stype[i]}" "${snames[i]}"
+			else
+				if [ "$elfclass" = 2 ]; then
+					printf -v val "%016$fmt" "${svalue[i]}"
+				else
+					printf -v val "%08$fmt" "${svalue[i]}"
+				fi
+				printf '%s %s %s\n' "$val" "${stype[i]}" "${snames[i]}"
+			fi
+		done
+	done
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# The SCCS utilities -- POSIX.1-2017: admin, delta, get, prs, rmdel, sact,
+# sccs, unget, val.
+#
+# An SCCS file is a text file with control lines that begin with SOH (^A): a
+# checksum, a table of deltas newest first, the list of who may edit it, the
+# flags, the descriptive text, and then the body -- every line any version ever
+# had, wrapped in ^AI, ^AD and ^AE lines that say which delta put it there and
+# which delta took it away.  A version is read out by walking the body and
+# keeping the lines the wanted delta can see.
+#
+# Branches are not offered: the deltas here run 1.1, 1.2, 1.3 up the trunk.
+# ---------------------------------------------------------------------------
+
+_BT_SOH=$'\001'
+
+# Add up every byte of file $1 except its first line, which is where the sum
+# itself is written.  Leaves the answer in _bt_int.
+_bt_sccs_sum() {
+	local fd line sum=0 i first=1 c
+	local -a bytes=()
+	_bt_int=0
+	{ exec {fd}<"$1"; } 2>/dev/null || return 1
+	while IFS= read -r line || [ -n "$line" ]; do
+		if [ "$first" = 1 ]; then first=0; line=; continue; fi
+		for (( i = 0; i < ${#line}; i++ )); do
+			printf -v c '%d' "'${line:i:1}"
+			sum=$(( sum + c ))
+		done
+		sum=$(( sum + 10 ))
+		line=
+	done <&"$fd"
+	exec {fd}<&-
+	_bt_int=$(( sum % 65536 ))
+	return 0
+}
+
+# Read the SCCS file $1 into the arrays the other commands work from.
+_bt_sccs_read() {
+	local fd line rest key i
+	sc_sums= sc_flags=() sc_desc=() sc_users=() sc_body=()
+	sc_type=() sc_sid=() sc_date=() sc_time=() sc_user=() sc_serial=()
+	sc_pred=() sc_ins=() sc_del=() sc_unc=() sc_comment=() sc_mr=()
+	{ exec {fd}<"$1"; } 2>/dev/null || return 1
+	IFS= read -r line <&"$fd" || { exec {fd}<&-; return 1; }
+	case $line in
+	"$_BT_SOH"h*)	sc_sums=${line#"$_BT_SOH"h} ;;
+	*)		exec {fd}<&-; return 1 ;;
+	esac
+	i=-1
+	while IFS= read -r line <&"$fd"; do
+		case $line in
+		"$_BT_SOH"s*)	rest=${line#"$_BT_SOH"s }
+				i=$(( i + 1 ))
+				sc_ins+=("${rest%%/*}")
+				rest=${rest#*/}
+				sc_del+=("${rest%%/*}")
+				sc_unc+=("${rest#*/}")
+				sc_comment+=('')
+				sc_mr+=('') ;;
+		"$_BT_SOH"d*)	rest=${line#"$_BT_SOH"d }
+				set -- $rest
+				sc_type+=("$1") sc_sid+=("$2") sc_date+=("$3")
+				sc_time+=("$4") sc_user+=("$5") sc_serial+=("$6")
+				sc_pred+=("$7") ;;
+		"$_BT_SOH"c*)	rest=${line#"$_BT_SOH"c}
+				rest=${rest# }
+				if [ -n "${sc_comment[i]}" ]; then
+					sc_comment[i]=${sc_comment[i]}$'\n'$rest
+				else
+					sc_comment[i]=$rest
+				fi ;;
+		"$_BT_SOH"m*)	rest=${line#"$_BT_SOH"m}
+				rest=${rest# }
+				if [ -n "${sc_mr[i]}" ]; then
+					sc_mr[i]=${sc_mr[i]}$'\n'$rest
+				else
+					sc_mr[i]=$rest
+				fi ;;
+		"$_BT_SOH"e)	;;
+		"$_BT_SOH"u)	while IFS= read -r line <&"$fd"; do
+					[ "$line" = "${_BT_SOH}U" ] && break
+					sc_users+=("$line")
+				done ;;
+		"$_BT_SOH"f*)	rest=${line#"$_BT_SOH"f }
+				key=${rest%% *}
+				if [ "$key" = "$rest" ]; then
+					sc_flags[$key]=
+				else
+					sc_flags[$key]=${rest#* }
+				fi ;;
+		"$_BT_SOH"t)	while IFS= read -r line <&"$fd"; do
+					[ "$line" = "${_BT_SOH}T" ] && break
+					sc_desc+=("$line")
+				done ;;
+		*)		sc_body+=("$line") ;;
+		esac
+	done
+	exec {fd}<&-
+	return 0
+}
+
+# Write the SCCS file $1 from the arrays, checksum and all.  The file is built
+# in memory first so that its own sum can go in the line that holds it, which
+# saves writing a second file that nothing here could remove afterwards.
+_bt_sccs_write() {
+	local out=$1 fd i n line sum=0 c j
+	local -a text=()
+	n=${#sc_serial[@]}
+	for (( i = 0; i < n; i++ )); do
+		printf -v line '%ss %05d/%05d/%05d' "$_BT_SOH" "${sc_ins[i]}" \
+			"${sc_del[i]}" "${sc_unc[i]}"
+		text+=("$line")
+		printf -v line '%sd %s %s %s %s %s %s %s' "$_BT_SOH" "${sc_type[i]}" \
+			"${sc_sid[i]}" "${sc_date[i]}" "${sc_time[i]}" \
+			"${sc_user[i]}" "${sc_serial[i]}" "${sc_pred[i]}"
+		text+=("$line")
+		if [ -n "${sc_mr[i]}" ]; then
+			while IFS= read -r line; do
+				text+=("${_BT_SOH}m $line")
+			done <<< "${sc_mr[i]}"
+		fi
+		if [ -n "${sc_comment[i]}" ]; then
+			while IFS= read -r line; do
+				text+=("${_BT_SOH}c $line")
+			done <<< "${sc_comment[i]}"
+		fi
+		text+=("${_BT_SOH}e")
+	done
+	text+=("${_BT_SOH}u")
+	for i in ${sc_users[@]+"${sc_users[@]}"}; do text+=("$i"); done
+	text+=("${_BT_SOH}U")
+	for i in ${!sc_flags[@]}; do
+		if [ -n "${sc_flags[$i]}" ]; then
+			text+=("${_BT_SOH}f $i ${sc_flags[$i]}")
+		else
+			text+=("${_BT_SOH}f $i")
+		fi
+	done
+	text+=("${_BT_SOH}t")
+	for i in ${sc_desc[@]+"${sc_desc[@]}"}; do text+=("$i"); done
+	text+=("${_BT_SOH}T")
+	for (( i = 0; i < ${#sc_body[@]}; i++ )); do text+=("${sc_body[i]}"); done
+
+	for (( i = 0; i < ${#text[@]}; i++ )); do
+		line=${text[i]}
+		for (( j = 0; j < ${#line}; j++ )); do
+			printf -v c '%d' "'${line:j:1}"
+			sum=$(( sum + c ))
+		done
+		sum=$(( sum + 10 ))
+	done
+	sum=$(( sum % 65536 ))
+
+	if ! { exec {fd}>"$out"; } 2>/dev/null; then
+		_bt_err "$_bt_sccs_who: cannot write $out"
+		return 1
+	fi
+	printf '%sh%05d\n' "$_BT_SOH" "$sum" >&"$fd"
+	for (( i = 0; i < ${#text[@]}; i++ )); do
+		printf '%s\n' "${text[i]}" >&"$fd"
+	done
+	exec {fd}>&-
+	return 0
+}
+
+# Nothing in a shell can remove a file, so what stands in for it here is
+# leaving the file empty: the p-file with no edits in it means no edits are
+# pending, and the g-file with nothing in it is the file delta took away.
+_bt_sccs_unlink() {
+	: > "$1" 2>/dev/null
+	return 0
+}
+
+# The text of the version with serial $1, into the `sc_text` array.
+_bt_sccs_apply() {
+	local want=$1 i n line cmd ser keep j
+	local -a stack=()
+	sc_text=()
+	n=${#sc_body[@]}
+	for (( i = 0; i < n; i++ )); do
+		line=${sc_body[i]}
+		case $line in
+		"$_BT_SOH"[IDE]*)
+			cmd=${line:1:1}
+			ser=${line#* }
+			if [ "$cmd" = E ]; then
+				unset "stack[${#stack[@]}-1]"
+			else
+				stack+=("$cmd$ser")
+			fi
+			continue ;;
+		esac
+		keep=1
+		for (( j = 0; j < ${#stack[@]}; j++ )); do
+			cmd=${stack[j]:0:1}
+			ser=${stack[j]:1}
+			if [ "$cmd" = D ] && [ "$ser" -le "$want" ]; then keep=0; break; fi
+		done
+		if [ "$keep" = 1 ]; then
+			for (( j = ${#stack[@]} - 1; j >= 0; j-- )); do
+				[ "${stack[j]:0:1}" = I ] || continue
+				[ "${stack[j]:1}" -gt "$want" ] && keep=0
+				break
+			done
+		fi
+		[ "$keep" = 1 ] && sc_text+=("$line")
+	done
+	return 0
+}
+
+# The index in the delta table of SID $1, or of the newest delta when $1 is
+# empty.  Leaves it in _bt_int, or -1.
+_bt_sccs_find() {
+	local want=$1 i
+	_bt_int=-1
+	if [ -z "$want" ]; then
+		[ "${#sc_sid[@]}" -gt 0 ] && _bt_int=0
+		return 0
+	fi
+	for (( i = 0; i < ${#sc_sid[@]}; i++ )); do
+		if [ "${sc_sid[i]}" = "$want" ]; then _bt_int=$i; return 0; fi
+	done
+	return 0
+}
+
+# The SID that follows $1 up the trunk.
+_bt_sccs_next() {
+	local sid=$1
+	_bt_str=$(( ${sid%%.*} )).$(( ${sid#*.} + 1 ))
+	return 0
+}
+
+# Today, the way an SCCS file writes it.
+_bt_sccs_now() {
+	printf -v sc_today '%(%y/%m/%d)T' -1
+	printf -v sc_clock '%(%H:%M:%S)T' -1
+	return 0
+}
+
+# Who is running this.
+_bt_sccs_whoami() {
+	local _bt_name _bt_uid _bt_gid
+	local _bt_ruid _bt_euid _bt_rgid _bt_egid
+	local -a _bt_supp=()
+	_bt_self_ids
+	if _bt_passwd "$_bt_euid" uid; then sc_me=$_bt_name; else sc_me=$_bt_euid; fi
+	return 0
+}
+
+# The same walk as _bt_sccs_apply, but recording for every body line whether
+# the wanted version has it, in `sc_in`.
+_bt_sccs_mark() {
+	local want=$1 i n line cmd ser keep j
+	local -a stack=()
+	sc_text=() sc_in=()
+	n=${#sc_body[@]}
+	for (( i = 0; i < n; i++ )); do
+		line=${sc_body[i]}
+		case $line in
+		"$_BT_SOH"[IDE]*)
+			cmd=${line:1:1}
+			ser=${line#* }
+			if [ "$cmd" = E ]; then
+				unset "stack[${#stack[@]}-1]"
+			else
+				stack+=("$cmd$ser")
+			fi
+			sc_in+=(2)
+			continue ;;
+		esac
+		keep=1
+		for (( j = 0; j < ${#stack[@]}; j++ )); do
+			cmd=${stack[j]:0:1}
+			ser=${stack[j]:1}
+			if [ "$cmd" = D ] && [ "$ser" -le "$want" ]; then keep=0; break; fi
+		done
+		if [ "$keep" = 1 ]; then
+			for (( j = ${#stack[@]} - 1; j >= 0; j-- )); do
+				[ "${stack[j]:0:1}" = I ] || continue
+				[ "${stack[j]:1}" -gt "$want" ] && keep=0
+				break
+			done
+		fi
+		sc_in+=("$keep")
+		[ "$keep" = 1 ] && sc_text+=("$line")
+	done
+	return 0
+}
+
+# The g-file and p-file names that go with the SCCS file $1.
+_bt_sccs_names() {
+	local f=$1 dir base
+	dir=${f%/*}
+	[ "$dir" = "$f" ] && dir=.
+	base=${f##*/}
+	case $base in
+	s.*)	;;
+	*)	return 1 ;;
+	esac
+	sc_gfile=${base#s.}
+	sc_pfile=$dir/p.${base#s.}
+	sc_sfile=$f
+	[ "$dir" = . ] || sc_gfile=$dir/${base#s.}
+	return 0
+}
+
+admin () {
+	local LC_ALL=C
+	local _bt_sccs_who=admin
+	local arg opt init= empty=0 sfile= comment= tfile= settext=0 i line fd
+	local status=0 rel= sc_today sc_clock sc_me
+	local -a sc_type=() sc_sid=() sc_date=() sc_time=() sc_user=() sc_serial=()
+	local -a sc_pred=() sc_ins=() sc_del=() sc_unc=() sc_comment=() sc_mr=()
+	local -a sc_users=() sc_desc=() sc_body=() sc_text=() sc_in=()
+	local -A sc_flags=()
+	local sc_sums sc_gfile sc_pfile sc_sfile _bt_int _bt_str
+	local -a adds=() dels=() fset=() fdel=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-i*)	init=${1#-i}; shift; [ -n "$init" ] || init=- ;;
+		-n)	empty=1; shift ;;
+		-r*)	rel=${1#-r}; shift ;;
+		-y*)	comment=${1#-y}; shift ;;
+		-t*)	tfile=${1#-t}; settext=1; shift ;;
+		-a*)	adds+=("${1#-a}"); shift ;;
+		-e*)	dels+=("${1#-e}"); shift ;;
+		-f*)	fset+=("${1#-f}"); shift ;;
+		-d*)	fdel+=("${1#-d}"); shift ;;
+		-h|-z)	shift ;;
+		-*)	_bt_err "admin: illegal option -- ${1#-}"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" != 1 ]; then
+		_bt_err "usage: admin -i[file] [-n] [-r SID] [-y comment] [-fflag] s.file"
+		_bt_err "       admin [-a user] [-e user] [-fflag] [-dflag] [-t[file]] s.file"
+		return 1
+	fi
+	sfile=$1
+	if ! _bt_sccs_names "$sfile"; then
+		_bt_err "admin: $sfile: not an SCCS file name"
+		return 1
+	fi
+
+	if [ -n "$init" ] || [ "$empty" = 1 ]; then
+		if [ -s "$sfile" ]; then
+			_bt_err "admin: $sfile is already there"
+			return 1
+		fi
+		_bt_sccs_now
+		_bt_sccs_whoami
+		sc_body=()
+		if [ "$empty" = 0 ]; then
+			if [ "$init" = - ]; then
+				line=
+				while IFS= read -r line; do sc_body+=("$line"); line=; done
+				[ -n "$line" ] && sc_body+=("$line")
+			elif { exec {fd}<"$init"; } 2>/dev/null; then
+				line=
+				while IFS= read -r line <&"$fd"; do sc_body+=("$line"); line=; done
+				[ -n "$line" ] && sc_body+=("$line")
+				exec {fd}<&-
+			else
+				_bt_err "admin: cannot open $init"
+				return 1
+			fi
+		fi
+		i=${#sc_body[@]}
+		sc_body=( "${_BT_SOH}I 1" ${sc_body[@]+"${sc_body[@]}"} "${_BT_SOH}E 1" )
+		sc_type=(D) sc_sid=("${rel:-1.1}") sc_date=("$sc_today") sc_time=("$sc_clock")
+		sc_user=("$sc_me") sc_serial=(1) sc_pred=(0)
+		sc_ins=("$i") sc_del=(0) sc_unc=(0)
+		sc_comment=("${comment:-date and time created $sc_today $sc_clock by $sc_me}")
+		sc_mr=('')
+		sc_users=() sc_desc=()
+	else
+		if ! _bt_sccs_read "$sfile"; then
+			_bt_err "admin: $sfile: not an SCCS file"
+			return 1
+		fi
+	fi
+
+	for i in ${adds[@]+"${adds[@]}"}; do sc_users+=("$i"); done
+	for i in ${dels[@]+"${dels[@]}"}; do
+		local -a keep=()
+		local u
+		for u in ${sc_users[@]+"${sc_users[@]}"}; do
+			[ "$u" = "$i" ] || keep+=("$u")
+		done
+		sc_users=( ${keep[@]+"${keep[@]}"} )
+	done
+	for i in ${fset[@]+"${fset[@]}"}; do
+		sc_flags[${i:0:1}]=${i:1}
+	done
+	for i in ${fdel[@]+"${fdel[@]}"}; do
+		unset "sc_flags[${i:0:1}]"
+	done
+	if [ "$settext" = 1 ]; then
+		sc_desc=()
+		if [ -n "$tfile" ] && { exec {fd}<"$tfile"; } 2>/dev/null; then
+			line=
+			while IFS= read -r line <&"$fd"; do sc_desc+=("$line"); line=; done
+			[ -n "$line" ] && sc_desc+=("$line")
+			exec {fd}<&-
+		fi
+	fi
+
+	_bt_sccs_write "$sfile" || return 1
+	return "$status"
+}
+
+get () {
+	local LC_ALL=C
+	local _bt_sccs_who=get
+	local arg opt sid= edit=0 topipe=0 silent=0 nog=0 keep=0 i n fd line
+	local status=0 sc_today sc_clock sc_me newsid
+	local -a sc_type=() sc_sid=() sc_date=() sc_time=() sc_user=() sc_serial=()
+	local -a sc_pred=() sc_ins=() sc_del=() sc_unc=() sc_comment=() sc_mr=()
+	local -a sc_users=() sc_desc=() sc_body=() sc_text=() sc_in=()
+	local -A sc_flags=()
+	local sc_sums sc_gfile sc_pfile sc_sfile _bt_int _bt_str
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-r*)	sid=${1#-r}; shift ;;
+		-e)	edit=1; shift ;;
+		-p)	topipe=1; shift ;;
+		-s)	silent=1; shift ;;
+		-g)	nog=1; shift ;;
+		-k)	keep=1; shift ;;
+		-m|-n|-b|-t)	shift ;;
+		-c*|-w*|-x*|-i*|-a*|-l*)	shift ;;
+		-*)	_bt_err "get: illegal option -- ${1#-}"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -lt 1 ]; then
+		_bt_err "usage: get [-e] [-k] [-p] [-s] [-g] [-r SID] s.file..."
+		return 1
+	fi
+
+	for arg in "$@"; do
+		if ! _bt_sccs_names "$arg" || ! _bt_sccs_read "$arg"; then
+			_bt_err "get: $arg: not an SCCS file"
+			status=1
+			continue
+		fi
+		_bt_sccs_find "$sid"
+		i=$_bt_int
+		if [ "$i" -lt 0 ]; then
+			_bt_err "get: $arg: no such delta $sid"
+			status=1
+			continue
+		fi
+		_bt_sccs_apply "${sc_serial[i]}"
+		[ "$silent" = 1 ] || printf '%s\n' "${sc_sid[i]}"
+		if [ "$edit" = 1 ]; then
+			_bt_sccs_next "${sc_sid[i]}"
+			newsid=$_bt_str
+			[ "$silent" = 1 ] || printf 'new delta %s\n' "$newsid"
+			_bt_sccs_now
+			_bt_sccs_whoami
+			printf '%s %s %s %s %s\n' "${sc_sid[i]}" "$newsid" "$sc_me" \
+				"$sc_today" "$sc_clock" >> "$sc_pfile"
+		fi
+		n=${#sc_text[@]}
+		if [ "$topipe" = 1 ]; then
+			[ "$n" -gt 0 ] && printf '%s\n' "${sc_text[@]}"
+		elif [ "$nog" = 0 ]; then
+			if ! { exec {fd}>"$sc_gfile"; } 2>/dev/null; then
+				_bt_err "get: cannot write $sc_gfile"
+				status=1
+				continue
+			fi
+			for (( n = 0; n < ${#sc_text[@]}; n++ )); do
+				printf '%s\n' "${sc_text[n]}" >&"$fd"
+			done
+			exec {fd}>&-
+			n=${#sc_text[@]}
+		fi
+		[ "$silent" = 1 ] || printf '%d lines\n' "$n"
+	done
+	return "$status"
+}
+
+sact () {
+	local LC_ALL=C
+	local arg line status=0
+	local sc_gfile sc_pfile sc_sfile
+	if [ "$#" -lt 1 ]; then
+		_bt_err "usage: sact s.file..."
+		return 1
+	fi
+	for arg in "$@"; do
+		if ! _bt_sccs_names "$arg"; then
+			_bt_err "sact: $arg: not an SCCS file name"
+			status=1
+			continue
+		fi
+		if [ ! -s "$sc_pfile" ]; then
+			_bt_err "sact: $arg: no edits pending"
+			status=1
+			continue
+		fi
+		[ "$#" -gt 1 ] && printf '\n%s:\n' "$arg"
+		while IFS= read -r line; do
+			printf '%s\n' "$line"
+		done < "$sc_pfile"
+	done
+	return "$status"
+}
+
+unget () {
+	local LC_ALL=C
+	local arg sid= keep=0 silent=0 status=0 line found=0
+	local sc_gfile sc_pfile sc_sfile
+	local -a lines=()
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-r*)	sid=${1#-r}; shift ;;
+		-n)	keep=1; shift ;;
+		-s)	silent=1; shift ;;
+		-*)	_bt_err "unget: illegal option -- ${1#-}"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -lt 1 ]; then
+		_bt_err "usage: unget [-ns] [-r SID] s.file..."
+		return 1
+	fi
+	for arg in "$@"; do
+		if ! _bt_sccs_names "$arg"; then
+			_bt_err "unget: $arg: not an SCCS file name"
+			status=1
+			continue
+		fi
+		if [ ! -s "$sc_pfile" ]; then
+			_bt_err "unget: $arg: no edits pending"
+			status=1
+			continue
+		fi
+		lines=()
+		found=0
+		while IFS= read -r line; do
+			set -- $line
+			if [ "$found" = 0 ] && { [ -z "$sid" ] || [ "$2" = "$sid" ]; }; then
+				found=1
+				[ "$silent" = 1 ] || printf '%s\n' "$2"
+				continue
+			fi
+			lines+=("$line")
+		done < "$sc_pfile"
+		if [ "$found" = 0 ]; then
+			_bt_err "unget: $arg: no such delta pending"
+			status=1
+			continue
+		fi
+		if [ "${#lines[@]}" = 0 ]; then
+			_bt_sccs_unlink "$sc_pfile"
+		else
+			printf '%s\n' "${lines[@]}" > "$sc_pfile"
+		fi
+		[ "$keep" = 1 ] || _bt_sccs_unlink "$sc_gfile"
+	done
+	return "$status"
+}
+
+delta () {
+	local LC_ALL=C
+	local _bt_sccs_who=delta
+	local arg sid= comment= mrs= silent=0 keep=0 status=0
+	local i j k n line fd oldsid newsid serial pi
+	local sc_today sc_clock sc_me
+	local -a sc_type=() sc_sid=() sc_date=() sc_time=() sc_user=() sc_serial=()
+	local -a sc_pred=() sc_ins=() sc_del=() sc_unc=() sc_comment=() sc_mr=()
+	local -a sc_users=() sc_desc=() sc_body=() sc_text=() sc_in=()
+	local -A sc_flags=()
+	local sc_sums sc_gfile sc_pfile sc_sfile _bt_int _bt_str
+	local -a plines=() newlines=() opos=() odel=() oins=() newbody=()
+	local script inserted=0 deleted=0 unchanged=0
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-r*)	sid=${1#-r}; shift ;;
+		-y*)	comment=${1#-y}; shift ;;
+		-m*)	mrs=${1#-m}; shift ;;
+		-s)	silent=1; shift ;;
+		-n)	keep=1; shift ;;
+		-p|-g*)	shift ;;
+		-*)	_bt_err "delta: illegal option -- ${1#-}"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -lt 1 ]; then
+		_bt_err "usage: delta [-nps] [-r SID] [-y comment] s.file..."
+		return 1
+	fi
+
+	for arg in "$@"; do
+		if ! _bt_sccs_names "$arg" || ! _bt_sccs_read "$arg"; then
+			_bt_err "delta: $arg: not an SCCS file"
+			status=1
+			continue
+		fi
+		if [ ! -s "$sc_pfile" ]; then
+			_bt_err "delta: $arg: no edits pending"
+			status=1
+			continue
+		fi
+		plines=()
+		oldsid= newsid=
+		while IFS= read -r line; do
+			set -- $line
+			if [ -z "$newsid" ] && { [ -z "$sid" ] || [ "$2" = "$sid" ]; }; then
+				oldsid=$1 newsid=$2
+				continue
+			fi
+			plines+=("$line")
+		done < "$sc_pfile"
+		if [ -z "$newsid" ]; then
+			_bt_err "delta: $arg: no such delta pending"
+			status=1
+			continue
+		fi
+
+		_bt_sccs_find "$oldsid"
+		i=$_bt_int
+		if [ "$i" -lt 0 ]; then
+			_bt_err "delta: $arg: no such delta $oldsid"
+			status=1
+			continue
+		fi
+		_bt_sccs_mark "${sc_serial[i]}"
+
+		# the old text on one side, the file as it stands on the other;
+		# the old text goes through a pipe, since a file left behind here
+		# is a file nothing could remove afterwards
+		if [ ! -r "$sc_gfile" ]; then
+			_bt_err "delta: $arg: cannot read $sc_gfile"
+			status=1
+			continue
+		fi
+		# diff reports a difference by its exit status, which is the whole
+		# point of running it, so that status is not an error here
+		script=$( diff -e <(
+			[ "${#sc_text[@]}" -gt 0 ] && printf '%s\n' "${sc_text[@]}"
+			:
+		) "$sc_gfile" ) || :
+
+		# the ed script runs backwards; the body has to be built forwards
+		opos=() odel=() oins=()
+		_bt_sccs_ops "$script"
+
+		serial=1
+		for (( j = 0; j < ${#sc_serial[@]}; j++ )); do
+			[ "${sc_serial[j]}" -ge "$serial" ] && serial=$(( sc_serial[j] + 1 ))
+		done
+		_bt_sccs_build "$serial"
+
+		unchanged=$(( ${#sc_text[@]} - deleted ))
+		_bt_sccs_now
+		_bt_sccs_whoami
+		sc_body=( ${newbody[@]+"${newbody[@]}"} )
+		sc_type=(D ${sc_type[@]+"${sc_type[@]}"})
+		sc_sid=("$newsid" ${sc_sid[@]+"${sc_sid[@]}"})
+		sc_date=("$sc_today" ${sc_date[@]+"${sc_date[@]}"})
+		sc_time=("$sc_clock" ${sc_time[@]+"${sc_time[@]}"})
+		sc_user=("$sc_me" ${sc_user[@]+"${sc_user[@]}"})
+		sc_serial=("$serial" ${sc_serial[@]+"${sc_serial[@]}"})
+		sc_pred=("${sc_serial[1]}" ${sc_pred[@]+"${sc_pred[@]}"})
+		sc_ins=("$inserted" ${sc_ins[@]+"${sc_ins[@]}"})
+		sc_del=("$deleted" ${sc_del[@]+"${sc_del[@]}"})
+		sc_unc=("$unchanged" ${sc_unc[@]+"${sc_unc[@]}"})
+		sc_comment=("${comment:-delta $newsid}" ${sc_comment[@]+"${sc_comment[@]}"})
+		sc_mr=("$mrs" ${sc_mr[@]+"${sc_mr[@]}"})
+
+		_bt_sccs_write "$arg" || { status=1; continue; }
+		if [ "${#plines[@]}" = 0 ]; then
+			_bt_sccs_unlink "$sc_pfile"
+		else
+			printf '%s\n' "${plines[@]}" > "$sc_pfile"
+		fi
+		[ "$keep" = 1 ] || _bt_sccs_unlink "$sc_gfile"
+		if [ "$silent" = 0 ]; then
+			printf '%s\n' "$newsid"
+			printf '%d inserted\n%d deleted\n%d unchanged\n' \
+				"$inserted" "$deleted" "$unchanged"
+		fi
+	done
+	return "$status"
+}
+
+# Turn the ed script $1 into the parallel arrays opos, odel and oins, in the
+# order the lines come in rather than the order ed would apply them.  The
+# inserted text of each change is one string, its lines joined by newlines.
+_bt_sccs_ops() {
+	local line cmd a b text collecting=0
+	local -a p=() d=() ins=()
+	while IFS= read -r line; do
+		if [ "$collecting" = 1 ]; then
+			if [ "$line" = '.' ]; then collecting=0; continue; fi
+			if [ -n "${ins[${#ins[@]}-1]}" ]; then
+				ins[${#ins[@]}-1]=${ins[${#ins[@]}-1]}$'\n'$line
+			else
+				ins[${#ins[@]}-1]=$line
+			fi
+			continue
+		fi
+		case $line in
+		*[acd])	cmd=${line: -1}
+			text=${line%?}
+			a=${text%%,*}
+			b=${text#*,}
+			[ "$b" = "$text" ] && b=$a ;;
+		*)	continue ;;
+		esac
+		case $cmd in
+		a)	p+=($(( a + 1 ))); d+=(0); ins+=(''); collecting=1 ;;
+		c)	p+=("$a"); d+=($(( b - a + 1 ))); ins+=(''); collecting=1 ;;
+		d)	p+=("$a"); d+=($(( b - a + 1 ))); ins+=('') ;;
+		esac
+	done <<< "$1"
+	# ed scripts run from the end of the file backwards
+	local i n=${#p[@]}
+	opos=() odel=() oins=()
+	for (( i = n - 1; i >= 0; i-- )); do
+		opos+=("${p[i]}")
+		odel+=("${d[i]}")
+		oins+=("${ins[i]}")
+	done
+	return 0
+}
+
+# Build the new body for a delta with serial $1.  Relies on its caller.
+_bt_sccs_build() {
+	local ser=$1 i k vline=0 opi=0 dopen=0 delend=0 pend= line n
+	newbody=()
+	inserted=0 deleted=0
+	n=${#sc_body[@]}
+	for (( i = 0; i < n; i++ )); do
+		line=${sc_body[i]}
+		if [ "${sc_in[i]}" != 1 ]; then
+			if [ "$dopen" = 1 ]; then
+				newbody+=("${_BT_SOH}E $ser")
+				dopen=2
+			fi
+			newbody+=("$line")
+			if [ "$dopen" = 2 ]; then
+				newbody+=("${_BT_SOH}D $ser")
+				dopen=1
+			fi
+			continue
+		fi
+		vline=$(( vline + 1 ))
+		while [ "$dopen" = 0 ] && [ "$opi" -lt "${#opos[@]}" ] &&
+		      [ "${opos[opi]}" = "$vline" ]; do
+			if [ "${odel[opi]}" -gt 0 ]; then
+				newbody+=("${_BT_SOH}D $ser")
+				dopen=1
+				delend=$(( vline + odel[opi] - 1 ))
+				deleted=$(( deleted + odel[opi] ))
+				pend=${oins[opi]}
+				opi=$(( opi + 1 ))
+				break
+			fi
+			_bt_sccs_emitins "$ser" "${oins[opi]}"
+			opi=$(( opi + 1 ))
+		done
+		newbody+=("$line")
+		if [ "$dopen" = 1 ] && [ "$vline" = "$delend" ]; then
+			newbody+=("${_BT_SOH}E $ser")
+			dopen=0
+			if [ -n "$pend" ]; then
+				_bt_sccs_emitins "$ser" "$pend"
+				pend=
+			fi
+		fi
+	done
+	if [ "$dopen" != 0 ]; then
+		newbody+=("${_BT_SOH}E $ser")
+		[ -n "$pend" ] && _bt_sccs_emitins "$ser" "$pend"
+	fi
+	while [ "$opi" -lt "${#opos[@]}" ]; do
+		if [ "${odel[opi]}" -gt 0 ]; then
+			deleted=$(( deleted + odel[opi] ))
+		fi
+		_bt_sccs_emitins "$ser" "${oins[opi]}"
+		opi=$(( opi + 1 ))
+	done
+	return 0
+}
+
+# Put an insert block of the lines in $2 into the body being built.
+_bt_sccs_emitins() {
+	local ser=$1 text=$2 line
+	[ -n "$text" ] || return 0
+	newbody+=("${_BT_SOH}I $ser")
+	while IFS= read -r line; do
+		newbody+=("$line")
+		inserted=$(( inserted + 1 ))
+	done <<< "$text"
+	newbody+=("${_BT_SOH}E $ser")
+	return 0
+}
+
+prs () {
+	local LC_ALL=C
+	local arg sid= dataspec= earlier=0 later=0 status=0 i n line first=1
+	local -a sc_type=() sc_sid=() sc_date=() sc_time=() sc_user=() sc_serial=()
+	local -a sc_pred=() sc_ins=() sc_del=() sc_unc=() sc_comment=() sc_mr=()
+	local -a sc_users=() sc_desc=() sc_body=() sc_text=() sc_in=()
+	local -A sc_flags=()
+	local sc_sums sc_gfile sc_pfile sc_sfile _bt_int _bt_str
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-r*)	sid=${1#-r}; shift ;;
+		-d*)	dataspec=${1#-d}; shift ;;
+		-e)	earlier=1; shift ;;
+		-l)	later=1; shift ;;
+		-a)	shift ;;
+		-c*)	shift ;;
+		-*)	_bt_err "prs: illegal option -- ${1#-}"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -lt 1 ]; then
+		_bt_err "usage: prs [-a] [-d dataspec] [-r SID] [-e|-l] s.file..."
+		return 1
+	fi
+
+	for arg in "$@"; do
+		if ! _bt_sccs_names "$arg" || ! _bt_sccs_read "$arg"; then
+			_bt_err "prs: $arg: not an SCCS file"
+			status=1
+			continue
+		fi
+		_bt_sccs_find "$sid"
+		i=$_bt_int
+		if [ "$i" -lt 0 ]; then
+			_bt_err "prs: $arg: no such delta $sid"
+			status=1
+			continue
+		fi
+		n=${#sc_sid[@]}
+		if [ -n "$dataspec" ]; then
+			_bt_sccs_data "$i" "$dataspec"
+			continue
+		fi
+		printf '%s:\n\n' "$arg"
+		if [ "$earlier" = 1 ]; then
+			for (( ; i < n; i++ )); do _bt_sccs_report "$i"; done
+		elif [ "$later" = 1 ]; then
+			for (( ; i >= 0; i-- )); do _bt_sccs_report "$i"; done
+		else
+			_bt_sccs_report "$i"
+		fi
+	done
+	return "$status"
+}
+
+# The report prs writes for the delta at index $1.
+_bt_sccs_report() {
+	local i=$1 line
+	printf '%s %s %s %s %s %s %s\n' "${sc_type[i]}" "${sc_sid[i]}" \
+		"${sc_date[i]}" "${sc_time[i]}" "${sc_user[i]}" \
+		"${sc_serial[i]}" "${sc_pred[i]}"
+	printf '%05d/%05d/%05d\n' "${sc_ins[i]}" "${sc_del[i]}" "${sc_unc[i]}"
+	printf 'MRs:\n'
+	if [ -n "${sc_mr[i]}" ]; then
+		while IFS= read -r line; do printf '%s\n' "$line"; done <<< "${sc_mr[i]}"
+	fi
+	printf 'COMMENTS:\n'
+	if [ -n "${sc_comment[i]}" ]; then
+		while IFS= read -r line; do printf '%s\n' "$line"; done <<< "${sc_comment[i]}"
+	fi
+	printf '\n'
+	return 0
+}
+
+# Expand a -d data specification for the delta at index $1.
+_bt_sccs_data() {
+	local i=$1 spec=$2 out= j c key
+	for (( j = 0; j < ${#spec}; j++ )); do
+		c=${spec:j:1}
+		if [ "$c" != : ]; then
+			out=$out$c
+			continue
+		fi
+		key=${spec:j+1}
+		key=${key%%:*}
+		j=$(( j + ${#key} + 1 ))
+		case $key in
+		I)	out=$out${sc_sid[i]} ;;
+		R)	out=$out${sc_sid[i]%%.*} ;;
+		L)	out=$out${sc_sid[i]#*.} ;;
+		D)	out=$out${sc_date[i]} ;;
+		T)	out=$out${sc_time[i]} ;;
+		P)	out=$out${sc_user[i]} ;;
+		DS)	out=$out${sc_serial[i]} ;;
+		DP)	out=$out${sc_pred[i]} ;;
+		Li)	out=$out${sc_ins[i]} ;;
+		Ld)	out=$out${sc_del[i]} ;;
+		Lu)	out=$out${sc_unc[i]} ;;
+		C)	out=$out${sc_comment[i]} ;;
+		MR)	out=$out${sc_mr[i]} ;;
+		DT)	out=$out${sc_type[i]} ;;
+		F)	out=$out${sc_sfile##*/} ;;
+		Dt)	out=$out"${sc_type[i]} ${sc_sid[i]} ${sc_date[i]} ${sc_time[i]} ${sc_user[i]} ${sc_serial[i]} ${sc_pred[i]}" ;;
+		*)	out=$out:$key: ;;
+		esac
+	done
+	printf '%s\n' "$out"
+	return 0
+}
+
+rmdel () {
+	local LC_ALL=C
+	local _bt_sccs_who=rmdel
+	local arg sid= status=0 i j n ser line
+	local -a sc_type=() sc_sid=() sc_date=() sc_time=() sc_user=() sc_serial=()
+	local -a sc_pred=() sc_ins=() sc_del=() sc_unc=() sc_comment=() sc_mr=()
+	local -a sc_users=() sc_desc=() sc_body=() sc_text=() sc_in=()
+	local -A sc_flags=()
+	local sc_sums sc_gfile sc_pfile sc_sfile _bt_int _bt_str
+	local -a newbody=() stack=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-r*)	sid=${1#-r}; shift ;;
+		-*)	_bt_err "rmdel: illegal option -- ${1#-}"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+	if [ -z "$sid" ] || [ "$#" -lt 1 ]; then
+		_bt_err "usage: rmdel -r SID s.file..."
+		return 1
+	fi
+
+	for arg in "$@"; do
+		if ! _bt_sccs_names "$arg" || ! _bt_sccs_read "$arg"; then
+			_bt_err "rmdel: $arg: not an SCCS file"
+			status=1
+			continue
+		fi
+		_bt_sccs_find "$sid"
+		i=$_bt_int
+		if [ "$i" -lt 0 ]; then
+			_bt_err "rmdel: $arg: no such delta $sid"
+			status=1
+			continue
+		fi
+		if [ "$i" != 0 ]; then
+			_bt_err "rmdel: $arg: $sid is not the newest delta"
+			status=1
+			continue
+		fi
+		ser=${sc_serial[i]}
+		# what this delta put in goes away with it, and what it took out
+		# comes back
+		newbody=()
+		n=${#sc_body[@]}
+		local drop=0
+		for (( j = 0; j < n; j++ )); do
+			line=${sc_body[j]}
+			case $line in
+			"${_BT_SOH}I $ser")	drop=1; continue ;;
+			"${_BT_SOH}D $ser")	continue ;;
+			"${_BT_SOH}E $ser")	drop=0; continue ;;
+			esac
+			[ "$drop" = 1 ] && continue
+			newbody+=("$line")
+		done
+		sc_body=( ${newbody[@]+"${newbody[@]}"} )
+		sc_type=("${sc_type[@]:1}") sc_sid=("${sc_sid[@]:1}")
+		sc_date=("${sc_date[@]:1}") sc_time=("${sc_time[@]:1}")
+		sc_user=("${sc_user[@]:1}") sc_serial=("${sc_serial[@]:1}")
+		sc_pred=("${sc_pred[@]:1}") sc_ins=("${sc_ins[@]:1}")
+		sc_del=("${sc_del[@]:1}") sc_unc=("${sc_unc[@]:1}")
+		sc_comment=("${sc_comment[@]:1}") sc_mr=("${sc_mr[@]:1}")
+		_bt_sccs_write "$arg" || status=1
+	done
+	return "$status"
+}
+
+val () {
+	local LC_ALL=C
+	local arg sid= silent=0 name= type= status=0 bits=0 i
+	local -a sc_type=() sc_sid=() sc_date=() sc_time=() sc_user=() sc_serial=()
+	local -a sc_pred=() sc_ins=() sc_del=() sc_unc=() sc_comment=() sc_mr=()
+	local -a sc_users=() sc_desc=() sc_body=() sc_text=() sc_in=()
+	local -A sc_flags=()
+	local sc_sums sc_gfile sc_pfile sc_sfile _bt_int _bt_str
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-s)	silent=1; shift ;;
+		-r*)	sid=${1#-r}; shift ;;
+		-m*)	name=${1#-m}; shift ;;
+		-y*)	type=${1#-y}; shift ;;
+		-*)	[ "$1" = - ] && break
+			[ "$silent" = 1 ] || _bt_err "val: unknown option ${1#-}"
+			bits=$(( bits | 2 ))
+			shift ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -lt 1 ]; then
+		[ "$silent" = 1 ] || _bt_err "val: missing file argument"
+		return $(( bits | 1 ))
+	fi
+
+	for arg in "$@"; do
+		if ! _bt_sccs_names "$arg"; then
+			[ "$silent" = 1 ] || _bt_err "val: $arg: not an SCCS file name"
+			bits=$(( bits | 8 ))
+			continue
+		fi
+		if ! _bt_sccs_read "$arg"; then
+			[ "$silent" = 1 ] || _bt_err "val: $arg: cannot be opened or is not an SCCS file"
+			bits=$(( bits | 8 ))
+			continue
+		fi
+		_bt_sccs_sum "$arg"
+		if [ "$_bt_int" != "$(( 10#${sc_sums:-0} ))" ]; then
+			[ "$silent" = 1 ] || _bt_err "val: $arg: corrupted SCCS file"
+			bits=$(( bits | 4 ))
+		fi
+		if [ -n "$sid" ]; then
+			_bt_sccs_find "$sid"
+			if [ "$_bt_int" -lt 0 ]; then
+				[ "$silent" = 1 ] || _bt_err "val: $arg: no such SID $sid"
+				bits=$(( bits | 32 ))
+			fi
+		fi
+		if [ -n "$type" ] && [ "${sc_flags[t]-}" != "$type" ]; then
+			[ "$silent" = 1 ] || _bt_err "val: $arg: type is not $type"
+			bits=$(( bits | 64 ))
+		fi
+		if [ -n "$name" ] && [ "${sc_flags[m]-}" != "$name" ]; then
+			[ "$silent" = 1 ] || _bt_err "val: $arg: module name is not $name"
+			bits=$(( bits | 128 ))
+		fi
+	done
+	return "$bits"
+}
+
+sccs () {
+	local LC_ALL=C
+	local arg cmd dir=. prefix= i
+	local -a files=() opts=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-d*)	dir=${1#-d}; shift ;;
+		-p*)	prefix=${1#-p}; shift ;;
+		-r)	shift ;;
+		-*)	_bt_err "sccs: illegal option -- ${1#-}"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" = 0 ]; then
+		_bt_err "usage: sccs [-r] [-d path] [-p path] command [options] [operands]"
+		return 1
+	fi
+	cmd=$1
+	shift
+	case $cmd in
+	admin|delta|get|prs|rmdel|sact|unget|val|cat|diffs|edit|create|print|check|info|tell|clean|unedit|deledit|fix|enter)	;;
+	*)	_bt_err "sccs: unknown command $cmd"
+		return 1 ;;
+	esac
+	# the front end knows where the files live, so a plain name becomes the
+	# SCCS file that goes with it
+	for arg in "$@"; do
+		case $arg in
+		-*)	opts+=("$arg"); continue ;;
+		esac
+		case $arg in
+		*/s.*|s.*)	files+=("$arg") ;;
+		*)		files+=("$dir/${prefix:-SCCS}/s.$arg") ;;
+		esac
+	done
+	case $cmd in
+	edit)	cmd=get; opts+=(-e) ;;
+	unedit)	cmd=unget ;;
+	print)	cmd=prs ;;
+	cat)	cmd=get; opts+=(-p -s) ;;
+	create|enter)	cmd=admin ;;
+	check|info|tell)	cmd=sact ;;
+	clean|fix|deledit|diffs)
+		_bt_err "sccs: $cmd is not offered here"
+		return 1 ;;
+	esac
+	"$cmd" ${opts[@]+"${opts[@]}"} ${files[@]+"${files[@]}"}
+	return $?
+}
+
+# ---------------------------------------------------------------------------
+# compress, uncompress, zcat -- POSIX.1-2017:
+#	compress [-fv] [-b bits] [file...]
+#	compress -c [-fv] [-b bits] [file]
+#	uncompress [-cfv] [file...]
+#	zcat [file...]
+#
+# The format is the one the standard describes: two magic bytes, a byte saying
+# how wide the codes may grow and whether the table may be cleared, and then
+# LZW codes packed low bit first, nine bits wide to begin with and one wider
+# every time the table fills.  The awkward part is the padding: when the width
+# grows, the encoder throws away bits so that the block just ended is a whole
+# number of eight-code groups, and the decoder has to throw away the same.
+# ---------------------------------------------------------------------------
+
+# Read the whole of fd $1 into the byte array `zb`.
+_bt_z_slurp() {
+	local i len rc v
+	local _bt_buf _bt_nul
+	zb=()
+	while :; do
+		if _bt_read "$1"; then rc=0; else rc=1; fi
+		len=${#_bt_buf}
+		for (( i = 0; i < len; i++ )); do
+			printf -v v '%d' "'${_bt_buf:i:1}"
+			zb+=("$v")
+		done
+		[ "$rc" = 0 ] && [ "$_bt_nul" = 1 ] && zb+=(0)
+		[ "$rc" = 1 ] && break
+	done
+	return 0
+}
+
+# Add byte $1 to the output being built, flushing now and then.
+_bt_z_put() {
+	local b s
+	for b in "$@"; do
+		printf -v s '\\0%03o' "$b"
+		zesc=$zesc$s
+	done
+	[ "${#zesc}" -gt 8000 ] && { printf '%b' "$zesc" >&"$zfd"; zesc=; }
+	return 0
+}
+
+_bt_z_flush() {
+	[ -n "$zesc" ] && printf '%b' "$zesc" >&"$zfd"
+	zesc=
+	return 0
+}
+
+# Decompress the LZW data in `zb` (magic and all) to fd `zfd`.
+#
+# The code width grows when the table outgrows what the current width can name,
+# and the table is started over when a clear code says so.  At either moment
+# the reader skips whatever is left of the current group of eight codes, which
+# is the padding the writer put there.
+_bt_z_decompress() {
+	local n=${#zb[@]} maxbits blockmode i bitpos code width next
+	local first prev k c count=0 need
+	local -a pfx=() sfx=() stack=()
+	if [ "$n" -lt 3 ] || [ "${zb[0]}" != 31 ] || [ "${zb[1]}" != 157 ]; then
+		_bt_err "$_bt_z_who: not in compressed format"
+		return 1
+	fi
+	maxbits=$(( zb[2] & 31 ))
+	blockmode=$(( (zb[2] >> 7) & 1 ))
+	if [ "$maxbits" -lt 9 ] || [ "$maxbits" -gt 16 ]; then
+		_bt_err "$_bt_z_who: cannot handle $maxbits bits"
+		return 1
+	fi
+	if [ "$blockmode" = 1 ]; then next=257; else next=256; fi
+	width=9
+	bitpos=24
+	prev=-1
+	while :; do
+		if [ $(( bitpos + width )) -gt $(( n * 8 )) ]; then break; fi
+		code=0
+		for (( i = 0; i < width; i++ )); do
+			k=$(( bitpos + i ))
+			c=$(( (zb[k / 8] >> (k % 8)) & 1 ))
+			code=$(( code | (c << i) ))
+		done
+		bitpos=$(( bitpos + width ))
+		count=$(( count + 1 ))
+		if [ "$blockmode" = 1 ] && [ "$code" = 256 ]; then
+			need=$(( (8 - (count % 8)) % 8 ))
+			bitpos=$(( bitpos + need * width ))
+			count=0
+			pfx=() sfx=()
+			next=257
+			width=9
+			prev=-1
+			continue
+		fi
+		if [ "$code" -lt 256 ]; then
+			stack=("$code")
+		elif [ "$code" -lt "$next" ]; then
+			k=$code
+			stack=()
+			while [ "$k" -ge 256 ]; do
+				stack+=("${sfx[k]}")
+				k=${pfx[k]}
+			done
+			stack+=("$k")
+		elif [ "$code" = "$next" ] && [ "$prev" -ge 0 ]; then
+			k=$prev
+			stack=()
+			while [ "$k" -ge 256 ]; do
+				stack+=("${sfx[k]}")
+				k=${pfx[k]}
+			done
+			stack+=("$k")
+			# a code the table has not got yet stands for the last
+			# string with its own first byte on the end
+			stack=("$k" "${stack[@]}")
+		else
+			_bt_err "$_bt_z_who: corrupt input"
+			return 1
+		fi
+		for (( i = ${#stack[@]} - 1; i >= 0; i-- )); do
+			_bt_z_put "${stack[i]}"
+		done
+		first=${stack[${#stack[@]}-1]}
+		if [ "$prev" -ge 0 ] && [ "$next" -lt $(( 1 << maxbits )) ]; then
+			pfx[next]=$prev
+			sfx[next]=$first
+			next=$(( next + 1 ))
+			# the reader is one code behind the writer, since it can
+			# only add an entry once it knows what came next, so it
+			# has to change width one code sooner
+			if [ "$next" -ge $(( 1 << width )) ] && [ "$width" -lt "$maxbits" ]; then
+				need=$(( (8 - (count % 8)) % 8 ))
+				bitpos=$(( bitpos + need * width ))
+				count=0
+				width=$(( width + 1 ))
+			fi
+		fi
+		prev=$code
+	done
+	_bt_z_flush
+	return 0
+}
+
+# Compress the bytes in `zb` to fd `zfd`, codes at most $1 bits wide.  When the
+# table is one entry short of full it is cleared and started again, which is
+# what the clear code in block mode is for and what keeps every reader of this
+# format in step.
+_bt_z_compress() {
+	local maxbits=$1 n=${#zb[@]} i b next width=9 cur=-1 count=0 limit key
+	local acc=0 nacc=0
+	local -A tbl=()
+	next=257
+	limit=$(( (1 << maxbits) - 1 ))
+	_bt_z_put 31 157 $(( 128 | maxbits ))
+	for (( i = 0; i < n; i++ )); do
+		b=${zb[i]}
+		if [ "$cur" -lt 0 ]; then cur=$b; continue; fi
+		key=$cur,$b
+		if [ -n "${tbl[$key]-}" ]; then
+			cur=${tbl[$key]}
+			continue
+		fi
+		_bt_z_emit "$cur"
+		if [ "$next" -ge "$limit" ]; then
+			_bt_z_emit 256
+			_bt_z_pad
+			tbl=()
+			next=257
+			width=9
+		else
+			tbl[$key]=$next
+			next=$(( next + 1 ))
+			if [ "$next" -gt $(( 1 << width )) ] && [ "$width" -lt "$maxbits" ]; then
+				_bt_z_pad
+				width=$(( width + 1 ))
+			fi
+		fi
+		cur=$b
+	done
+	[ "$cur" -ge 0 ] && _bt_z_emit "$cur"
+	while [ "$nacc" -gt 0 ]; do
+		_bt_z_put $(( acc & 255 ))
+		acc=$(( acc >> 8 ))
+		nacc=$(( nacc - 8 ))
+	done
+	_bt_z_flush
+	return 0
+}
+
+# Put one code into the bit stream.  Relies on its caller's locals.
+_bt_z_emit() {
+	acc=$(( acc | ($1 << nacc) ))
+	nacc=$(( nacc + width ))
+	count=$(( count + 1 ))
+	while [ "$nacc" -ge 8 ]; do
+		_bt_z_put $(( acc & 255 ))
+		acc=$(( acc >> 8 ))
+		nacc=$(( nacc - 8 ))
+	done
+	return 0
+}
+
+# Fill out the current group of eight codes, which is what a reader skips when
+# the width changes or the table is cleared.  Relies on its caller's locals.
+_bt_z_pad() {
+	local need=$(( (8 - (count % 8)) % 8 )) i
+	for (( i = 0; i < need; i++ )); do
+		_bt_z_emit 0
+	done
+	count=0
+	return 0
+}
+
+compress () {
+	local LC_ALL=C
+	local _bt_z_who=compress
+	local arg opt tostdout=0 force=0 verbose=0 bits=16 status=0 file fd out
+	local zesc= zfd=1
+	local -a zb=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-b)	shift; [ "$#" = 0 ] && { _bt_err "compress: option requires an argument -- b"; return 1; }
+			bits=$1; shift ;;
+		-b*)	bits=${1#-b}; shift ;;
+		-*)	[ "$1" = - ] && break
+			arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				c)	tostdout=1 ;;
+				f)	force=1 ;;
+				v)	verbose=1 ;;
+				*)	_bt_err "compress: illegal option -- $opt"
+					_bt_err "usage: compress [-cfv] [-b bits] [file...]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	case $bits in
+	''|*[!0-9]*)	_bt_err "compress: bits must be a number"; return 1 ;;
+	esac
+	if [ "$bits" -lt 9 ] || [ "$bits" -gt 16 ]; then
+		_bt_err "compress: bits must be between 9 and 16"
+		return 1
+	fi
+
+	if [ "$#" = 0 ]; then
+		_bt_z_slurp 0
+		zfd=1
+		_bt_z_compress "$bits"
+		return 0
+	fi
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			_bt_z_slurp 0
+		elif { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_z_slurp "$fd"
+			exec {fd}<&-
+		else
+			_bt_err "compress: $file: No such file or directory"
+			status=1
+			continue
+		fi
+		if [ "$tostdout" = 1 ] || [ "$file" = - ]; then
+			zfd=1
+			_bt_z_compress "$bits"
+		else
+			out=$file.Z
+			if [ -e "$out" ] && [ "$force" = 0 ]; then
+				_bt_err "compress: $out already exists"
+				status=1
+				continue
+			fi
+			if ! { exec {zfd}>"$out"; } 2>/dev/null; then
+				_bt_err "compress: cannot write $out"
+				status=1
+				continue
+			fi
+			_bt_z_compress "$bits"
+			exec {zfd}>&-
+			zfd=1
+			# the original would be removed here, which no shell can
+			# do; it is left empty instead
+			: > "$file"
+			[ "$verbose" = 1 ] && _bt_err "$file: compressed to $out"
+		fi
+	done
+	return "$status"
+}
+
+uncompress () {
+	local LC_ALL=C
+	local _bt_z_who=uncompress
+	local arg opt tostdout=0 force=0 verbose=0 status=0 file fd out
+	local zesc= zfd=1
+	local -a zb=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-*)	[ "$1" = - ] && break
+			arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				c)	tostdout=1 ;;
+				f)	force=1 ;;
+				v)	verbose=1 ;;
+				*)	_bt_err "uncompress: illegal option -- $opt"
+					_bt_err "usage: uncompress [-cfv] [file...]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	if [ "$#" = 0 ]; then set -- -; fi
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			_bt_z_slurp 0
+			zfd=1
+			_bt_z_decompress || status=1
+			continue
+		fi
+		if [ ! -e "$file" ] && [ -e "$file.Z" ]; then file=$file.Z; fi
+		if ! { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_err "uncompress: $file: No such file or directory"
+			status=1
+			continue
+		fi
+		_bt_z_slurp "$fd"
+		exec {fd}<&-
+		if [ "$tostdout" = 1 ]; then
+			zfd=1
+			_bt_z_decompress || status=1
+			continue
+		fi
+		case $file in
+		*.Z)	out=${file%.Z} ;;
+		*)	_bt_err "uncompress: $file: unknown suffix"
+			status=1
+			continue ;;
+		esac
+		if [ -e "$out" ] && [ "$force" = 0 ] && [ -s "$out" ]; then
+			_bt_err "uncompress: $out already exists"
+			status=1
+			continue
+		fi
+		if ! { exec {zfd}>"$out"; } 2>/dev/null; then
+			_bt_err "uncompress: cannot write $out"
+			status=1
+			continue
+		fi
+		_bt_z_decompress || status=1
+		exec {zfd}>&-
+		zfd=1
+		: > "$file"
+		[ "$verbose" = 1 ] && _bt_err "$file: expanded to $out"
+	done
+	return "$status"
+}
+
+zcat () {
+	local LC_ALL=C
+	uncompress -c "$@"
+	return $?
+}

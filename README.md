@@ -27,8 +27,8 @@ $ cat README.md | head -n 3 | wc -l
 `strace` records exactly **one** `execve` for a session like that: bash itself.
 
 This is a toy, and it is meant to be one. It is also a real conformance
-exercise: every utility is checked against GNU coreutils, byte for byte on
-stdout and on exit status, over 6156 comparisons.
+exercise: wherever this machine has the utility already, every one of these is
+checked against it, byte for byte on standard output and on exit status.
 
 ## Use it
 
@@ -48,10 +48,11 @@ Run the test suite with:
 
 ## What is implemented
 
-47 of the 160 utilities in POSIX.1-2017, as of now.
+72 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
+| `admin` | `admin -i[file] [-n] [-r SID] [-y comment] [-fflag] s.file` · `admin [-a user] [-e user] [-fflag] [-dflag] [-t[file]] s.file` |
 | `ar` | `ar -d\|-m\|-p\|-q\|-r\|-t\|-x [-abcisuv] [posname] archive [file...]` |
 | `asa` | `asa [file...]` |
 | `basename` | `basename string [suffix]` |
@@ -60,10 +61,12 @@ Run the test suite with:
 | `cksum` | `cksum [file...]` |
 | `cmp` | `cmp [-l\|-s] file1 file2` |
 | `comm` | `comm [-123] file1 file2` |
+| `compress` | `compress [-cfv] [-b bits] [file...]` |
 | `csplit` | `csplit [-ks] [-f prefix] [-n number] file arg...` |
 | `cut` | `cut -b list [-n] [file...]` · `cut -c list [file...]` · `cut -f list [-d delim] [-s] [file...]` |
 | `date` | `date [-u] [+format]` |
 | `dd` | `dd [operand...]` (`if` `of` `bs` `ibs` `obs` `count` `skip` `conv`) |
+| `delta` | `delta [-nps] [-r SID] [-y comment] [-m mrlist] s.file...` |
 | `diff` | `diff [-bi] [-e] file1 file2` |
 | `dirname` | `dirname string` |
 | `ed` | `ed [-p string] [-s] [file]` |
@@ -72,6 +75,7 @@ Run the test suite with:
 | `expr` | `expr operand...` |
 | `fold` | `fold [-bs] [-w width] [file...]` |
 | `fuser` | `fuser [-cfu] file...` |
+| `get` | `get [-e] [-k] [-p] [-s] [-g] [-r SID] s.file...` |
 | `grep` | `grep [-E\|-F] [-c\|-l\|-q] [-insvx] [-e pattern] [-f file] [file...]` |
 | `head` | `head [-n number] [file...]` |
 | `iconv` | `iconv [-cs] [-f frommap] [-t tomap] [file...]` · `iconv -l` |
@@ -82,13 +86,18 @@ Run the test suite with:
 | `logname` | `logname` |
 | `m4` | `m4 [-s] [-D name[=value]]... [-U name]... [file...]` |
 | `nl` | `nl [-p] [-b type] [-d delim] [-f type] [-h type] [-i incr] [-l num] [-n format] [-s sep] [-v start] [-w width] [file]` |
+| `nm` | `nm [-APv] [-efox] [-g\|-u] [-t format] file...` |
 | `nohup` | `nohup utility [argument...]` |
 | `od` | `od [-v] [-A base] [-j skip] [-N count] [-t type]... [file...]` |
 | `paste` | `paste [-s] [-d list] file...` |
 | `patch` | `patch [-blNR] [-c\|-e\|-n\|-u] [-D define] [-i patchfile] [-o outfile] [-p num] [-r rejectfile] [file]` |
 | `pathchk` | `pathchk [-p] pathname...` |
 | `pr` | `pr [+page] [-column] [-adFmrt] [-h header] [-l lines] [-o offset] [-w width] [file...]` |
+| `prs` | `prs [-a] [-d dataspec] [-r SID] [-e\|-l] s.file...` |
 | `ps` | `ps [-aA] [-defl] [-G grouplist] [-o format]... [-p proclist] [-t termlist] [-U userlist] [-g grouplist] [-n namelist] [-u userlist]` |
+| `rmdel` | `rmdel -r SID s.file...` |
+| `sact` | `sact s.file...` |
+| `sccs` | `sccs [-r] [-d path] [-p path] command [options] [operands]` |
 | `sed` | `sed [-n] script [file...]` · `sed [-n] [-e script]... [-f file]... [file...]` |
 | `sleep` | `sleep time` |
 | `sort` | `sort [-m] [-o out] [-bdfinru] [-t char] [-k keydef]... [file...]` · `sort -c ...` |
@@ -102,15 +111,19 @@ Run the test suite with:
 | `tsort` | `tsort [file]` |
 | `tty` | `tty` |
 | `uname` | `uname [-amnrsv]` |
+| `uncompress` | `uncompress [-cfv] [file...]` |
 | `unexpand` | `unexpand [-a] [-t tablist] [file...]` |
+| `unget` | `unget [-ns] [-r SID] s.file...` |
 | `uniq` | `uniq [-c\|-d\|-u] [-f fields] [-s chars] [input [output]]` |
 | `uudecode` | `uudecode [-o outfile] [file]` |
 | `uuencode` | `uuencode [-m] [file] decode_pathname` |
+| `val` | `val [-s] [-m name] [-r SID] [-y type] s.file...` |
 | `wc` | `wc [-c\|-m] [-lw] [file...]` |
 | `what` | `what [-s] file...` |
 | `who` | `who [-mTu] [file]` |
 | `write` | `write user_name [terminal]` |
 | `xargs` | `xargs [-t] [-E eof] [-I repl] [-L n] [-n n] [-s size] [utility [arg...]]` |
+| `zcat` | `zcat [file...]` |
 
 Including the parts that are easy to forget: `--` ends the options and a lone
 `-` names standard input; `tail -n +5` counts from the start of the file while
@@ -202,20 +215,29 @@ $ ./test.sh
 ==== pass=6643 fail=0 ====
 ```
 
-Every case runs twice — once through the bash function, once through the system
-coreutils — comparing stdout byte for byte and comparing exit status. That
-covers embedded NULs, unterminated lines, empty files, 300 KB of random binary,
-and every sign and magnitude of `-n`/`-c`. A fuzz pass repeats at block sizes
-from 1 byte to 64 KiB to exercise the block-boundary paths. `id` is checked in
-every option form against every user in `/etc/passwd`, and where `setpriv` is
-available, against processes whose real and effective IDs differ. `patch` is
-handed random pairs of files in both formats, forwards, backwards, already
-applied and shifted down the file. `tput` is asked for every capability of every
-terminal the machine has a terminfo entry for. `ps` gets a process of its own to
-sit and be inspected, and the system-wide listings are compared on the columns
-that cannot change between two runs. `uuencode` is checked against known
-encodings and round-tripped through `uudecode`. A final case runs everything
-with an empty `PATH`.
+Every case runs twice — once through the bash function, once through the
+program the machine already has — comparing standard output byte for byte and
+comparing exit status. That covers embedded NULs, unterminated lines, empty
+files, 300 KB of random binary, and every sign and magnitude of `-n`/`-c`. A
+fuzz pass repeats at block sizes from 1 byte to 64 KiB to exercise the
+block-boundary paths. `id` is checked in every option form against every user in
+`/etc/passwd`, and where `setpriv` is available, against processes whose real and
+effective IDs differ. `patch` is handed random pairs of files in both formats,
+forwards, backwards, already applied and shifted down the file. `tput` is asked
+for every capability of every terminal the machine has a terminfo entry for.
+`ps` gets a process of its own to sit and be inspected. `iconv` converts every
+character set it knows to every other. `ar` archives are compared byte for byte
+with the ones `ar` builds. `nm` reads the object files the machine has and any
+the compiler can be asked for.
+
+Four have nothing here to be compared against, and are held to a property
+instead. `ed` replays the script `diff -e` writes, which has to turn one file
+into the other. `uuencode` is checked against known encodings and round-tripped
+through `uudecode`. The SCCS utilities put a file under `admin`, edit and
+`delta` it four times over with random changes, and then have to hand back every
+version it ever had, byte for byte, and pass `val` at the end.
+
+A final case runs everything with an empty `PATH`.
 
 ## Limitations, and why they exist
 
@@ -243,6 +265,7 @@ So these are permanently out of reach, not merely unfinished:
 | `mesg` | reports and sets the group-write bit of a terminal: no `stat()` to read it, no `chmod()` to change it |
 | `nice` `renice` `newgrp` `ipcrm` `logger` | `setpriority()`, `setgid()`, SysV IPC, `AF_UNIX` — bash only speaks TCP/UDP |
 | `at` `batch` `crontab` `lp` `uucp` `uustat` `uux` | need a daemon or a mode-protected spool |
+| `qalter` `qdel` `qhold` `qmove` `qmsg` `qrerun` `qrls` `qselect` `qsig` `qstat` `qsub` | the batch utilities need a batch server to talk to, for the same reason `at` needs a daemon |
 | `c99` `fort77` `strip` | must produce an executable, which needs the exec bit |
 | `time` | `time` is a bash reserved word: `time() { ... }` will not even parse |
 | `getconf` | `sysconf()` values are compile-time constants, readable nowhere |
@@ -256,20 +279,19 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 59 |
+| implemented here | 72 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
-| **unreachable from a builtin** | **41** |
-| reachable, not yet written | 38 |
+| **unreachable from a builtin** | **52** |
+| reachable, not yet written | 14 |
 
-**The ceiling is 97 of 160**, or about 61% of the standard. Getting past that
+**The ceiling is 86 of 160**, or about 54% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 38 that remain are wildly uneven, too. `val`, `sact` and `unget` are
-afternoons. `awk`, `bc`, `make`, `lex` and `yacc` are interpreters and
-compilers, each larger than everything here put together, written in a language
-with no arrays of structs and no way to turn a character into an integer except
-`printf '%d' "'$c"`.
+The 14 that remain are wildly uneven. `awk`, `bc`, `make`, `lex` and `yacc`
+are interpreters and compilers, each larger than everything here put together,
+written in a language with no arrays of structs and no way to turn a character
+into an integer except `printf '%d' "'$c"`.
 
 ### Smaller deviations, all deliberate
 
@@ -307,6 +329,22 @@ with no arrays of structs and no way to turn a character into an integer except
   `ar` itself writes in the deterministic mode it defaults to now — and just as
   well, since `stat()` is unreachable. It does not build the symbol table that
   `ar s` and `ranlib` maintain for archives of object files.
+* `compress` writes the LZW format the standard describes, and `gzip` -- which
+  still reads it -- gets exactly what it expects out of every setting from 9 to
+  16 bits. `uncompress` and `zcat` read it back. The original file would be
+  removed by both, which no shell can do, so it is left empty instead. `zcat`
+  here is `uncompress -c`, as the standard says, and knows nothing of gzip.
+* The SCCS utilities keep the file format SCCS keeps: a checksum, a table of
+  deltas newest first, and a body holding every line any version ever had,
+  wrapped in the control lines that say which delta put it there and which took
+  it away. Branches are not offered — the deltas run 1.1, 1.2, 1.3 up the
+  trunk. Nothing in a shell can remove a file, so where SCCS would delete the
+  working file or the p-file, these leave it empty instead, which means the
+  same thing to every command that looks at it.
+* `nm` reads ELF, which is what the object files on this machine are: a header,
+  a table of section headers, and among the sections a symbol table and the
+  strings its names live in. Without `-D` it looks only at `.symtab`, as `nm`
+  does, so a stripped binary has no symbols to show.
 * `locale` answers exactly what the environment asks for, and its keyword
   values are the ones the standard fixes for the POSIX locale. Any other
   locale's data lives in a compiled archive that nothing here can read, so
