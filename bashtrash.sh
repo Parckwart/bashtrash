@@ -10548,7 +10548,7 @@ _BT_LOCALE_CATS='LC_CTYPE LC_NUMERIC LC_TIME LC_COLLATE LC_MONETARY LC_MESSAGES
 locale () {
 	local LC_ALL_SAVE=${LC_ALL-}
 	local arg opt all=0 maps=0 showcat=0 keyword=0 status=0
-	local name cat kind val line def set IFS_SAVE
+	local name cat kind val line def set IFS_SAVE _bt_str= _bt_c=
 
 	while [ "$#" -gt 0 ]; do
 		case $1 in
@@ -10651,12 +10651,84 @@ _bt_locale_show() {
 	line=${line#*:}
 	kind=${line%%:*}
 	val=${line#*:}
+	# a locale made by localedef says what its own keywords are
+	if _bt_locale_made "$cat" "$key"; then
+		val=$_bt_str
+	fi
 	if [ "$keyword" = 1 ]; then
 		if [ "$kind" = n ]; then printf '%s=%s\n' "$key" "$val"
 		else printf '%s="%s"\n' "$key" "$val"; fi
 	else
 		printf '%s\n' "$val"
 	fi
+	return 0
+}
+
+# The value of keyword $2 of category $1 in the locale that is in force, if
+# that locale is one localedef made here.  The answer comes back in _bt_str.
+_bt_locale_made() {
+	local cat=$1 key=$2 name file line kw val fd incat=0
+	if [ -n "$LC_ALL_SAVE" ]; then
+		name=$LC_ALL_SAVE
+	else
+		eval "name=\${$cat-}"
+		[ -z "$name" ] && name=${LANG-}
+	fi
+	case $name in
+	''|C|POSIX)	return 1 ;;
+	*/*)		file=$name ;;
+	*)		file=${LOCPATH:-/usr/lib/locale}/$name ;;
+	esac
+	[ -f "$file" ] || return 1
+	{ exec {fd}<"$file"; } 2>/dev/null || return 1
+	while IFS= read -r line <&"$fd"; do
+		case $line in
+		"$cat")		incat=1; continue ;;
+		"END $cat")	break ;;
+		'LC_'*)		incat=0; continue ;;
+		esac
+		[ "$incat" = 1 ] || continue
+		kw=${line%%[	 ]*}
+		[ "$kw" = "$key" ] || continue
+		val=${line#"$kw"}
+		val=${val# }
+		exec {fd}<&-
+		_bt_locale_unquote "$val"
+		return 0
+	done
+	exec {fd}<&-
+	return 1
+}
+
+# Undo the spelling out localedef does when it writes a value.
+_bt_locale_unquote() {
+	local v=$1 n=${#1} i out= c d
+	for (( i = 0; i < n; i++ )); do
+		c=${v:i:1}
+		if [ "$c" != '\' ]; then
+			out=$out$c
+			continue
+		fi
+		i=$(( i + 1 ))
+		d=${v:i:1}
+		case $d in
+		n)	out=$out$'\n' ;;
+		t)	out=$out$'\t' ;;
+		r)	out=$out$'\r' ;;
+		v)	out=$out$'\v' ;;
+		f)	out=$out$'\f' ;;
+		b)	out=$out$'\b' ;;
+		a)	out=$out$'\a' ;;
+		'\')	out=$out'\' ;;
+		';')	out=$out';' ;;
+		[0-7])	c=${v:i:3}
+			i=$(( i + 2 ))
+			_bt_chr $(( 8#$c ))
+			out=$out$_bt_c ;;
+		*)	out=$out$d ;;
+		esac
+	done
+	_bt_str=$out
 	return 0
 }
 
@@ -24469,4 +24541,729 @@ mailx () {
 	# the end of the input is the same as quit
 	_bt_mailx_writeback
 	return "$_mx_status"
+}
+
+# ---------------------------------------------------------------------------
+# localedef -- POSIX.1-2017:
+#	localedef [-c] [-f charmap] [-i sourcefile] [-u code_set_name] name
+#
+# The source is the locale definition format the standard describes: an escape
+# character, a comment character, and then a run of categories, each ending in
+# END, holding keywords whose values are strings, numbers, lists, or names in
+# angle brackets that the charmap gives the encoding of.
+#
+# What comes out is a directory with a file for each category, holding the
+# keywords with their values worked out.  The format of that is left to the
+# implementation by the standard, and this one is the format `locale' here
+# reads back.
+# ---------------------------------------------------------------------------
+
+# Read the charmap $1: the symbolic names and what they stand for.
+_bt_ld_charmap() {
+	local f=$1 line sym val a b i n esc='\' com='#' inmap=0 lo hi
+	local -a lines=()
+	case $f in
+	*.gz)	local _bt_str=
+		_bt_gunzip "$f" || return 1
+		while IFS= read -r line; do lines+=("$line"); done <<< "$_bt_str" ;;
+	*)	local fd
+		{ exec {fd}<"$f"; } 2>/dev/null || return 1
+		line=
+		while IFS= read -r line <&"$fd"; do lines+=("$line"); line=; done
+		[ -n "$line" ] && lines+=("$line")
+		exec {fd}<&- ;;
+	esac
+	n=${#lines[@]}
+	for (( i = 0; i < n; i++ )); do
+		line=${lines[i]}
+		case $line in
+		"$com"*)	continue ;;
+		'')		continue ;;
+		'CHARMAP')	inmap=1; continue ;;
+		'END CHARMAP')	inmap=0; continue ;;
+		esac
+		if [ "$inmap" = 0 ]; then
+			case $line in
+			'<escape_char>'*)	esc=${line##*[	 ]} ;;
+			'<comment_char>'*)	com=${line##*[	 ]} ;;
+			'<code_set_name>'*)	_ld_codeset=${line##*[	 ]} ;;
+			'<mb_cur_max>'*)	_ld_mbmax=${line##*[	 ]}
+						[ "$_ld_mbmax" -gt 1 ] 2>/dev/null && _ld_multi=1 ;;
+			esac
+			continue
+		fi
+		sym=${line%%[	 ]*}
+		val=${line#"$sym"}
+		val=${val#"${val%%[![:space:]]*}"}
+		val=${val%%[	 ]*}
+		# in a charmap of more than one byte a character, the <Uxxxx>
+		# names say what they encode, so there is nothing to remember:
+		# working it out beats holding a million of them
+		if [ "$_ld_multi" = 1 ]; then
+			case $sym in
+			'<U'*)	continue ;;
+			esac
+		fi
+		case $sym in
+		*..*)	# a range of names, all with the same encoding to start
+			lo=${sym%%..*}
+			hi=${sym##*..}
+			_bt_ld_range "$lo" "$hi" "$val" "$esc"
+			continue ;;
+		esac
+		_bt_ld_bytes "$val" "$esc"
+		_ld_map[$sym]=$_bt_str
+	done
+	return 0
+}
+
+# The names from $1 to $2, starting at the encoding $3.
+_bt_ld_range() {
+	local lo=$1 hi=$2 val=$3 esc=$4 pre num i last width
+	# <U0041>..<U005A> and the like
+	case $lo in
+	'<U'*)	pre='<U'
+		num=${lo#<U}
+		num=${num%>}
+		last=${hi#<U}
+		last=${last%>}
+		width=${#num}
+		for (( i = 16#$num; i <= 16#$last; i++ )); do
+			printf -v num '%0*X' "$width" "$i"
+			_bt_ld_bytes "$val" "$esc"
+			_ld_map[$pre$num>]=$_bt_str
+			_bt_ld_next "$val" "$esc"
+			val=$_bt_str
+		done
+		return 0 ;;
+	esac
+	return 0
+}
+
+# The next encoding after $1, which is how a range of names is numbered.
+_bt_ld_next() {
+	local val=$1 esc=$2 head tail v
+	case $val in
+	*x??)	head=${val%??}
+		v=$(( 16#${val: -2} + 1 ))
+		printf -v _bt_str '%s%02x' "$head" "$v"
+		return 0 ;;
+	esac
+	_bt_str=$val
+	return 0
+}
+
+# The bytes the encoding $1 stands for, into _bt_str.
+_bt_ld_bytes() {
+	local val=$1 esc=$2 out= part v
+	while [ -n "$val" ]; do
+		case $val in
+		"$esc"x*)	part=${val:2:2}
+				val=${val:4}
+				_bt_chr $(( 16#$part ))
+				out=$out$_bt_c ;;
+		"$esc"d*)	part=${val:2:3}
+				val=${val:5}
+				_bt_chr $(( 10#$part ))
+				out=$out$_bt_c ;;
+		"$esc"[0-7]*)	part=${val:1:3}
+				val=${val:4}
+				_bt_chr $(( 8#$part ))
+				out=$out$_bt_c ;;
+		*)		out=$out${val:0:1}
+				val=${val:1} ;;
+		esac
+	done
+	_bt_str=$out
+	return 0
+}
+
+# Work out what the value $1 comes to: the names in angle brackets replaced by
+# what the charmap says, into _bt_str.
+_bt_ld_value() {
+	local s=$1 n=${#1} i=0 out= c sym
+	while [ "$i" -lt "$n" ]; do
+		c=${s:i:1}
+		if [ "$c" = "$_ld_esc" ]; then
+			out=$out${s:i+1:1}
+			i=$(( i + 2 ))
+			continue
+		fi
+		if [ "$c" = '<' ]; then
+			sym=
+			i=$(( i + 1 ))
+			while [ "$i" -lt "$n" ] && [ "${s:i:1}" != '>' ]; do
+				if [ "${s:i:1}" = "$_ld_esc" ]; then
+					sym=$sym${s:i+1:1}
+					i=$(( i + 2 ))
+					continue
+				fi
+				sym=$sym${s:i:1}
+				i=$(( i + 1 ))
+			done
+			i=$(( i + 1 ))
+			if [ -n "${_ld_map[<$sym>]+x}" ]; then
+				out=$out${_ld_map[<$sym>]}
+			elif [ -n "${_ld_sym[<$sym>]+x}" ]; then
+				out=$out'<'$sym'>'
+			elif _bt_ld_codepoint "$sym"; then
+				out=$out$_bt_str
+			else
+				_bt_err "localedef: <$sym> is not in the charmap"
+				case $_ld_cat in
+				LC_CTYPE|LC_COLLATE)	_ld_warn=1 ;;
+				*)			_ld_error=1 ;;
+				esac
+				out=$out'<'$sym'>'
+			fi
+			continue
+		fi
+		out=$out$c
+		i=$(( i + 1 ))
+	done
+	_bt_str=$out
+	return 0
+}
+
+# A name like U0041 that says which character it is rather than naming it.
+_bt_ld_codepoint() {
+	local sym=$1 v
+	case $sym in
+	U[0-9A-Fa-f][0-9A-Fa-f]*)	;;
+	*)				return 1 ;;
+	esac
+	case ${sym#U} in
+	*[!0-9A-Fa-f]*)	return 1 ;;
+	esac
+	v=$(( 16#${sym#U} ))
+	if [ "$_ld_multi" = 1 ]; then
+		_bt_ld_utf8 "$v"
+		return 0
+	fi
+	if [ "$v" -lt 256 ]; then
+		_bt_chr "$v"
+		_bt_str=$_bt_c
+		return 0
+	fi
+	return 1
+}
+
+# A value that is a list of strings and names, into _bt_str with the items
+# parted by semicolons.
+_bt_ld_list() {
+	local s=$1 n=${#1} i=0 out= item= c instr=0 first=1
+	# the common case is a run of names parted by semicolons, with no
+	# quotes and nothing escaped, and that splits in one go
+	case $s in
+	*'"'*|*"$_ld_esc"*)	;;
+	*)	local IFS=';'
+		local -a items=()
+		local -
+		set -f
+		items=($s)
+		IFS=' '
+		for item in ${items[@]+"${items[@]}"}; do
+			# a line carried on brings its indent with it, and the
+			# blanks around an item mean nothing
+			item=${item#"${item%%[![:space:]]*}"}
+			item=${item%"${item##*[![:space:]]}"}
+			_bt_ld_value "$item"
+			if [ "$first" = 1 ]; then out=$_bt_str; first=0
+			else out=$out$'\001'$_bt_str; fi
+		done
+		_bt_str=$out
+		return 0 ;;
+	esac
+	while [ "$i" -lt "$n" ]; do
+		c=${s:i:1}
+		if [ "$c" = "$_ld_esc" ]; then
+			item=$item${s:i:2}
+			i=$(( i + 2 ))
+			continue
+		fi
+		if [ "$c" = '"' ]; then
+			instr=$(( 1 - instr ))
+			i=$(( i + 1 ))
+			continue
+		fi
+		if [ "$instr" = 0 ] && [ "$c" = ';' ]; then
+			item=${item#"${item%%[![:space:]]*}"}
+			item=${item%"${item##*[![:space:]]}"}
+			_bt_ld_value "$item"
+			if [ "$first" = 1 ]; then out=$_bt_str; first=0
+			else out=$out$'\001'$_bt_str; fi
+			item=
+			i=$(( i + 1 ))
+			continue
+		fi
+		item=$item$c
+		i=$(( i + 1 ))
+	done
+	if [ -n "$item" ] || [ "$first" = 1 ]; then
+		item=${item#"${item%%[![:space:]]*}"}
+		item=${item%"${item##*[![:space:]]}"}
+		_bt_ld_value "$item"
+		if [ "$first" = 1 ]; then out=$_bt_str
+		else out=$out$'\001'$_bt_str; fi
+	fi
+	_bt_str=$out
+	return 0
+}
+
+# Read the locale source $1 (or standard input when it is -) into the lines
+# array, with the continuations joined.
+_bt_ld_source() {
+	local f=$1 fd line acc= cont
+	local -a raw=()
+	if [ "$f" = - ]; then
+		line=
+		while IFS= read -r line; do raw+=("$line"); line=; done
+		[ -n "$line" ] && raw+=("$line")
+	else
+		{ exec {fd}<"$f"; } 2>/dev/null || return 1
+		line=
+		while IFS= read -r line <&"$fd"; do raw+=("$line"); line=; done
+		[ -n "$line" ] && raw+=("$line")
+		exec {fd}<&-
+	fi
+	# the escape and comment characters can be changed, but only at the top
+	local i n=${#raw[@]}
+	for (( i = 0; i < n; i++ )); do
+		case ${raw[i]} in
+		'escape_char'*)		_ld_esc=${raw[i]##*[	 ]} ;;
+		'comment_char'*)	_ld_com=${raw[i]##*[	 ]} ;;
+		esac
+	done
+	_ld_lines=()
+	acc=
+	for (( i = 0; i < n; i++ )); do
+		line=${raw[i]}
+		case $line in
+		"$_ld_com"*)	continue ;;
+		'escape_char'*|'comment_char'*)
+			# the character these name is the value, not a
+			# continuation of the line
+			_ld_lines+=("$line")
+			continue ;;
+		esac
+		if [ "${line: -1}" = "$_ld_esc" ]; then
+			acc=$acc${line%?}
+			continue
+		fi
+		_ld_lines+=("$acc$line")
+		acc=
+	done
+	[ -n "$acc" ] && _ld_lines+=("$acc")
+	return 0
+}
+
+# Take in one category, from line $1, and say where it ended in _ld_i.
+_bt_ld_category() {
+	local i=$1 n=${#_ld_lines[@]} line kw rest cat=$_ld_cat name
+	local -a items=()
+	_ld_keys[$cat]=
+	while [ "$i" -lt "$n" ]; do
+		line=${_ld_lines[i]}
+		case $line in
+		'')	i=$(( i + 1 )); continue ;;
+		"END $cat")
+			_ld_i=$(( i + 1 ))
+			return 0 ;;
+		'END '*)
+			_bt_err "localedef: $cat ends with ${line#END }"
+			_ld_error=1
+			_ld_i=$(( i + 1 ))
+			return 0 ;;
+		esac
+		kw=${line%%[	 ]*}
+		rest=${line#"$kw"}
+		rest=${rest#"${rest%%[![:space:]]*}"}
+		case $kw in
+		copy)	name=${rest%\"}
+			name=${name#\"}
+			if ! _bt_ld_copy "$name" "$cat"; then
+				_bt_err "localedef: cannot copy $cat from $name"
+				_ld_error=1
+			fi
+			i=$(( i + 1 ))
+			continue ;;
+		collating-symbol)
+			_ld_sym[$rest]=1
+			i=$(( i + 1 ))
+			continue ;;
+		collating-element)
+			name=${rest%% *}
+			_ld_sym[$name]=1
+			i=$(( i + 1 ))
+			continue ;;
+		order_start)
+			_ld_order=
+			i=$(( i + 1 ))
+			while [ "$i" -lt "$n" ]; do
+				line=${_ld_lines[i]}
+				case $line in
+				order_end)	break ;;
+				'')		i=$(( i + 1 )); continue ;;
+				esac
+				name=${line%%[	 ;]*}
+				if [ -n "$name" ] && [ "$name" != UNDEFINED ]; then
+					_bt_ld_value "$name"
+					_ld_order=$_ld_order$_bt_str
+				fi
+				i=$(( i + 1 ))
+			done
+			_bt_ld_add "$cat" collation "$_ld_order"
+			i=$(( i + 1 ))
+			continue ;;
+		esac
+		# a keyword the standard knows, or one it does not
+		if ! _bt_ld_known "$cat" "$kw"; then
+			_bt_err "localedef: $cat: unknown keyword $kw"
+			_ld_warn=1
+			i=$(( i + 1 ))
+			continue
+		fi
+		_bt_ld_list "$rest"
+		_bt_ld_add "$cat" "$kw" "$_bt_str"
+		i=$(( i + 1 ))
+	done
+	_bt_err "localedef: $cat has no END"
+	_ld_error=1
+	_ld_i=$i
+	return 0
+}
+
+# Remember that category $1 has keyword $2 with value $3.
+_bt_ld_add() {
+	_ld_val[$1:$2]=$3
+	case " ${_ld_keys[$1]} " in
+	*" $2 "*)	return 0 ;;
+	esac
+	_ld_keys[$1]="${_ld_keys[$1]} $2"
+	return 0
+}
+
+# Is $2 a keyword of category $1?
+_bt_ld_known() {
+	case $1 in
+	LC_CTYPE)
+		case $2 in
+		upper|lower|alpha|digit|alnum|space|cntrl|punct|graph|print|\
+		xdigit|blank|toupper|tolower|charclass|charconv|class|\
+		translit_start|translit_end|include|default_missing|\
+		outdigit|map)	return 0 ;;
+		esac ;;
+	LC_COLLATE)
+		case $2 in
+		script|symbol-equivalence|reorder-after|reorder-end|\
+		reorder-sections-after|reorder-sections-end|order_end|\
+		UNDEFINED)	return 0 ;;
+		esac ;;
+	LC_MONETARY)
+		case $2 in
+		int_curr_symbol|currency_symbol|mon_decimal_point|\
+		mon_thousands_sep|mon_grouping|positive_sign|negative_sign|\
+		int_frac_digits|frac_digits|p_cs_precedes|p_sep_by_space|\
+		n_cs_precedes|n_sep_by_space|p_sign_posn|n_sign_posn|\
+		int_p_cs_precedes|int_p_sep_by_space|int_n_cs_precedes|\
+		int_n_sep_by_space|int_p_sign_posn|int_n_sign_posn|\
+		duo_int_curr_symbol|duo_currency_symbol)	return 0 ;;
+		esac ;;
+	LC_NUMERIC)
+		case $2 in
+		decimal_point|thousands_sep|grouping)	return 0 ;;
+		esac ;;
+	LC_TIME)
+		case $2 in
+		abday|day|abmon|mon|d_t_fmt|d_fmt|t_fmt|am_pm|t_fmt_ampm|\
+		era|era_d_fmt|era_t_fmt|era_d_t_fmt|alt_digits|date_fmt|\
+		week|first_weekday|first_workday|cal_direction|timezone|\
+		ab_alt_mon|alt_mon)	return 0 ;;
+		esac ;;
+	LC_MESSAGES)
+		case $2 in
+		yesexpr|noexpr|yesstr|nostr)	return 0 ;;
+		esac ;;
+	*)	return 0 ;;
+	esac
+	return 1
+}
+
+# Copy category $2 out of the locale source $1.
+_bt_ld_copy() {
+	local name=$1 cat=$2 d f i n line found=0
+	local -a save=()
+	for d in "$_ld_dir" /usr/share/i18n/locales; do
+		[ -n "$d" ] || continue
+		[ -f "$d/$name" ] || continue
+		f=$d/$name
+		found=1
+		break
+	done
+	[ "$found" = 0 ] && return 1
+	save=("${_ld_lines[@]}")
+	local esc=$_ld_esc com=$_ld_com
+	_bt_ld_source "$f" || { _ld_lines=("${save[@]}"); return 1; }
+	n=${#_ld_lines[@]}
+	for (( i = 0; i < n; i++ )); do
+		if [ "${_ld_lines[i]}" = "$cat" ]; then
+			_bt_ld_category $(( i + 1 ))
+			_ld_lines=("${save[@]}")
+			_ld_esc=$esc _ld_com=$com
+			return 0
+		fi
+	done
+	_ld_lines=("${save[@]}")
+	_ld_esc=$esc _ld_com=$com
+	return 1
+}
+
+# The bytes for the code point $1, in UTF-8, into _bt_str.
+_bt_ld_utf8() {
+	local v=$1
+	_bt_chrtab
+	if [ "$v" -lt 128 ]; then
+		_bt_str=${_BT_CHRTAB[v]}
+		return 0
+	fi
+	if [ "$v" -lt 2048 ]; then
+		_bt_str=${_BT_CHRTAB[192 | (v >> 6)]}${_BT_CHRTAB[128 | (v & 63)]}
+		return 0
+	fi
+	if [ "$v" -lt 65536 ]; then
+		_bt_str=${_BT_CHRTAB[224 | (v >> 12)]}${_BT_CHRTAB[128 | ((v >> 6) & 63)]}${_BT_CHRTAB[128 | (v & 63)]}
+		return 0
+	fi
+	_bt_str=${_BT_CHRTAB[240 | (v >> 18)]}${_BT_CHRTAB[128 | ((v >> 12) & 63)]}${_BT_CHRTAB[128 | ((v >> 6) & 63)]}${_BT_CHRTAB[128 | (v & 63)]}
+	return 0
+}
+
+# When no charmap is given, the characters this machine's byte values stand
+# for, which is what the standard calls an implementation-defined mapping.
+_bt_ld_default_map() {
+	local i name
+	for (( i = 1; i < 128; i++ )); do
+		printf -v name '<U%04X>' "$i"
+		_bt_chr "$i"
+		_ld_map[$name]=$_bt_c
+	done
+	_ld_map['<NUL>']=
+	_ld_map['<space>']=' '
+	_ld_map['<tab>']=$'\t'
+	_ld_map['<newline>']=$'\n'
+	_ld_map['<exclamation-mark>']='!'
+	_ld_map['<quotation-mark>']='"'
+	_ld_map['<number-sign>']='#'
+	_ld_map['<dollar-sign>']='$'
+	_ld_map['<percent-sign>']='%'
+	_ld_map['<ampersand>']='&'
+	_ld_map['<apostrophe>']="'"
+	_ld_map['<left-parenthesis>']='('
+	_ld_map['<right-parenthesis>']=')'
+	_ld_map['<asterisk>']='*'
+	_ld_map['<plus-sign>']='+'
+	_ld_map['<comma>']=','
+	_ld_map['<hyphen-minus>']='-'
+	_ld_map['<hyphen>']='-'
+	_ld_map['<period>']='.'
+	_ld_map['<full-stop>']='.'
+	_ld_map['<slash>']='/'
+	_ld_map['<solidus>']='/'
+	_ld_map['<colon>']=':'
+	_ld_map['<semicolon>']=';'
+	_ld_map['<less-than-sign>']='<'
+	_ld_map['<equals-sign>']='='
+	_ld_map['<greater-than-sign>']='>'
+	_ld_map['<question-mark>']='?'
+	_ld_map['<commercial-at>']='@'
+	_ld_map['<left-square-bracket>']='['
+	_ld_map['<backslash>']='\'
+	_ld_map['<reverse-solidus>']='\'
+	_ld_map['<right-square-bracket>']=']'
+	_ld_map['<circumflex>']='^'
+	_ld_map['<circumflex-accent>']='^'
+	_ld_map['<underscore>']='_'
+	_ld_map['<low-line>']='_'
+	_ld_map['<grave-accent>']='`'
+	_ld_map['<left-brace>']='{'
+	_ld_map['<left-curly-bracket>']='{'
+	_ld_map['<vertical-line>']='|'
+	_ld_map['<right-brace>']='}'
+	_ld_map['<right-curly-bracket>']='}'
+	_ld_map['<tilde>']='~'
+	for (( i = 0; i < 10; i++ )); do
+		_ld_map["<$i>"]=$i
+	done
+	for name in a b c d e f g h i j k l m n o p q r s t u v w x y z; do
+		_ld_map["<$name>"]=$name
+	done
+	for name in A B C D E F G H I J K L M N O P Q R S T U V W X Y Z; do
+		_ld_map["<$name>"]=$name
+	done
+	return 0
+}
+
+# A value written so that it fits on one line, into _bt_str: the backslash,
+# the newline and the other control characters spelt out.
+_bt_ld_quote() {
+	local v=$1 n=${#1} i out= c d
+	for (( i = 0; i < n; i++ )); do
+		c=${v:i:1}
+		case $c in
+		'\')	out=$out'\\' ;;
+		';')	out=$out'\;' ;;
+		$'\n')	out=$out'\n' ;;
+		$'\t')	out=$out'\t' ;;
+		$'\r')	out=$out'\r' ;;
+		$'\v')	out=$out'\v' ;;
+		$'\f')	out=$out'\f' ;;
+		$'\b')	out=$out'\b' ;;
+		$'\a')	out=$out'\a' ;;
+		*)	printf -v d '%d' "'$c"
+			if [ "$d" -lt 32 ] || [ "$d" = 127 ]; then
+				printf -v d '\\%03o' "$d"
+				out=$out$d
+			else
+				out=$out$c
+			fi ;;
+		esac
+	done
+	_bt_str=$out
+	return 0
+}
+
+# The items of $1 spelt out and joined with semicolons, into _bt_str.
+_bt_ld_join() {
+	local v=$1 out= first=1 item
+	local IFS=$'\001'
+	local -
+	set -f
+	local -a items=($v)
+	IFS=' '
+	for item in ${items[@]+"${items[@]}"}; do
+		_bt_ld_quote "$item"
+		if [ "$first" = 1 ]; then out=$_bt_str; first=0
+		else out=$out';'$_bt_str; fi
+	done
+	[ "$first" = 1 ] && { _bt_ld_quote "$v"; out=$_bt_str; }
+	_bt_str=$out
+	return 0
+}
+
+localedef () {
+	local LC_ALL=C
+	local arg opt keepwarn=0 charmap= source=- codeset= name= dest cat i n line
+	local _ld_esc='\' _ld_com='#' _ld_error=0 _ld_warn=0 _ld_i=0 _ld_cat=
+	local _ld_codeset= _ld_mbmax=1 _ld_multi=0 _ld_order= _ld_dir= _bt_str= _bt_c=
+	local -a _ld_lines=() _BT_CHRTAB=()
+	local -A _ld_map=() _ld_sym=() _ld_val=() _ld_keys=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-f)	shift
+			[ "$#" = 0 ] && { _bt_err 'localedef: -f wants a charmap'; return 4; }
+			charmap=$1; shift ;;
+		-f*)	charmap=${1#-f}; shift ;;
+		-i)	shift
+			[ "$#" = 0 ] && { _bt_err 'localedef: -i wants a file'; return 4; }
+			source=$1; shift ;;
+		-i*)	source=${1#-i}; shift ;;
+		-u)	shift
+			[ "$#" = 0 ] && { _bt_err 'localedef: -u wants a codeset'; return 4; }
+			codeset=$1; shift ;;
+		-u*)	codeset=${1#-u}; shift ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				c)	keepwarn=1 ;;
+				*)	_bt_err "localedef: illegal option -- $opt"
+					_bt_err 'usage: localedef [-c] [-f charmap] [-i sourcefile] [-u code_set_name] name'
+					return 4 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" != 1 ]; then
+		_bt_err 'usage: localedef [-c] [-f charmap] [-i sourcefile] [-u code_set_name] name'
+		return 4
+	fi
+	name=$1
+
+	_bt_ld_default_map
+	if [ -n "$charmap" ]; then
+		if ! _bt_ld_charmap "$charmap"; then
+			_bt_err "localedef: cannot read the charmap $charmap"
+			return 4
+		fi
+	else
+		_ld_codeset=ANSI_X3.4-1968
+	fi
+	[ -n "$codeset" ] && _ld_codeset=$codeset
+
+	case $source in
+	-)	_ld_dir=. ;;
+	*/*)	_ld_dir=${source%/*} ;;
+	*)	_ld_dir=. ;;
+	esac
+	if ! _bt_ld_source "$source"; then
+		_bt_err "localedef: cannot read $source"
+		return 4
+	fi
+
+	n=${#_ld_lines[@]}
+	i=0
+	while [ "$i" -lt "$n" ]; do
+		line=${_ld_lines[i]}
+		case $line in
+		LC_CTYPE|LC_COLLATE|LC_MONETARY|LC_NUMERIC|LC_TIME|LC_MESSAGES|LC_*)
+			_ld_cat=$line
+			_bt_ld_category $(( i + 1 ))
+			i=$_ld_i
+			continue ;;
+		'escape_char'*|'comment_char'*|'')
+			i=$(( i + 1 ))
+			continue ;;
+		esac
+		_bt_err "localedef: cannot make sense of \`$line'"
+		_ld_error=1
+		i=$(( i + 1 ))
+	done
+
+	if [ "$_ld_error" != 0 ]; then
+		_bt_err 'localedef: no locale was made'
+		return 4
+	fi
+	if [ "$_ld_warn" != 0 ] && [ "$keepwarn" = 0 ]; then
+		_bt_err 'localedef: no locale was made; -c would have made it anyway'
+		return 4
+	fi
+
+	case $name in
+	*/*)	dest=$name ;;
+	*)	dest=${LOCPATH:-/usr/lib/locale}/$name ;;
+	esac
+	# a locale is one file here: a shell has no way to make a directory
+	{
+	printf '# locale %s, made by bashtrash localedef\n' "$name"
+	printf 'codeset %s\n' "$_ld_codeset"
+	for cat in LC_CTYPE LC_COLLATE LC_MONETARY LC_NUMERIC LC_TIME LC_MESSAGES; do
+		[ -n "${_ld_keys[$cat]-}" ] || continue
+		printf '%s\n' "$cat"
+		for line in ${_ld_keys[$cat]}; do
+			_bt_ld_join "${_ld_val[$cat:$line]}"
+			printf '%s %s\n' "$line" "$_bt_str"
+		done
+		printf 'END %s\n' "$cat"
+	done
+	} > "$dest" 2>/dev/null || {
+		_bt_err "localedef: cannot write $dest"
+		return 4
+	}
+	[ "$_ld_warn" != 0 ] && return 1
+	return 0
 }

@@ -28,7 +28,7 @@ for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          nohup pr dd sed who logname diff cal fuser ipcs patch tput \
          what uuencode uudecode write ps ed m4 iconv ar locale nm \
          admin delta get prs rmdel sact sccs unget val \
-         compress uncompress zcat bc make awk gencat ctags cflow cxref file lex yacc man mailx; do
+         compress uncompress zcat bc make awk gencat ctags cflow cxref file lex yacc man mailx localedef; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -4052,6 +4052,174 @@ case $a in
 *'no mailer'*rc=1)	pass=$((pass + 1)) ;;
 *)			note_fail "mailx to a remote address: [$a]" ;;
 esac
+
+cd .. || exit 1
+
+# --- localedef --------------------------------------------------------------
+# A locale definition is compiled into the form `locale' here reads back, so
+# the test is a round trip: write a definition, compile it, and ask locale
+# what it says.
+echo "### localedef"
+mkdir -p ldt
+cd ldt || exit 1
+LDHOME=$PWD
+
+cat > src <<'LEOF'
+comment_char %
+escape_char /
+% a small locale
+LC_NUMERIC
+decimal_point "<comma>"
+thousands_sep "<period>"
+grouping 3;3
+END LC_NUMERIC
+LC_TIME
+abday "Su";"Mo";"Tu";"We";"Th";"Fr";"Sa"
+day "Sunday";/
+    "Monday";/
+    "Tuesday";/
+    "Wednesday";/
+    "Thursday";/
+    "Friday";/
+    "Saturday"
+d_fmt "%d.%m.%Y"
+t_fmt "%H:%M:%S"
+END LC_TIME
+LC_MESSAGES
+yesexpr "<circumflex>[jJyY]"
+noexpr "<circumflex>[nN]"
+END LC_MESSAGES
+LEOF
+
+a=$( LOCPATH=$LDHOME; export LOCPATH; . "$BT"; localedef -i src mine 2>&1; echo "rc=$?" )
+if [ "$a" = "rc=0" ] && [ -f mine ]; then pass=$((pass + 1))
+else note_fail "localedef: [$a]"; fi
+
+# what came out says what went in
+ok=1
+for want in '^LC_NUMERIC$' '^decimal_point ,$' '^grouping 3;3$' '^END LC_NUMERIC$' \
+            '^abday Su;Mo;Tu;We;Th;Fr;Sa$' '^d_fmt %d\.%m\.%Y$' '^yesexpr \^\[jJyY\]$'; do
+	"$(real_of grep)" -q "$want" mine || { ok=0; note_fail "localedef: [$want] not in the locale"; }
+done
+[ "$ok" = 1 ] && pass=$((pass + 1))
+
+# and locale reads it back
+got=$( { LOCPATH=$LDHOME LC_ALL=mine; export LOCPATH LC_ALL; . "$BT"
+	locale -k decimal_point d_fmt abday yesexpr; } 2>/dev/null )
+want='decimal_point=","
+d_fmt="%d.%m.%Y"
+abday="Su;Mo;Tu;We;Th;Fr;Sa"
+yesexpr="^[jJyY]"'
+if [ "$got" = "$want" ]; then pass=$((pass + 1))
+else note_fail "locale reading a compiled locale: [$got]"; fi
+# without it, the POSIX values stand
+got=$( { LC_ALL=C; export LC_ALL; . "$BT"; locale -k d_fmt; } 2>/dev/null )
+if [ "$got" = 'd_fmt="%m/%d/%y"' ]; then pass=$((pass + 1))
+else note_fail "locale outside a compiled locale: [$got]"; fi
+
+# characters that would be taken for something else survive the trip
+cat > tricky <<'LEOF'
+LC_NUMERIC
+decimal_point "<semicolon>"
+thousands_sep "<backslash>"
+grouping 3
+END LC_NUMERIC
+LC_TIME
+abday "a;b";"c\\d";"e f"
+END LC_TIME
+LEOF
+( . "$BT"; localedef -i tricky ./odd ) > /dev/null 2>&1
+got=$( { LC_ALL=$LDHOME/odd; export LC_ALL; . "$BT"; locale -k decimal_point thousands_sep abday; } 2>/dev/null )
+want='decimal_point=";"
+thousands_sep="\"
+abday="a;b;c\d;e f"'
+if [ "$got" = "$want" ]; then pass=$((pass + 1))
+else note_fail "localedef round trip with odd characters: [$got]"; fi
+
+# a charmap of one's own
+cat > cm <<'LEOF'
+<code_set_name> TEST
+<mb_cur_max> 1
+<comment_char> %
+<escape_char> /
+CHARMAP
+<one-sign>     /x31
+<two-sign>     /x32
+<star>         /x2a
+END CHARMAP
+LEOF
+cat > src2 <<'LEOF'
+LC_NUMERIC
+decimal_point "<star>"
+thousands_sep "<one-sign>"
+grouping 3
+END LC_NUMERIC
+LEOF
+a=$( . "$BT"; localedef -f cm -i src2 ./cmloc 2>&1; echo "rc=$?" )
+got=$( { LC_ALL=$LDHOME/cmloc; export LC_ALL; . "$BT"; locale -k decimal_point thousands_sep; } 2>/dev/null )
+if [ "$a" = "rc=0" ] && [ "$got" = 'decimal_point="*"
+thousands_sep="1"' ]; then
+	pass=$((pass + 1))
+else note_fail "localedef with a charmap: [$a] [$got]"; fi
+
+# a name the charmap does not hold is a warning in LC_CTYPE and an error
+# elsewhere; a warning stops the locale being made unless -c says otherwise
+cat > src3 <<'LEOF'
+LC_CTYPE
+upper "<not-a-real-name>"
+END LC_CTYPE
+LEOF
+rm -f ./warned
+a=$( . "$BT"; localedef -f cm -i src3 ./warned 2>/dev/null; echo "rc=$?" )
+if [ "$a" = "rc=4" ] && [ ! -f ./warned ]; then pass=$((pass + 1))
+else note_fail "localedef with a warning and no -c: [$a]"; fi
+a=$( . "$BT"; localedef -c -f cm -i src3 ./warned 2>/dev/null; echo "rc=$?" )
+if [ "$a" = "rc=1" ] && [ -f ./warned ]; then pass=$((pass + 1))
+else note_fail "localedef -c with a warning: [$a]"; fi
+cat > src4 <<'LEOF'
+LC_NUMERIC
+decimal_point "<not-a-real-name>"
+END LC_NUMERIC
+LEOF
+rm -f ./errored
+a=$( . "$BT"; localedef -c -f cm -i src4 ./errored 2>/dev/null; echo "rc=$?" )
+if [ "$a" = "rc=4" ] && [ ! -f ./errored ]; then pass=$((pass + 1))
+else note_fail "localedef with an error even with -c: [$a]"; fi
+
+# a source that is not there, and a line that means nothing
+a=$( . "$BT"; localedef -i nosuch ./x 2>/dev/null; echo "rc=$?" )
+if [ "$a" = "rc=4" ]; then pass=$((pass + 1))
+else note_fail "localedef with a missing source: [$a]"; fi
+printf 'this is not a category\n' > src5
+rm -f ./bad
+a=$( . "$BT"; localedef -i src5 ./bad 2>/dev/null; echo "rc=$?" )
+if [ "$a" = "rc=4" ] && [ ! -f ./bad ]; then pass=$((pass + 1))
+else note_fail "localedef with a line it cannot read: [$a]"; fi
+
+# copy takes a category from another definition
+cat > base <<'LEOF'
+LC_TIME
+d_fmt "%Y-%m-%d"
+END LC_TIME
+LEOF
+cat > src6 <<'LEOF'
+LC_TIME
+copy "base"
+END LC_TIME
+LEOF
+( . "$BT"; localedef -i src6 ./copied ) > /dev/null 2>&1
+got=$( { LC_ALL=$LDHOME/copied; export LC_ALL; . "$BT"; locale -k d_fmt; } 2>/dev/null )
+if [ "$got" = 'd_fmt="%Y-%m-%d"' ]; then pass=$((pass + 1))
+else note_fail "localedef copy: [$got]"; fi
+
+# the definition this system keeps for the POSIX locale compiles
+if [ -f /usr/share/i18n/locales/POSIX ]; then
+	rm -f ./posix
+	a=$( . "$BT"; localedef -i /usr/share/i18n/locales/POSIX ./posix 2>/dev/null; echo "rc=$?" )
+	if [ "$a" = "rc=0" ] && "$(real_of grep)" -q '^upper A;B;C' ./posix; then
+		pass=$((pass + 1))
+	else note_fail "localedef on the system's POSIX definition: [$a]"; fi
+fi
 
 cd .. || exit 1
 

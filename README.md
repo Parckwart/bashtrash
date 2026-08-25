@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-84 of the 160 utilities in POSIX.1-2017, as of now.
+85 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -91,6 +91,7 @@ Run the test suite with:
 | `join` | `join [-a n] [-e s] [-o list] [-t c] [-v n] [-1 f] [-2 f] file1 file2` |
 | `lex` | `lex [-t] [-n\|-v] file...` |
 | `locale` | `locale [-a\|-m]` · `locale [-ck] name...` |
+| `localedef` | `localedef [-c] [-f charmap] [-i sourcefile] [-u code_set_name] name` |
 | `logname` | `logname` |
 | `m4` | `m4 [-s] [-D name[=value]]... [-U name]... [file...]` |
 | `mailx` | `mailx [-s subject] address...`<br>`mailx -e`<br>`mailx [-HiNn] [-F] [-u user]`<br>`mailx -f [-HiNn] [-F] [file]` |
@@ -235,6 +236,16 @@ declaration. Braces inside strings and comments are counted by nobody, and
 the tag `main` is written out as `M` and the file's name, as the standard
 asks.
 
+**`localedef` compiles a locale into the form `locale` here reads back.**
+The standard leaves that form to whoever writes the utility, and since a shell
+cannot make a directory, a locale here is one file: the categories in order,
+each keyword with its value worked out, the names in angle brackets replaced
+by what the charmap says they encode, and anything that would be taken for
+punctuation spelt out. `locale -k` then reads it, so a locale written by hand
+in the morning can be asked questions in the afternoon -- which is what the
+standard means when it says the output has to be usable by the utilities of
+the implementation.
+
 **`man` had to learn to read gzip**, since that is how every page on a
 modern system is kept. Deflate is a stream of blocks, each either stored or
 coded with a Huffman code, and each symbol either a byte or a length and a
@@ -309,7 +320,7 @@ $ ./test.sh
 ### fuzz
 ### id
 ...
-==== pass=6643 fail=0 ====
+==== pass=7695 fail=0 ====
 ```
 
 Every case runs twice — once through the bash function, once through the
@@ -327,14 +338,36 @@ character set it knows to every other. `ar` archives are compared byte for byte
 with the ones `ar` builds. `nm` reads the object files the machine has and any
 the compiler can be asked for.
 
-Four have nothing here to be compared against, and are held to a property
+Where nothing here can be compared against, the utility is held to a property
 instead. `ed` replays the script `diff -e` writes, which has to turn one file
 into the other. `uuencode` is checked against known encodings and round-tripped
 through `uudecode`. The SCCS utilities put a file under `admin`, edit and
 `delta` it four times over with random changes, and then have to hand back every
-version it ever had, byte for byte, and pass `val` at the end.
+version it ever had, byte for byte, and pass `val` at the end. `gencat` writes
+message catalogues that have to come out byte for byte the same as the C
+library's own gencat writes, merging included. `ctags` has to find every object
+in a file written to contain all of them, and every search pattern it writes
+has to find the line it points at. `cflow` is given the program the standard
+prints as its example, and has to draw the graph the standard prints beside it.
+`file` has to answer with the strings the standard's table lists, for a file of
+each sort. `man` formats a page written for the purpose, and then the same page
+gzipped, and the two have to come out identical -- which is also how the gzip
+reader is checked, against `zcat`, on text, on random bytes and on every manual
+page this machine has. `localedef` compiles a locale definition that `locale`
+then has to read back, odd characters and all.
 
-A final case runs everything with an empty `PATH`.
+`lex` and `yacc` write C, so the only honest test is to compile what they write
+and run it: the scanners are fed input and have to return the right tokens in
+the right order, `REJECT` and `yymore` and start conditions included, and the
+parsers have to parse -- with precedence, error recovery, a union for the
+values and actions in the middle of a rule -- while the grammar of C itself has
+to come out with the one shift/reduce conflict every yacc reports for it.
+
+A final case runs a good deal of the library with an empty `PATH`: `awk`,
+`sed`, `grep`, `sort`, `bc`, `make`, `lex`, `yacc`, `ctags`, `cflow`, `cxref`,
+`file`, `gencat`, `compress`, `zcat`, `uuencode`, `uudecode`, `od`, `pr`,
+`diff`, `man` and `mailx`, one after another, with nothing on the machine to
+fall back on.
 
 ## Limitations, and why they exist
 
@@ -358,6 +391,7 @@ So these are permanently out of reach, not merely unfinished:
 | --- | --- |
 | `mkdir` `rmdir` `rm` `unlink` `link` `ln` `mv` `chmod` `chgrp` `chown` `mkfifo` `touch` | no builtin mutates the filesystem |
 | `df` `du` `ls -l` `find -size/-perm/-mtime` `pax` | no numeric `stat()` of any kind — nothing in `/proc` carries free space either |
+| `cp` | copies the bytes happily; the standard also asks for the destination's mode and times to be set, and neither `chmod()` nor `utime()` is reachable |
 | `stty` `vi` `ex` `more` `talk` | no termios: no raw mode |
 | `mesg` | reports and sets the group-write bit of a terminal: no `stat()` to read it, no `chmod()` to change it |
 | `nice` `renice` `newgrp` `ipcrm` `logger` | `setpriority()`, `setgid()`, SysV IPC, `AF_UNIX` — bash only speaks TCP/UDP |
@@ -376,19 +410,19 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 84 |
+| implemented here | 85 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **52** |
-| reachable, not yet written | 2 |
+| reachable, not yet written | 1 |
 
 **The ceiling is 86 of 160**, or about 54% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 2 that remain are `localedef`, which compiles locale definitions into a
-binary whose format nobody has written down -- it is glibc's own, and the
-only thing that reads it is glibc -- and `sh`, whose whole purpose, running a
-program, is the one thing this library will not do.
+The one that remains is `sh`, whose whole purpose -- running a program -- is
+the one thing this library will not do. The shell this is written in is
+already a POSIX shell; writing a second one inside it would be a curiosity
+rather than a utility.
 
 ### Smaller deviations, all deliberate
 
@@ -436,6 +470,14 @@ program, is the one thing this library will not do.
   does and not what mawk does; a `printf` given fewer arguments than
   conversions treats the missing ones as empty, as the standard says, rather
   than stopping.
+* `localedef` writes its locale as a single file, since nothing in a shell can
+  make a directory, and it puts it where `LOCPATH` says, as glibc's own
+  loader does. It is slow in proportion to what it is given: a definition
+  the size of the ones in the standard compiles in well under a second, while
+  glibc's `i18n` file, with its hundred thousand character names, would keep
+  it busy for a very long time. Nothing here consumes a locale for anything
+  but `locale` itself -- every utility in this library works in bytes, in the
+  C locale, on purpose.
 * `mailx` has no mailer to hand a message to, so it delivers: a message for a
   user on this machine is appended to their mailbox in the format every
   mailbox has, and an address with a host in it is refused rather than
@@ -574,7 +616,6 @@ Measured on a 2.6 MB text file, in this container:
 | | throughput |
 | --- | ---: |
 | `cat` | ~33 MB/s |
-| `cal` | `cal [[month] year]` |
 | `tail -n 5` | ~9 MB/s |
 | `wc -l` | ~3 MB/s |
 | `tr a-z A-Z` | ~12 KB/s |
