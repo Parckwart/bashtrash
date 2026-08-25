@@ -59,7 +59,6 @@ Run the test suite with:
 | `cmp` | `cmp [-l\|-s] file1 file2` |
 | `comm` | `comm [-123] file1 file2` |
 | `cut` | `cut -b list [-n] [file...]` · `cut -c list [file...]` · `cut -f list [-d delim] [-s] [file...]` |
-| `csplit` | `csplit [-ks] [-f prefix] [-n number] file arg...` |
 | `date` | `date [-u] [+format]` |
 | `dirname` | `dirname string` |
 | `env` | `env [-i] [name=value]... [utility [argument...]]` |
