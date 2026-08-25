@@ -14642,3 +14642,3114 @@ make () {
 	done
 	return "$status"
 }
+
+# ---------------------------------------------------------------------------
+# awk -- POSIX.1-2017:
+#	awk [-F sepstring] [-v assignment]... program [argument...]
+#	awk [-F sepstring] -f progfile [-f progfile]... [-v assignment]...
+#	    [argument...]
+#
+# A lexer, a recursive descent parser that builds a tree in a handful of
+# parallel arrays, and a walker over that tree.  Numbers are decimal strings,
+# done exactly when they are whole and through the same arithmetic bc uses when
+# they are not.  Regular expressions are handed to the shell's own =~, which is
+# the ERE matcher awk asks for.
+# ---------------------------------------------------------------------------
+
+# Turn a number written with an exponent into plain digits, into _aw_s.
+_bt_awk_plain() {
+	local s=$1 mant exp sign= int frac
+	case $s in
+	*[eE]*)	;;
+	*)	_aw_s=$s; return 0 ;;
+	esac
+	mant=${s%%[eE]*}
+	exp=${s#*[eE]}
+	case $exp in
+	+*)	exp=${exp#+} ;;
+	esac
+	case $mant in
+	-*)	sign=-; mant=${mant#-} ;;
+	+*)	mant=${mant#+} ;;
+	esac
+	case $mant in
+	*.*)	int=${mant%%.*}; frac=${mant#*.} ;;
+	*)	int=$mant; frac= ;;
+	esac
+	case $exp in
+	-*)	exp=$(( -1 * 10#${exp#-} )) ;;
+	*)	exp=$(( 10#$exp )) ;;
+	esac
+	while [ "$exp" -gt 0 ]; do
+		if [ -n "$frac" ]; then
+			int=$int${frac:0:1}
+			frac=${frac:1}
+		else
+			int=${int}0
+		fi
+		exp=$(( exp - 1 ))
+	done
+	while [ "$exp" -lt 0 ]; do
+		if [ -n "$int" ]; then
+			frac=${int: -1}$frac
+			int=${int%?}
+		else
+			frac=0$frac
+		fi
+		exp=$(( exp + 1 ))
+	done
+	[ -z "$int" ] && int=0
+	if [ -n "$frac" ]; then _aw_s=$sign$int.$frac; else _aw_s=$sign$int; fi
+	return 0
+}
+
+# The escapes awk understands, in $1, into _aw_s.  $2 says whether this is a
+# regular expression, where an escape the matcher knows is left as it stands.
+_bt_awk_esc() {
+	local s=$1 re=$2 n=${#1} i=0 out= c d v
+	while [ "$i" -lt "$n" ]; do
+		c=${s:i:1}
+		if [ "$c" != '\' ]; then
+			out=$out$c
+			i=$(( i + 1 ))
+			continue
+		fi
+		d=${s:i+1:1}
+		case $d in
+		'\')	if [ "$re" = 1 ]; then out=$out'\\'; else out=$out'\'; fi
+			i=$(( i + 2 )) ;;
+		'/')	out=$out/; i=$(( i + 2 )) ;;
+		'"')	out=$out'"'; i=$(( i + 2 )) ;;
+		n)	out=$out$'\n'; i=$(( i + 2 )) ;;
+		t)	out=$out$'\t'; i=$(( i + 2 )) ;;
+		r)	out=$out$'\r'; i=$(( i + 2 )) ;;
+		b)	out=$out$'\b'; i=$(( i + 2 )) ;;
+		f)	out=$out$'\f'; i=$(( i + 2 )) ;;
+		v)	out=$out$'\v'; i=$(( i + 2 )) ;;
+		a)	out=$out$'\a'; i=$(( i + 2 )) ;;
+		[0-7])	v=0
+			i=$(( i + 1 ))
+			d=0
+			while [ "$d" -lt 3 ]; do
+				case ${s:i:1} in
+				[0-7])	v=$(( v * 8 + ${s:i:1} )); i=$(( i + 1 )); d=$(( d + 1 )) ;;
+				*)	break ;;
+				esac
+			done
+			if [ "$v" = 0 ]; then
+				:
+			else
+				printf -v c '\\%03o' "$v"
+				printf -v c "$c"
+				out=$out$c
+			fi ;;
+		'')	out=$out'\'; i=$(( i + 1 )) ;;
+		*)	out=$out'\'$d; i=$(( i + 2 )) ;;
+		esac
+	done
+	_aw_s=$out
+	return 0
+}
+
+# The words that are not names.
+_bt_awk_kw() {
+	case $1 in
+	BEGIN|END|function|func|if|else|while|for|do|break|continue|next|\
+	nextfile|exit|return|delete|in|getline|print|printf)	return 0 ;;
+	esac
+	return 1
+}
+
+# The functions awk brings with it.
+_bt_awk_builtin() {
+	case $1 in
+	length|substr|index|split|sub|gsub|match|sprintf|sin|cos|atan2|exp|log|\
+	sqrt|int|rand|srand|tolower|toupper|system|close|fflush)	return 0 ;;
+	esac
+	return 1
+}
+
+# Break the program text $1 into the token arrays ak (kind) and av (value).
+# The kinds are N number, S string, R regular expression, I name, K keyword,
+# F name followed straight away by a bracket, and O for everything else.
+_bt_awk_lex() {
+	local s=$1 n=${#1} i=0 c d prevk= prev= t
+	ak=() av=()
+	while [ "$i" -lt "$n" ]; do
+		c=${s:i:1}
+		case $c in
+		' '|$'\t'|$'\r')	i=$(( i + 1 )); continue ;;
+		'\')	if [ "${s:i+1:1}" = $'\n' ]; then i=$(( i + 2 )); continue; fi
+			i=$(( i + 1 )); continue ;;
+		'#')	while [ "$i" -lt "$n" ] && [ "${s:i:1}" != $'\n' ]; do i=$(( i + 1 )); done
+			continue ;;
+		$'\n')	i=$(( i + 1 ))
+			# after these a newline is only more space
+			case $prevk:$prev in
+			:*|O:'{'|O:'&&'|O:'||'|O:','|O:';'|O:$'\n'|K:do|K:else)
+				continue ;;
+			esac
+			ak+=(O); av+=($'\n'); prevk=O; prev=$'\n'; continue ;;
+		'"')	i=$(( i + 1 ))
+			d=
+			while [ "$i" -lt "$n" ] && [ "${s:i:1}" != '"' ]; do
+				if [ "${s:i:1}" = '\' ]; then
+					d=$d${s:i:2}
+					i=$(( i + 2 ))
+					continue
+				fi
+				d=$d${s:i:1}
+				i=$(( i + 1 ))
+			done
+			i=$(( i + 1 ))
+			_bt_awk_esc "$d" 0
+			ak+=(S); av+=("$_aw_s"); prevk=S; prev=$_aw_s; continue ;;
+		[0-9])	d=
+			while [ "$i" -lt "$n" ]; do
+				case ${s:i:1} in
+				[0-9])	d=$d${s:i:1}; i=$(( i + 1 )) ;;
+				*)	break ;;
+				esac
+			done
+			if [ "${s:i:1}" = . ]; then
+				d=$d.
+				i=$(( i + 1 ))
+				while [ "$i" -lt "$n" ]; do
+					case ${s:i:1} in
+					[0-9])	d=$d${s:i:1}; i=$(( i + 1 )) ;;
+					*)	break ;;
+					esac
+				done
+			fi
+			case ${s:i:1} in
+			[eE])	case ${s:i+1:1} in
+				[0-9])	d=$d${s:i:1}; i=$(( i + 1 )) ;;
+				[-+])	case ${s:i+2:1} in
+					[0-9])	d=$d${s:i:2}; i=$(( i + 2 )) ;;
+					*)	d=$d ;;
+					esac ;;
+				esac
+				while [ "$i" -lt "$n" ]; do
+					case ${s:i:1} in
+					[0-9])	d=$d${s:i:1}; i=$(( i + 1 )) ;;
+					*)	break ;;
+					esac
+				done ;;
+			esac
+			_bt_awk_plain "$d"
+			ak+=(N); av+=("$_aw_s"); prevk=N; prev=$_aw_s; continue ;;
+		'.')	case ${s:i+1:1} in
+			[0-9])	d=.
+				i=$(( i + 1 ))
+				while [ "$i" -lt "$n" ]; do
+					case ${s:i:1} in
+					[0-9])	d=$d${s:i:1}; i=$(( i + 1 )) ;;
+					*)	break ;;
+					esac
+				done
+				case ${s:i:1} in
+				[eE])	case ${s:i+1:1} in
+					[0-9])	d=$d${s:i:1}; i=$(( i + 1 )) ;;
+					[-+])	d=$d${s:i:2}; i=$(( i + 2 )) ;;
+					esac
+					while [ "$i" -lt "$n" ]; do
+						case ${s:i:1} in
+						[0-9])	d=$d${s:i:1}; i=$(( i + 1 )) ;;
+						*)	break ;;
+						esac
+					done ;;
+				esac
+				_bt_awk_plain "0$d"
+				ak+=(N); av+=("$_aw_s"); prevk=N; prev=$_aw_s; continue ;;
+			esac ;;
+		[A-Za-z_])
+			d=
+			while [ "$i" -lt "$n" ]; do
+				case ${s:i:1} in
+				[A-Za-z0-9_])	d=$d${s:i:1}; i=$(( i + 1 )) ;;
+				*)		break ;;
+				esac
+			done
+			if _bt_awk_kw "$d"; then
+				[ "$d" = func ] && d=function
+				ak+=(K); av+=("$d"); prevk=K; prev=$d; continue
+			fi
+			if [ "${s:i:1}" = '(' ]; then
+				ak+=(F); av+=("$d"); prevk=F; prev=$d; continue
+			fi
+			ak+=(I); av+=("$d"); prevk=I; prev=$d; continue ;;
+		'/')	# a slash is division only where a value has just ended
+			case $prevk:$prev in
+			N:*|S:*|I:*|O:')'|O:']'|O:'++'|O:'--'|O:'$')
+				;;
+			*)	i=$(( i + 1 ))
+				d=
+				while [ "$i" -lt "$n" ] && [ "${s:i:1}" != / ]; do
+					if [ "${s:i:1}" = '\' ]; then
+						d=$d${s:i:2}
+						i=$(( i + 2 ))
+						continue
+					fi
+					if [ "${s:i:1}" = $'\n' ]; then break; fi
+					d=$d${s:i:1}
+					i=$(( i + 1 ))
+				done
+				i=$(( i + 1 ))
+				_bt_awk_esc "$d" 1
+				ak+=(R); av+=("$_aw_s"); prevk=R; prev=$_aw_s
+				continue ;;
+			esac ;;
+		esac
+		t=
+		case ${s:i:3} in
+		'**=')	t='^=' ;;
+		esac
+		if [ -z "$t" ]; then
+			case ${s:i:2} in
+			'=='|'!='|'<='|'>='|'&&'|'||'|'++'|'--'|'+='|'-='|'*='|\
+			'/='|'%='|'^='|'!~'|'>>')	t=${s:i:2} ;;
+			'**')	t='^' ;;
+			esac
+			if [ -n "$t" ]; then
+				case ${s:i:2} in
+				'**')	i=$(( i + 2 )) ;;
+				*)	i=$(( i + ${#t} )) ;;
+				esac
+			fi
+		else
+			i=$(( i + 3 ))
+		fi
+		if [ -z "$t" ]; then
+			t=$c
+			i=$(( i + 1 ))
+		fi
+		ak+=(O); av+=("$t"); prevk=O; prev=$t
+	done
+	ak+=(E); av+=('')
+	return 0
+}
+
+# --- the parser ------------------------------------------------------------
+# The tree lives in the arrays nk (kind), na, nb, nc, nd (children, -1 for
+# none) and ns (a name or an operator).  A node is an index into them.
+
+_bt_awk_node() {
+	local i=${#nk[@]}
+	nk[i]=$1
+	na[i]=${2--1}
+	nb[i]=${3--1}
+	nc[i]=${4--1}
+	nd[i]=${5--1}
+	ns[i]=${6-}
+	_aw_nd=$i
+	return 0
+}
+
+_bt_awk_is() {
+	[ "${ak[tp]}" = "$1" ] && [ "${av[tp]}" = "$2" ]
+	return $?
+}
+
+_bt_awk_nl() {
+	while [ "${ak[tp]}" = O ] && [ "${av[tp]}" = $'\n' ]; do tp=$(( tp + 1 )); done
+	return 0
+}
+
+# Step over the statement terminators: newlines and semicolons alike.
+_bt_awk_term() {
+	while [ "${ak[tp]}" = O ] &&
+	      { [ "${av[tp]}" = $'\n' ] || [ "${av[tp]}" = ';' ]; }; do
+		tp=$(( tp + 1 ))
+	done
+	return 0
+}
+
+_bt_awk_die() {
+	_bt_err "awk: syntax error at or near ${av[tp]:-end of program}"
+	_aw_bad=1
+	return 1
+}
+
+# A whole program: rules and function definitions.
+_bt_awk_p_program() {
+	local pat pat2 act
+	_bt_awk_term
+	while [ "${ak[tp]}" != E ]; do
+		[ "$_aw_bad" = 1 ] && return 1
+		if [ "${ak[tp]}" = K ] && [ "${av[tp]}" = function ]; then
+			_bt_awk_p_function || return 1
+			_bt_awk_term
+			continue
+		fi
+		pat=-1 pat2=-1 act=-1
+		if [ "${ak[tp]}" = K ] && [ "${av[tp]}" = BEGIN ]; then
+			tp=$(( tp + 1 ))
+			_bt_awk_nl
+			_bt_awk_p_block || return 1
+			rk+=(BEGIN); rp+=(-1); rp2+=(-1); ra+=("$_aw_nd"); rng+=(0)
+			_bt_awk_term
+			continue
+		fi
+		if [ "${ak[tp]}" = K ] && [ "${av[tp]}" = END ]; then
+			tp=$(( tp + 1 ))
+			_bt_awk_nl
+			_bt_awk_p_block || return 1
+			rk+=(END); rp+=(-1); rp2+=(-1); ra+=("$_aw_nd"); rng+=(0)
+			_bt_awk_term
+			continue
+		fi
+		if ! _bt_awk_is O '{'; then
+			_bt_awk_p_expr || return 1
+			pat=$_aw_nd
+			if _bt_awk_is O ','; then
+				tp=$(( tp + 1 ))
+				_bt_awk_nl
+				_bt_awk_p_expr || return 1
+				pat2=$_aw_nd
+			fi
+		fi
+		if _bt_awk_is O '{'; then
+			_bt_awk_p_block || return 1
+			act=$_aw_nd
+		fi
+		rk+=(rule); rp+=("$pat"); rp2+=("$pat2"); ra+=("$act"); rng+=(0)
+		_bt_awk_term
+	done
+	return 0
+}
+
+_bt_awk_p_function() {
+	local name params=
+	tp=$(( tp + 1 ))
+	case ${ak[tp]} in
+	F|I)	name=${av[tp]}; tp=$(( tp + 1 )) ;;
+	*)	_bt_awk_die; return 1 ;;
+	esac
+	_bt_awk_is O '(' || { _bt_awk_die; return 1; }
+	tp=$(( tp + 1 ))
+	while ! _bt_awk_is O ')'; do
+		[ "${ak[tp]}" = E ] && { _bt_awk_die; return 1; }
+		if [ "${ak[tp]}" = I ]; then
+			params="$params ${av[tp]}"
+			tp=$(( tp + 1 ))
+		elif _bt_awk_is O ','; then
+			tp=$(( tp + 1 ))
+			_bt_awk_nl
+		else
+			_bt_awk_die; return 1
+		fi
+	done
+	tp=$(( tp + 1 ))
+	_bt_awk_nl
+	_bt_awk_p_block || return 1
+	_aw_fn[$name]=$_aw_nd
+	_aw_fnp[$name]=${params# }
+	return 0
+}
+
+# A { ... } block, into _aw_nd.
+_bt_awk_p_block() {
+	local head=-1 tail=-1 st
+	_bt_awk_is O '{' || { _bt_awk_die; return 1; }
+	tp=$(( tp + 1 ))
+	_bt_awk_term
+	while ! _bt_awk_is O '}'; do
+		if [ "${ak[tp]}" = E ]; then _bt_awk_die; return 1; fi
+		_bt_awk_p_stmt || return 1
+		st=$_aw_nd
+		_bt_awk_node stlist "$st" -1
+		if [ "$head" = -1 ]; then head=$_aw_nd; else nb[tail]=$_aw_nd; fi
+		tail=$_aw_nd
+		_bt_awk_term
+	done
+	tp=$(( tp + 1 ))
+	_bt_awk_node block "$head"
+	return 0
+}
+
+# One statement, into _aw_nd.
+_bt_awk_p_stmt() {
+	local a b c d save
+	if _bt_awk_is O '{'; then
+		_bt_awk_p_block
+		return $?
+	fi
+	if _bt_awk_is O ';'; then
+		tp=$(( tp + 1 ))
+		_bt_awk_node block -1
+		return 0
+	fi
+	if [ "${ak[tp]}" = K ]; then
+		case ${av[tp]} in
+		if)	tp=$(( tp + 1 ))
+			_bt_awk_is O '(' || { _bt_awk_die; return 1; }
+			tp=$(( tp + 1 ))
+			_bt_awk_p_expr || return 1
+			a=$_aw_nd
+			_bt_awk_is O ')' || { _bt_awk_die; return 1; }
+			tp=$(( tp + 1 ))
+			_bt_awk_nl
+			_bt_awk_p_stmt || return 1
+			b=$_aw_nd
+			c=-1
+			save=$tp
+			_bt_awk_term
+			if [ "${ak[tp]}" = K ] && [ "${av[tp]}" = else ]; then
+				tp=$(( tp + 1 ))
+				_bt_awk_nl
+				_bt_awk_p_stmt || return 1
+				c=$_aw_nd
+			else
+				tp=$save
+			fi
+			_bt_awk_node if "$a" "$b" "$c"
+			return 0 ;;
+		while)	tp=$(( tp + 1 ))
+			_bt_awk_is O '(' || { _bt_awk_die; return 1; }
+			tp=$(( tp + 1 ))
+			_bt_awk_p_expr || return 1
+			a=$_aw_nd
+			_bt_awk_is O ')' || { _bt_awk_die; return 1; }
+			tp=$(( tp + 1 ))
+			_bt_awk_nl
+			if _bt_awk_is O ';'; then
+				tp=$(( tp + 1 ))
+				_bt_awk_node block -1
+			else
+				_bt_awk_p_stmt || return 1
+			fi
+			_bt_awk_node while "$a" "$_aw_nd"
+			return 0 ;;
+		do)	tp=$(( tp + 1 ))
+			_bt_awk_nl
+			_bt_awk_p_stmt || return 1
+			a=$_aw_nd
+			_bt_awk_term
+			[ "${ak[tp]}" = K ] && [ "${av[tp]}" = while ] || { _bt_awk_die; return 1; }
+			tp=$(( tp + 1 ))
+			_bt_awk_is O '(' || { _bt_awk_die; return 1; }
+			tp=$(( tp + 1 ))
+			_bt_awk_p_expr || return 1
+			b=$_aw_nd
+			_bt_awk_is O ')' || { _bt_awk_die; return 1; }
+			tp=$(( tp + 1 ))
+			_bt_awk_node do "$a" "$b"
+			return 0 ;;
+		for)	tp=$(( tp + 1 ))
+			_bt_awk_is O '(' || { _bt_awk_die; return 1; }
+			tp=$(( tp + 1 ))
+			# for (name in array) is a different statement altogether
+			if [ "${ak[tp]}" = I ] && [ "${ak[tp+1]}" = K ] &&
+			   [ "${av[tp+1]}" = in ] && [ "${ak[tp+2]}" = I ] &&
+			   [ "${ak[tp+3]}" = O ] && [ "${av[tp+3]}" = ')' ]; then
+				a=${av[tp]}
+				b=${av[tp+2]}
+				tp=$(( tp + 4 ))
+				_bt_awk_nl
+				_bt_awk_p_stmt || return 1
+				_bt_awk_node forin "$_aw_nd" -1 -1 -1 "$a $b"
+				return 0
+			fi
+			a=-1 b=-1 c=-1
+			if ! _bt_awk_is O ';'; then
+				_bt_awk_p_simple || return 1
+				a=$_aw_nd
+			fi
+			_bt_awk_is O ';' || { _bt_awk_die; return 1; }
+			tp=$(( tp + 1 ))
+			_bt_awk_nl
+			if ! _bt_awk_is O ';'; then
+				_bt_awk_p_expr || return 1
+				b=$_aw_nd
+			fi
+			_bt_awk_is O ';' || { _bt_awk_die; return 1; }
+			tp=$(( tp + 1 ))
+			_bt_awk_nl
+			if ! _bt_awk_is O ')'; then
+				_bt_awk_p_simple || return 1
+				c=$_aw_nd
+			fi
+			_bt_awk_is O ')' || { _bt_awk_die; return 1; }
+			tp=$(( tp + 1 ))
+			_bt_awk_nl
+			if _bt_awk_is O ';'; then
+				tp=$(( tp + 1 ))
+				_bt_awk_node block -1
+			else
+				_bt_awk_p_stmt || return 1
+			fi
+			_bt_awk_node for "$a" "$b" "$c" "$_aw_nd"
+			return 0 ;;
+		break)		tp=$(( tp + 1 )); _bt_awk_node break; return 0 ;;
+		continue)	tp=$(( tp + 1 )); _bt_awk_node continue; return 0 ;;
+		next)		tp=$(( tp + 1 )); _bt_awk_node next; return 0 ;;
+		nextfile)	tp=$(( tp + 1 )); _bt_awk_node nextfile; return 0 ;;
+		exit)		tp=$(( tp + 1 ))
+				a=-1
+				if _bt_awk_startsexpr; then
+					_bt_awk_p_expr || return 1
+					a=$_aw_nd
+				fi
+				_bt_awk_node exit "$a"; return 0 ;;
+		return)		tp=$(( tp + 1 ))
+				a=-1
+				if _bt_awk_startsexpr; then
+					_bt_awk_p_expr || return 1
+					a=$_aw_nd
+				fi
+				_bt_awk_node return "$a"; return 0 ;;
+		delete)		tp=$(( tp + 1 ))
+				[ "${ak[tp]}" = I ] || { _bt_awk_die; return 1; }
+				a=${av[tp]}
+				tp=$(( tp + 1 ))
+				b=-1
+				if _bt_awk_is O '['; then
+					tp=$(( tp + 1 ))
+					_bt_awk_p_list ']' || return 1
+					b=$_aw_nd
+					_bt_awk_is O ']' || { _bt_awk_die; return 1; }
+					tp=$(( tp + 1 ))
+				fi
+				_bt_awk_node delete "$b" -1 -1 -1 "$a"; return 0 ;;
+		esac
+	fi
+	_bt_awk_p_simple
+	return $?
+}
+
+# Is there an expression here, rather than the end of a statement?
+_bt_awk_startsexpr() {
+	case ${ak[tp]} in
+	N|S|R|I|F)	return 0 ;;
+	K)	case ${av[tp]} in
+		getline)	return 0 ;;
+		esac
+		return 1 ;;
+	O)	case ${av[tp]} in
+		'$'|'('|'!'|'-'|'+'|'++'|'--')	return 0 ;;
+		esac
+		return 1 ;;
+	esac
+	return 1
+}
+
+# print, printf, or a bare expression.
+_bt_awk_p_simple() {
+	local a redir= rexp=-1 what
+	if [ "${ak[tp]}" = K ] &&
+	   { [ "${av[tp]}" = print ] || [ "${av[tp]}" = printf ]; }; then
+		what=${av[tp]}
+		tp=$(( tp + 1 ))
+		a=-1
+		if _bt_awk_startsexpr; then
+			_aw_nogt=$(( _aw_nogt + 1 ))
+			_bt_awk_p_list '' || { _aw_nogt=$(( _aw_nogt - 1 )); return 1; }
+			_aw_nogt=$(( _aw_nogt - 1 ))
+			a=$_aw_nd
+			# print (a, b) > "f" -- one bracketed list, not a grouping
+			if [ "${nk[a]}" = list ] && [ "${nb[a]}" = -1 ] &&
+			   [ "${nk[na[a]]}" = grp ] && [ -n "${_aw_grplist-}" ]; then
+				:
+			fi
+		fi
+		if [ "${ak[tp]}" = O ]; then
+			case ${av[tp]} in
+			'>'|'>>'|'|')	redir=${av[tp]}
+					tp=$(( tp + 1 ))
+					_bt_awk_p_expr || return 1
+					rexp=$_aw_nd ;;
+			esac
+		fi
+		_bt_awk_node "$what" "$a" "$rexp" -1 -1 "$redir"
+		return 0
+	fi
+	_bt_awk_p_expr || return 1
+	_bt_awk_node expr "$_aw_nd"
+	return 0
+}
+
+# A comma separated list of expressions, into _aw_nd as a chain of list nodes.
+_bt_awk_p_list() {
+	local head=-1 tail=-1
+	while :; do
+		_bt_awk_p_expr || return 1
+		_bt_awk_node list "$_aw_nd" -1
+		if [ "$head" = -1 ]; then head=$_aw_nd; else nb[tail]=$_aw_nd; fi
+		tail=$_aw_nd
+		_bt_awk_is O ',' || break
+		tp=$(( tp + 1 ))
+		_bt_awk_nl
+	done
+	_aw_nd=$head
+	return 0
+}
+
+# An expression, into _aw_nd.  Assignment is the loosest thing there is and
+# leans to the right.
+_bt_awk_p_expr() {
+	local lhs op
+	_bt_awk_p_ternary || return 1
+	lhs=$_aw_nd
+	if [ "${ak[tp]}" = O ]; then
+		case ${av[tp]} in
+		'='|'+='|'-='|'*='|'/='|'%='|'^=')
+			case ${nk[lhs]} in
+			var|fld|idx)	;;
+			*)	_bt_awk_die; return 1 ;;
+			esac
+			op=${av[tp]}
+			tp=$(( tp + 1 ))
+			_bt_awk_nl
+			_bt_awk_p_expr || return 1
+			_bt_awk_node asg "$lhs" "$_aw_nd" -1 -1 "$op"
+			return 0 ;;
+		esac
+	fi
+	_aw_nd=$lhs
+	return 0
+}
+
+_bt_awk_p_ternary() {
+	local c a
+	_bt_awk_p_or || return 1
+	c=$_aw_nd
+	if _bt_awk_is O '?'; then
+		tp=$(( tp + 1 ))
+		_bt_awk_nl
+		_bt_awk_p_expr || return 1
+		a=$_aw_nd
+		_bt_awk_is O ':' || { _bt_awk_die; return 1; }
+		tp=$(( tp + 1 ))
+		_bt_awk_nl
+		_bt_awk_p_expr || return 1
+		_bt_awk_node cnd "$c" "$a" "$_aw_nd"
+		return 0
+	fi
+	_aw_nd=$c
+	return 0
+}
+
+_bt_awk_p_or() {
+	local a
+	_bt_awk_p_and || return 1
+	a=$_aw_nd
+	while _bt_awk_is O '||'; do
+		tp=$(( tp + 1 ))
+		_bt_awk_nl
+		_bt_awk_p_and || return 1
+		_bt_awk_node or "$a" "$_aw_nd"
+		a=$_aw_nd
+	done
+	_aw_nd=$a
+	return 0
+}
+
+_bt_awk_p_and() {
+	local a
+	_bt_awk_p_in || return 1
+	a=$_aw_nd
+	while _bt_awk_is O '&&'; do
+		tp=$(( tp + 1 ))
+		_bt_awk_nl
+		_bt_awk_p_in || return 1
+		_bt_awk_node and "$a" "$_aw_nd"
+		a=$_aw_nd
+	done
+	_aw_nd=$a
+	return 0
+}
+
+_bt_awk_p_in() {
+	local a
+	_bt_awk_p_match || return 1
+	a=$_aw_nd
+	while [ "${ak[tp]}" = K ] && [ "${av[tp]}" = in ]; do
+		tp=$(( tp + 1 ))
+		[ "${ak[tp]}" = I ] || { _bt_awk_die; return 1; }
+		_bt_awk_node list "$a" -1
+		_bt_awk_node in "$_aw_nd" -1 -1 -1 "${av[tp]}"
+		tp=$(( tp + 1 ))
+		a=$_aw_nd
+	done
+	_aw_nd=$a
+	return 0
+}
+
+_bt_awk_p_match() {
+	local a op
+	_bt_awk_p_rel || return 1
+	a=$_aw_nd
+	while [ "${ak[tp]}" = O ] &&
+	      { [ "${av[tp]}" = '~' ] || [ "${av[tp]}" = '!~' ]; }; do
+		op=${av[tp]}
+		tp=$(( tp + 1 ))
+		_bt_awk_p_rel || return 1
+		_bt_awk_node mat "$a" "$_aw_nd" -1 -1 "$op"
+		a=$_aw_nd
+	done
+	_aw_nd=$a
+	return 0
+}
+
+_bt_awk_p_rel() {
+	local a op
+	_bt_awk_p_concat || return 1
+	a=$_aw_nd
+	if [ "${ak[tp]}" = O ]; then
+		case ${av[tp]} in
+		'<'|'<='|'!='|'=='|'>=')	op=${av[tp]} ;;
+		'>')	if [ "$_aw_nogt" -gt 0 ]; then _aw_nd=$a; return 0; fi
+			op='>' ;;
+		*)	_aw_nd=$a; return 0 ;;
+		esac
+		tp=$(( tp + 1 ))
+		_bt_awk_p_concat || return 1
+		_bt_awk_node rel "$a" "$_aw_nd" -1 -1 "$op"
+		return 0
+	fi
+	_aw_nd=$a
+	return 0
+}
+
+# Can the token here begin another thing to stick on the end?
+_bt_awk_p_cat_more() {
+	case ${ak[tp]} in
+	N|S|R|I|F)	return 0 ;;
+	K)	case ${av[tp]} in
+		getline)	return 1 ;;
+		esac
+		return 1 ;;
+	O)	case ${av[tp]} in
+		'$'|'('|'!'|'++'|'--')	return 0 ;;
+		esac
+		return 1 ;;
+	esac
+	return 1
+}
+
+_bt_awk_p_concat() {
+	local a
+	_bt_awk_p_add || return 1
+	a=$_aw_nd
+	while _bt_awk_p_cat_more; do
+		_bt_awk_p_add || return 1
+		_bt_awk_node cat "$a" "$_aw_nd"
+		a=$_aw_nd
+	done
+	# "command" | getline is read as though it were one thing
+	while _bt_awk_is O '|' && [ "${ak[tp+1]}" = K ] && [ "${av[tp+1]}" = getline ]; do
+		tp=$(( tp + 2 ))
+		_bt_awk_node gl -1 "$a" -1 -1 cmd
+		if _bt_awk_p_lvalue; then na[_aw_nd]=$_aw_lv; fi
+		a=$_aw_nd
+	done
+	_aw_nd=$a
+	return 0
+}
+
+_bt_awk_p_add() {
+	local a op
+	_bt_awk_p_mul || return 1
+	a=$_aw_nd
+	while [ "${ak[tp]}" = O ] &&
+	      { [ "${av[tp]}" = '+' ] || [ "${av[tp]}" = '-' ]; }; do
+		op=${av[tp]}
+		tp=$(( tp + 1 ))
+		_bt_awk_p_mul || return 1
+		_bt_awk_node bin "$a" "$_aw_nd" -1 -1 "$op"
+		a=$_aw_nd
+	done
+	_aw_nd=$a
+	return 0
+}
+
+_bt_awk_p_mul() {
+	local a op
+	_bt_awk_p_unary || return 1
+	a=$_aw_nd
+	while [ "${ak[tp]}" = O ]; do
+		case ${av[tp]} in
+		'*'|'/'|'%')	op=${av[tp]} ;;
+		*)		break ;;
+		esac
+		tp=$(( tp + 1 ))
+		_bt_awk_p_unary || return 1
+		_bt_awk_node bin "$a" "$_aw_nd" -1 -1 "$op"
+		a=$_aw_nd
+	done
+	_aw_nd=$a
+	return 0
+}
+
+# Unary minus is looser than ^, so -2^2 is -4.
+_bt_awk_p_unary() {
+	if [ "${ak[tp]}" = O ]; then
+		case ${av[tp]} in
+		'-')	tp=$(( tp + 1 )); _bt_awk_p_unary || return 1
+			_bt_awk_node neg "$_aw_nd"; return 0 ;;
+		'+')	tp=$(( tp + 1 )); _bt_awk_p_unary || return 1
+			_bt_awk_node pos "$_aw_nd"; return 0 ;;
+		'!')	tp=$(( tp + 1 )); _bt_awk_p_unary || return 1
+			_bt_awk_node not "$_aw_nd"; return 0 ;;
+		esac
+	fi
+	_bt_awk_p_pow
+	return $?
+}
+
+_bt_awk_p_pow() {
+	local a
+	_bt_awk_p_postfix || return 1
+	a=$_aw_nd
+	if _bt_awk_is O '^'; then
+		tp=$(( tp + 1 ))
+		_bt_awk_p_unary || return 1
+		_bt_awk_node bin "$a" "$_aw_nd" -1 -1 '^'
+		return 0
+	fi
+	_aw_nd=$a
+	return 0
+}
+
+# An lvalue and nothing else, into _aw_lv.  Fails, without moving, if there
+# is not one here.
+_bt_awk_p_lvalue() {
+	local save=$tp
+	if _bt_awk_is O '$'; then
+		tp=$(( tp + 1 ))
+		_bt_awk_p_postfix || { tp=$save; return 1; }
+		_bt_awk_node fld "$_aw_nd"
+		_aw_lv=$_aw_nd
+		return 0
+	fi
+	if [ "${ak[tp]}" = I ]; then
+		local name=${av[tp]}
+		tp=$(( tp + 1 ))
+		if _bt_awk_is O '['; then
+			tp=$(( tp + 1 ))
+			local g=$_aw_nogt
+			_aw_nogt=0
+			_bt_awk_p_list ']' || { _aw_nogt=$g; tp=$save; return 1; }
+			_aw_nogt=$g
+			_bt_awk_is O ']' || { tp=$save; return 1; }
+			tp=$(( tp + 1 ))
+			_bt_awk_node idx "$_aw_nd" -1 -1 -1 "$name"
+		else
+			_bt_awk_node var -1 -1 -1 -1 "$name"
+		fi
+		_aw_lv=$_aw_nd
+		return 0
+	fi
+	return 1
+}
+
+_bt_awk_p_postfix() {
+	local a op
+	if [ "${ak[tp]}" = O ] &&
+	   { [ "${av[tp]}" = '++' ] || [ "${av[tp]}" = '--' ]; }; then
+		op=${av[tp]}
+		tp=$(( tp + 1 ))
+		if _bt_awk_p_lvalue; then
+			if [ "$op" = '++' ]; then _bt_awk_node preinc "$_aw_lv"
+			else _bt_awk_node predec "$_aw_lv"; fi
+			return 0
+		fi
+		# ++ in front of something that cannot be raised is just a sign
+		_bt_awk_p_unary || return 1
+		_bt_awk_node pos "$_aw_nd"
+		return 0
+	fi
+	_bt_awk_p_primary || return 1
+	a=$_aw_nd
+	while [ "${ak[tp]}" = O ] &&
+	      { [ "${av[tp]}" = '++' ] || [ "${av[tp]}" = '--' ]; }; do
+		case ${nk[a]} in
+		var|fld|idx)	;;
+		*)		break ;;
+		esac
+		if [ "${av[tp]}" = '++' ]; then _bt_awk_node postinc "$a"
+		else _bt_awk_node postdec "$a"; fi
+		a=$_aw_nd
+		tp=$(( tp + 1 ))
+	done
+	_aw_nd=$a
+	return 0
+}
+
+_bt_awk_p_primary() {
+	local name a g lv
+	case ${ak[tp]} in
+	N)	_bt_awk_node num -1 -1 -1 -1 "${av[tp]}"; tp=$(( tp + 1 )); return 0 ;;
+	S)	_bt_awk_node str -1 -1 -1 -1 "${av[tp]}"; tp=$(( tp + 1 )); return 0 ;;
+	R)	_bt_awk_node re -1 -1 -1 -1 "${av[tp]}"; tp=$(( tp + 1 )); return 0 ;;
+	esac
+	if _bt_awk_is O '$'; then
+		tp=$(( tp + 1 ))
+		_bt_awk_p_primary || return 1
+		_bt_awk_node fld "$_aw_nd"
+		return 0
+	fi
+	if _bt_awk_is O '('; then
+		tp=$(( tp + 1 ))
+		g=$_aw_nogt
+		_aw_nogt=0
+		_bt_awk_p_list ')' || { _aw_nogt=$g; return 1; }
+		_aw_nogt=$g
+		a=$_aw_nd
+		_bt_awk_is O ')' || { _bt_awk_die; return 1; }
+		tp=$(( tp + 1 ))
+		if [ "${ak[tp]}" = K ] && [ "${av[tp]}" = in ]; then
+			tp=$(( tp + 1 ))
+			[ "${ak[tp]}" = I ] || { _bt_awk_die; return 1; }
+			_bt_awk_node in "$a" -1 -1 -1 "${av[tp]}"
+			tp=$(( tp + 1 ))
+			return 0
+		fi
+		if [ "${nb[a]}" != -1 ]; then
+			# a bracketed list, which only print has any use for
+			_bt_awk_node glist "$a"
+			return 0
+		fi
+		_bt_awk_node grp "${na[a]}"
+		return 0
+	fi
+	if [ "${ak[tp]}" = K ] && [ "${av[tp]}" = getline ]; then
+		tp=$(( tp + 1 ))
+		lv=-1
+		if _bt_awk_p_lvalue; then lv=$_aw_lv; fi
+		if _bt_awk_is O '<'; then
+			tp=$(( tp + 1 ))
+			_bt_awk_p_concat || return 1
+			_bt_awk_node gl "$lv" "$_aw_nd" -1 -1 file
+			return 0
+		fi
+		_bt_awk_node gl "$lv" -1 -1 -1 ''
+		return 0
+	fi
+	if [ "${ak[tp]}" = F ]; then
+		name=${av[tp]}
+		tp=$(( tp + 1 ))
+		tp=$(( tp + 1 ))		# the bracket
+		g=$_aw_nogt
+		_aw_nogt=0
+		a=-1
+		if ! _bt_awk_is O ')'; then
+			_bt_awk_p_list ')' || { _aw_nogt=$g; return 1; }
+			a=$_aw_nd
+		fi
+		_aw_nogt=$g
+		_bt_awk_is O ')' || { _bt_awk_die; return 1; }
+		tp=$(( tp + 1 ))
+		if _bt_awk_builtin "$name"; then
+			_bt_awk_node bic "$a" -1 -1 -1 "$name"
+		else
+			_bt_awk_node call "$a" -1 -1 -1 "$name"
+			_aw_used[$name]=1
+		fi
+		return 0
+	fi
+	if [ "${ak[tp]}" = I ]; then
+		name=${av[tp]}
+		if _bt_awk_builtin "$name"; then
+			# length, alone, means length($0)
+			tp=$(( tp + 1 ))
+			_bt_awk_node bic -1 -1 -1 -1 "$name"
+			return 0
+		fi
+		_bt_awk_p_lvalue || { _bt_awk_die; return 1; }
+		_aw_nd=$_aw_lv
+		return 0
+	fi
+	_bt_awk_die
+	return 1
+}
+
+# --- numbers ---------------------------------------------------------------
+# Numbers are decimal strings.  Whole ones that fit are added, subtracted and
+# multiplied by the shell itself; everything else goes through the arithmetic
+# bc uses, which is exact but slow, so the whole-number path is worth having.
+
+# Does $1 hold nothing but a number?  This is what tells a field that happens
+# to read as a number from one that does not.
+_bt_awk_looksnum() {
+	[[ $1 =~ ^[$' \t\n']*[-+]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?[$' \t\n']*$ ]]
+	return $?
+}
+
+# The number at the front of $1, into _aw_s.  A string with no number in front
+# of it is worth nothing at all.
+_bt_awk_num() {
+	if [[ $1 =~ ^[$' \t\n']*([-+]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][-+]?[0-9]+)?) ]]; then
+		_bt_awk_plain "${BASH_REMATCH[1]}"
+		case $_aw_s in
+		+*)	_aw_s=${_aw_s#+} ;;
+		esac
+		case $_aw_s in
+		.*)	_aw_s=0$_aw_s ;;
+		-.*)	_aw_s=-0${_aw_s#-} ;;
+		esac
+		[ -z "$_aw_s" ] && _aw_s=0
+		_bt_awk_trimnum "$_aw_s"
+		return 0
+	fi
+	_aw_s=0
+	return 0
+}
+
+# Trim a number down to something to compare or print: no trailing zeros in
+# the fraction, no leading zeros in front, and only one nought.
+_bt_awk_trimnum() {
+	local v=$1 sign=
+	case $v in
+	-*)	sign=-; v=${v#-} ;;
+	esac
+	case $v in
+	*.*)	v=${v%"${v##*[!0]}"}
+		case $v in
+		*.)	v=${v%.} ;;
+		esac ;;
+	esac
+	v=${v#"${v%%[!0]*}"}
+	case $v in
+	''|.*)	v=0$v ;;
+	esac
+	[ "$v" = 0 ] && sign=
+	_aw_s=$sign$v
+	return 0
+}
+
+# Is $1 a whole number the shell can do arithmetic on?
+_bt_awk_small() {
+	case $1 in
+	*.*|*[!-0-9]*|'')	return 1 ;;
+	0?*|-0?*)		return 1 ;;
+	esac
+	[ "${#1}" -le 15 ] && return 0
+	return 1
+}
+
+# $1 op $3 with $2 the operator, into _aw_s.
+_bt_awk_arith() {
+	local a=$1 op=$2 b=$3 q
+	if _bt_awk_small "$a" && _bt_awk_small "$b"; then
+		case $op in
+		'+')	_aw_s=$(( a + b )); return 0 ;;
+		'-')	_aw_s=$(( a - b )); return 0 ;;
+		'*')	if [ "${#a}" -le 8 ] && [ "${#b}" -le 8 ]; then
+				_aw_s=$(( a * b )); return 0
+			fi ;;
+		'%')	if [ "$b" = 0 ]; then
+				_bt_err "awk: division by zero"
+				_aw_bad=2
+				_aw_s=0
+				return 1
+			fi
+			_aw_s=$(( a % b )); return 0 ;;
+		'/')	if [ "$b" = 0 ]; then
+				_bt_err "awk: division by zero"
+				_aw_bad=2
+				_aw_s=0
+				return 1
+			fi
+			if [ $(( a % b )) = 0 ]; then _aw_s=$(( a / b )); return 0; fi ;;
+		'^')	if [ "$b" -ge 0 ] && [ "$b" -le 20 ] && [ "${#a}" -le 4 ]; then
+				q=1
+				while [ "$b" -gt 0 ]; do q=$(( q * a )); b=$(( b - 1 )); done
+				_aw_s=$q
+				return 0
+			fi ;;
+		esac
+	fi
+	case $op in
+	'+')	_bt_bc_add "$a" "$b" ;;
+	'-')	_bt_bc_sub "$a" "$b" ;;
+	'*')	_bt_bc_mulx "$a" "$b" ;;
+	'/')	if _bt_awk_iszero "$b"; then
+			_bt_err "awk: division by zero"
+			_aw_bad=2
+			_aw_s=0
+			return 1
+		fi
+		_bt_bc_div "$a" "$b" ;;
+	'%')	if _bt_awk_iszero "$b"; then
+			_bt_err "awk: division by zero"
+			_aw_bad=2
+			_aw_s=0
+			return 1
+		fi
+		_bt_awk_fmod "$a" "$b" ;;
+	'^')	_bt_awk_pow "$a" "$b"; _aw_s=$_bc_num; _bt_awk_trimnum "$_aw_s"; return 0 ;;
+	esac
+	_bt_awk_trimnum "$_bc_num"
+	# keep the fraction from growing for ever
+	case $_aw_s in
+	*.*)	[ "${#_aw_s}" -gt 40 ] && _bt_awk_cut "$_aw_s" 20 ;;
+	esac
+	return 0
+}
+
+# $1 with no more than $2 places after the point, into _aw_s.
+_bt_awk_cut() {
+	local f
+	_bt_bc_split "$1"
+	f=$_bc_frac
+	[ "${#f}" -gt "$2" ] && f=${f:0:$2}
+	if [ -n "$f" ]; then _bt_awk_trimnum "$_bc_sign$_bc_int.$f"
+	else _bt_awk_trimnum "$_bc_sign$_bc_int"; fi
+	return 0
+}
+
+_bt_awk_iszero() {
+	case $1 in
+	*[1-9]*)	return 1 ;;
+	esac
+	return 0
+}
+
+# The remainder awk asks for: what is left after taking the whole part of the
+# division away, keeping the sign of the left hand side.
+_bt_awk_fmod() {
+	local q
+	_bt_bc_div "$1" "$2"
+	_bt_bc_split "$_bc_num"
+	q=$_bc_sign$_bc_int
+	[ -z "$_bc_int" ] && q=0
+	_bt_bc_mulx "$q" "$2"
+	_bt_bc_sub "$1" "$_bc_num"
+	return 0
+}
+
+# $1 raised to $2, into _bc_num.
+_bt_awk_pow() {
+	local e
+	_bt_bc_split "$2"
+	if [ -z "${_bc_frac//0/}" ]; then
+		e=$_bc_sign$_bc_int
+		[ -z "$_bc_int" ] && e=0
+		_bt_bc_pow "$1" "$e"
+		return 0
+	fi
+	# a fraction of an exponent asks for logarithms
+	if _bt_awk_iszero "$1"; then _bc_num=0; return 0; fi
+	_bt_awk_log "$1"
+	_bt_bc_mulx "$_bc_num" "$2"
+	_bt_awk_exp "$_bc_num"
+	return 0
+}
+
+# --- the mathematics -------------------------------------------------------
+# The same series bc's library uses, written out here so that awk can call
+# them without a bc of its own.
+
+_BT_AWK_PI=3.14159265358979323846264338327950288
+_BT_AWK_2PI=6.28318530717958647692528676655900576
+
+# e to the $1, into _bc_num.
+_bt_awk_exp() {
+	local x=$1 k=0 t n i keep=$scale neg=0
+	scale=$(( keep + 12 ))
+	_bt_bc_cmp "$x" 0
+	if [ "$_bc_i" -lt 0 ]; then neg=1; _bt_bc_sub 0 "$x"; x=$_bc_num; fi
+	while :; do
+		_bt_bc_cmp "$x" 1
+		[ "$_bc_i" -le 0 ] && break
+		_bt_bc_div "$x" 2
+		x=$_bc_num
+		k=$(( k + 1 ))
+	done
+	t=1 n=1 i=1
+	while :; do
+		_bt_bc_mulx "$n" "$x"
+		_bt_bc_div "$_bc_num" "$i"
+		n=$_bc_num
+		_bt_awk_cut "$n" "$scale"
+		n=$_aw_s
+		[ "$n" = 0 ] && break
+		_bt_bc_add "$t" "$n"
+		t=$_bc_num
+		i=$(( i + 1 ))
+		[ "$i" -gt 200 ] && break
+	done
+	while [ "$k" -gt 0 ]; do
+		_bt_bc_mulx "$t" "$t"
+		_bt_awk_cut "$_bc_num" "$scale"
+		t=$_aw_s
+		k=$(( k - 1 ))
+	done
+	if [ "$neg" = 1 ]; then
+		_bt_bc_div 1 "$t"
+		t=$_bc_num
+	fi
+	scale=$keep
+	_bt_awk_cut "$t" "$scale"
+	_bc_num=$_aw_s
+	return 0
+}
+
+# The natural logarithm of $1, into _bc_num.
+_bt_awk_log() {
+	local x=$1 k=0 t z n i keep=$scale
+	_bt_bc_cmp "$x" 0
+	if [ "$_bc_i" -le 0 ]; then
+		_bt_err "awk: log of a number that is not above zero"
+		_bc_num=0
+		return 0
+	fi
+	scale=$(( keep + 12 ))
+	while :; do
+		_bt_bc_cmp "$x" 2
+		[ "$_bc_i" -le 0 ] && break
+		_bt_bc_div "$x" 2
+		x=$_bc_num
+		k=$(( k + 1 ))
+	done
+	while :; do
+		_bt_bc_cmp "$x" 0.5
+		[ "$_bc_i" -ge 0 ] && break
+		_bt_bc_mulx "$x" 2
+		x=$_bc_num
+		k=$(( k - 1 ))
+	done
+	# 2 atanh((x-1)/(x+1))
+	_bt_bc_sub "$x" 1
+	t=$_bc_num
+	_bt_bc_add "$x" 1
+	_bt_bc_div "$t" "$_bc_num"
+	z=$_bc_num
+	_bt_awk_atanh "$z"
+	t=$_bc_num
+	if [ "$k" != 0 ]; then
+		_bt_awk_atanh 0.333333333333333333333333333333333333333333333
+		_bt_bc_mulx "$_bc_num" "$k"
+		_bt_bc_add "$t" "$_bc_num"
+		t=$_bc_num
+	fi
+	scale=$keep
+	_bt_awk_cut "$t" "$scale"
+	_bc_num=$_aw_s
+	return 0
+}
+
+# 2 atanh($1), which is the series log leans on, into _bc_num.
+_bt_awk_atanh() {
+	local y=$1 z t n i=1
+	_bt_bc_mulx "$y" "$y"
+	_bt_awk_cut "$_bc_num" "$scale"
+	z=$_aw_s
+	t=$y n=$y
+	while :; do
+		_bt_bc_mulx "$n" "$z"
+		_bt_awk_cut "$_bc_num" "$scale"
+		n=$_aw_s
+		i=$(( i + 2 ))
+		_bt_bc_div "$n" "$i"
+		if _bt_awk_iszero "$_bc_num"; then break; fi
+		_bt_bc_add "$t" "$_bc_num"
+		t=$_bc_num
+		[ "$i" -gt 400 ] && break
+	done
+	_bt_bc_mulx "$t" 2
+	return 0
+}
+
+# Bring $1 into the turn from -pi to pi, into _aw_s.
+_bt_awk_reduce() {
+	local x=$1 q
+	_bt_bc_div "$x" "$_BT_AWK_2PI"
+	_bt_bc_split "$_bc_num"
+	q=$_bc_sign$_bc_int
+	[ -z "$_bc_int" ] && q=0
+	_bt_bc_mulx "$q" "$_BT_AWK_2PI"
+	_bt_bc_sub "$x" "$_bc_num"
+	x=$_bc_num
+	_bt_bc_cmp "$x" "$_BT_AWK_PI"
+	if [ "$_bc_i" -gt 0 ]; then _bt_bc_sub "$x" "$_BT_AWK_2PI"; x=$_bc_num; fi
+	_bt_bc_cmp "$x" "-$_BT_AWK_PI"
+	if [ "$_bc_i" -lt 0 ]; then _bt_bc_add "$x" "$_BT_AWK_2PI"; x=$_bc_num; fi
+	_aw_s=$x
+	return 0
+}
+
+# The sine of $1, into _bc_num.  $2 asks for the cosine instead.
+_bt_awk_sin() {
+	local x t n i sign keep=$scale sq
+	scale=$(( keep + 12 ))
+	_bt_awk_reduce "$1"
+	x=$_aw_s
+	if [ "${2-}" = cos ]; then
+		# the cosine is the sine a quarter turn along
+		_bt_bc_div "$_BT_AWK_PI" 2
+		_bt_bc_add "$x" "$_bc_num"
+		_bt_awk_reduce "$_bc_num"
+		x=$_aw_s
+	fi
+	_bt_bc_mulx "$x" "$x"
+	_bt_awk_cut "$_bc_num" "$scale"
+	sq=$_aw_s
+	t=$x n=$x i=1
+	while :; do
+		_bt_bc_mulx "$n" "$sq"
+		_bt_awk_cut "$_bc_num" "$scale"
+		n=$_aw_s
+		_bt_bc_mulx $(( i + 1 )) $(( i + 2 ))
+		_bt_bc_div "$n" "$_bc_num"
+		_bt_awk_cut "$_bc_num" "$scale"
+		n=$_aw_s
+		i=$(( i + 2 ))
+		if _bt_awk_iszero "$n"; then break; fi
+		if [ $(( ( i / 2 ) % 2 )) = 1 ]; then _bt_bc_sub "$t" "$n"
+		else _bt_bc_add "$t" "$n"; fi
+		t=$_bc_num
+		[ "$i" -gt 120 ] && break
+	done
+	scale=$keep
+	_bt_awk_cut "$t" "$scale"
+	_bc_num=$_aw_s
+	return 0
+}
+
+# The angle of the point ($2, $1), into _bc_num.
+_bt_awk_atan2() {
+	local y=$1 x=$2 t keep=$scale neg=0 inv=0
+	scale=$(( keep + 12 ))
+	if _bt_awk_iszero "$x"; then
+		if _bt_awk_iszero "$y"; then _bc_num=0; scale=$keep; return 0; fi
+		_bt_bc_div "$_BT_AWK_PI" 2
+		t=$_bc_num
+		_bt_bc_cmp "$y" 0
+		[ "$_bc_i" -lt 0 ] && { _bt_bc_sub 0 "$t"; t=$_bc_num; }
+		scale=$keep
+		_bt_awk_cut "$t" "$scale"
+		_bc_num=$_aw_s
+		return 0
+	fi
+	_bt_bc_div "$y" "$x"
+	_bt_awk_atan "$_bc_num"
+	t=$_bc_num
+	_bt_bc_cmp "$x" 0
+	if [ "$_bc_i" -lt 0 ]; then
+		_bt_bc_cmp "$y" 0
+		if [ "$_bc_i" -lt 0 ]; then _bt_bc_sub "$t" "$_BT_AWK_PI"
+		else _bt_bc_add "$t" "$_BT_AWK_PI"; fi
+		t=$_bc_num
+	fi
+	scale=$keep
+	_bt_awk_cut "$t" "$scale"
+	_bc_num=$_aw_s
+	return 0
+}
+
+# The arc tangent of $1, into _bc_num.
+_bt_awk_atan() {
+	local x=$1 t n i sq k=0 neg=0
+	_bt_bc_cmp "$x" 0
+	if [ "$_bc_i" -lt 0 ]; then neg=1; _bt_bc_sub 0 "$x"; x=$_bc_num; fi
+	# x / (1 + sqrt(1 + x^2)) halves the angle, and a small angle converges
+	while :; do
+		_bt_bc_cmp "$x" 0.2
+		[ "$_bc_i" -le 0 ] && break
+		_bt_bc_mulx "$x" "$x"
+		_bt_bc_add 1 "$_bc_num"
+		_bt_bc_sqrt "$_bc_num"
+		_bt_bc_add 1 "$_bc_num"
+		_bt_bc_div "$x" "$_bc_num"
+		x=$_bc_num
+		k=$(( k + 1 ))
+	done
+	_bt_bc_mulx "$x" "$x"
+	_bt_awk_cut "$_bc_num" "$scale"
+	sq=$_aw_s
+	t=$x n=$x i=1
+	while :; do
+		_bt_bc_mulx "$n" "$sq"
+		_bt_awk_cut "$_bc_num" "$scale"
+		n=$_aw_s
+		i=$(( i + 2 ))
+		_bt_bc_div "$n" "$i"
+		if _bt_awk_iszero "$_bc_num"; then break; fi
+		if [ $(( ( i / 2 ) % 2 )) = 1 ]; then _bt_bc_sub "$t" "$_bc_num"
+		else _bt_bc_add "$t" "$_bc_num"; fi
+		t=$_bc_num
+		[ "$i" -gt 400 ] && break
+	done
+	while [ "$k" -gt 0 ]; do
+		_bt_bc_mulx "$t" 2
+		t=$_bc_num
+		k=$(( k - 1 ))
+	done
+	[ "$neg" = 1 ] && { _bt_bc_sub 0 "$t"; t=$_bc_num; }
+	_bc_num=$t
+	return 0
+}
+
+# --- values ----------------------------------------------------------------
+# A value is a string in _aw_v with a note in _aw_t of where it came from:
+# n a number, s a string, u something read from the input, which counts as a
+# number when it reads like one.
+
+# The number in the value held in _aw_v/_aw_t, into _aw_s.
+_bt_awk_tonum() {
+	if [ "$_aw_t" = n ]; then _aw_s=$_aw_v; return 0; fi
+	_bt_awk_num "$_aw_v"
+	return 0
+}
+
+# The string of the value held in _aw_v/_aw_t, into _aw_s.
+_bt_awk_tostr() {
+	if [ "$_aw_t" = n ]; then
+		_bt_awk_fmt "$_aw_v" "${_aw_var[CONVFMT]}"
+		return 0
+	fi
+	_aw_s=$_aw_v
+	return 0
+}
+
+# Number $1 written out the way awk writes it, with format $2 for the ones
+# that are not whole.
+_bt_awk_fmt() {
+	local v=$1
+	case $v in
+	*.*)	_bt_awk_trimnum "$v"; v=$_aw_s ;;
+	esac
+	case $v in
+	*.*)	printf -v _aw_s "$2" "$v"; return 0 ;;
+	esac
+	_bt_awk_trimnum "$v"
+	# a whole number prints as itself as long as it would have fitted in the
+	# integer awk keeps them in; past that awk falls back on the format
+	v=$_aw_s
+	case $v in
+	-*)	v=${v#-} ;;
+	esac
+	if [ "${#v}" -gt 19 ]; then
+		printf -v _aw_s "$2" "$_aw_s"
+	elif [ "${#v}" = 19 ] && [[ $v > 9223372036854775807 ]]; then
+		printf -v _aw_s "$2" "$_aw_s"
+	fi
+	return 0
+}
+
+# Is the value in _aw_v/_aw_t true?
+_bt_awk_bool() {
+	case $_aw_t in
+	n)	_bt_awk_iszero "$_aw_v" && return 1
+		return 0 ;;
+	u)	if _bt_awk_looksnum "$_aw_v"; then
+			_bt_awk_num "$_aw_v"
+			_bt_awk_iszero "$_aw_s" && return 1
+			return 0
+		fi ;;
+	esac
+	[ -n "$_aw_v" ] && return 0
+	return 1
+}
+
+# Compare the value in _aw_v/_aw_t with the one in $1/$2, into _aw_c as -1, 0
+# or 1.  Two numbers compare as numbers, and so does a number against
+# something read from the input that reads like one; anything else is text.
+_bt_awk_compare() {
+	local av=$_aw_v at=$_aw_t bv=$1 bt=$2 an bn numeric=0
+	if [ "$at" = n ] && [ "$bt" = n ]; then numeric=1
+	elif [ "$at" = n ] && [ "$bt" = u ] && _bt_awk_looksnum "$bv"; then numeric=1
+	elif [ "$bt" = n ] && [ "$at" = u ] && _bt_awk_looksnum "$av"; then numeric=1
+	elif [ "$at" = u ] && [ "$bt" = u ] &&
+	     _bt_awk_looksnum "$av" && _bt_awk_looksnum "$bv"; then numeric=1
+	elif [ "$at" = u ] && [ "$bt" = u ] && [ -z "$av" ] && [ -z "$bv" ]; then numeric=1
+	fi
+	if [ "$numeric" = 1 ]; then
+		if [ "$at" = n ]; then an=$av; else _bt_awk_num "$av"; an=$_aw_s; fi
+		if [ "$bt" = n ]; then bn=$bv; else _bt_awk_num "$bv"; bn=$_aw_s; fi
+		if _bt_awk_small "$an" && _bt_awk_small "$bn"; then
+			if [ "$an" -lt "$bn" ]; then _aw_c=-1
+			elif [ "$an" -gt "$bn" ]; then _aw_c=1
+			else _aw_c=0; fi
+			return 0
+		fi
+		_bt_bc_cmp "$an" "$bn"
+		_aw_c=$_bc_i
+		return 0
+	fi
+	_aw_t=$at _aw_v=$av
+	_bt_awk_tostr
+	an=$_aw_s
+	_aw_t=$bt _aw_v=$bv
+	_bt_awk_tostr
+	bn=$_aw_s
+	_aw_v=$av _aw_t=$at
+	if [ "$an" = "$bn" ]; then _aw_c=0
+	elif [[ $an < $bn ]]; then _aw_c=-1
+	else _aw_c=1; fi
+	return 0
+}
+
+# --- the record and its fields ---------------------------------------------
+
+# Take $1 as the new record.  The fields wait until something asks for them.
+_bt_awk_setrec() {
+	_aw_f=("$1")
+	_aw_split=0
+	return 0
+}
+
+# Break the record into fields, if that has not happened yet.
+_bt_awk_dosplit() {
+	[ "$_aw_split" = 1 ] && return 0
+	local rec=${_aw_f[0]} fs=${_aw_var[FS]}
+	local -a out=()
+	_bt_awk_splitinto "$rec" "$fs" out
+	_aw_f=("$rec" ${out[@]+"${out[@]}"})
+	_aw_var[NF]=$(( ${#_aw_f[@]} - 1 ))
+	_aw_vt[NF]=n
+	_aw_split=1
+	return 0
+}
+
+# Split $1 by $2 into the array named $3.
+_bt_awk_splitinto() {
+	local s=$1 fs=$2 name=$3 rest piece
+	local -n _out=$3
+	_out=()
+	[ -z "$s" ] && return 0
+	if [ -z "$fs" ]; then
+		local _i
+		for (( _i = 0; _i < ${#s}; _i++ )); do
+			_out+=("${s:_i:1}")
+		done
+		return 0
+	fi
+	if [ "$fs" = ' ' ]; then
+		local -
+		local IFS=$' \t\n'
+		set -f
+		_out=($s)
+		return 0
+	fi
+	if [ "$_aw_para" = 1 ] && [ "${#fs}" = 1 ] && [ "$fs" != $'\n' ]; then
+		# in paragraph mode a newline parts fields as well
+		_bt_awk_re_split "$s" "[$fs$'\n']" _out
+		return 0
+	fi
+	if [ "${#fs}" = 1 ] && [ "$fs" != '\' ]; then
+		rest=$s
+		while :; do
+			case $rest in
+			*"$fs"*)	piece=${rest%%"$fs"*}
+					_out+=("$piece")
+					rest=${rest#*"$fs"} ;;
+			*)		_out+=("$rest"); break ;;
+			esac
+		done
+		return 0
+	fi
+	_bt_awk_re_split "$s" "$fs" _out
+	return 0
+}
+
+# Split $1 by the expression $2 into the array named $3.
+_bt_awk_re_split() {
+	local s=$1 re=$2 rest=$1 pre m
+	local -n _o=$3
+	_o=()
+	while [ -n "$rest" ]; do
+		if [[ $rest =~ $re ]]; then
+			m=${BASH_REMATCH[0]}
+			if [ -z "$m" ]; then
+				_o+=("$rest")
+				return 0
+			fi
+			pre=${rest%%"$m"*}
+			_o+=("$pre")
+			rest=${rest:${#pre}+${#m}}
+			continue
+		fi
+		_o+=("$rest")
+		return 0
+	done
+	_o+=("")
+	return 0
+}
+
+# Field $1, into _aw_v/_aw_t.
+_bt_awk_getfield() {
+	local i=$1
+	if [ "$i" = 0 ]; then
+		_aw_v=${_aw_f[0]}
+		_aw_t=u
+		return 0
+	fi
+	_bt_awk_dosplit
+	_aw_v=${_aw_f[i]-}
+	_aw_t=u
+	return 0
+}
+
+# Put $2 into field $1, building the record up again around it.
+_bt_awk_setfield() {
+	local i=$1 v=$2 n
+	if [ "$i" = 0 ]; then
+		_bt_awk_setrec "$v"
+		_bt_awk_dosplit
+		return 0
+	fi
+	_bt_awk_dosplit
+	n=${_aw_var[NF]}
+	if [ "$i" -gt "$n" ]; then
+		while [ "$n" -lt "$i" ]; do
+			n=$(( n + 1 ))
+			_aw_f[n]=
+		done
+		_aw_var[NF]=$i
+		_aw_vt[NF]=n
+	fi
+	_aw_f[i]=$v
+	_bt_awk_rebuild
+	return 0
+}
+
+# Put the record back together out of its fields.
+_bt_awk_rebuild() {
+	local ofs=${_aw_var[OFS]} i n=${_aw_var[NF]} out=
+	for (( i = 1; i <= n; i++ )); do
+		if [ "$i" = 1 ]; then out=${_aw_f[i]-}
+		else out=$out$ofs${_aw_f[i]-}; fi
+	done
+	_aw_f[0]=$out
+	return 0
+}
+
+# NF has been set to $1: drop or add fields to suit.
+_bt_awk_setnf() {
+	local want=$1 n
+	_bt_awk_dosplit
+	n=${_aw_var[NF]}
+	if [ "$want" -lt "$n" ]; then
+		while [ "$n" -gt "$want" ]; do
+			unset '_aw_f[n]'
+			n=$(( n - 1 ))
+		done
+	else
+		while [ "$n" -lt "$want" ]; do
+			n=$(( n + 1 ))
+			_aw_f[n]=
+		done
+	fi
+	_aw_var[NF]=$want
+	_aw_vt[NF]=n
+	_bt_awk_rebuild
+	return 0
+}
+
+# --- variables and arrays --------------------------------------------------
+
+# The array $1 really stands for, into _aw_an.  A name given to a function
+# stands for whatever array was handed in.
+_bt_awk_aname() {
+	_aw_an=${_aw_alias[$1]-$1}
+	return 0
+}
+
+_bt_awk_getvar() {
+	case $1 in
+	NF)	_bt_awk_dosplit ;;
+	esac
+	_aw_v=${_aw_var[$1]-}
+	_aw_t=${_aw_vt[$1]-u}
+	return 0
+}
+
+_bt_awk_setvar() {
+	case $1 in
+	NF)	_bt_awk_dosplit
+		_bt_awk_num "$2"
+		_bt_awk_setnf "${_aw_s%%.*}"
+		return 0 ;;
+	esac
+	_aw_var[$1]=$2
+	_aw_vt[$1]=$3
+	return 0
+}
+
+# The subscript the list of expressions $1 comes to, into _aw_k.
+_bt_awk_subscript() {
+	local l=$1 sep=${_aw_var[SUBSEP]} out= first=1 v t
+	while [ "$l" != -1 ]; do
+		_bt_awk_ev "${na[l]}"
+		_bt_awk_tostr
+		if [ "$first" = 1 ]; then out=$_aw_s; first=0
+		else out=$out$sep$_aw_s; fi
+		l=${nb[l]}
+	done
+	_aw_k=$out
+	return 0
+}
+
+# --- regular expressions ---------------------------------------------------
+# The shell's own =~ is the matcher.  Because it reports the leftmost match,
+# the text it matched cannot appear any earlier in the string than the match
+# itself, so looking for that text is enough to say where the match was.
+
+# Does $1 match $2?
+_bt_awk_re_test() {
+	[[ $1 =~ $2 ]]
+	return $?
+}
+
+# Where does $2 match $1?  _aw_rs is the place, counting from one, and _aw_rl
+# how long the match is; both are -1 and 0 when there is no match at all.
+_bt_awk_re_find() {
+	local m pre
+	if [[ $1 =~ $2 ]]; then
+		m=${BASH_REMATCH[0]}
+		if [ -z "$m" ]; then
+			_aw_rs=1
+			_aw_rl=0
+			return 0
+		fi
+		pre=${1%%"$m"*}
+		_aw_rs=$(( ${#pre} + 1 ))
+		_aw_rl=${#m}
+		return 0
+	fi
+	_aw_rs=0
+	_aw_rl=-1
+	return 1
+}
+
+# Put $2 in place of what $3 matches in $1, into _aw_s, with _aw_c counting
+# the changes.  $4 asks for every match rather than the first.
+_bt_awk_sub() {
+	local s=$1 rep=$2 re=$3 all=$4 out= rest=$1 m pre i n c after=0
+	_aw_c=0
+	while :; do
+		if ! [[ $rest =~ $re ]]; then
+			out=$out$rest
+			break
+		fi
+		m=${BASH_REMATCH[0]}
+		if [ -z "$m" ]; then pre=; else pre=${rest%%"$m"*}; fi
+		# an empty match right after a real one does not count
+		if [ -z "$m" ] && [ -z "$pre" ] && [ "$after" = 1 ]; then
+			[ -z "$rest" ] && break
+			out=$out${rest:0:1}
+			rest=${rest:1}
+			after=0
+			continue
+		fi
+		out=$out$pre
+		# & in the replacement stands for what was matched
+		n=${#rep}
+		i=0
+		while [ "$i" -lt "$n" ]; do
+			c=${rep:i:1}
+			if [ "$c" = '\' ]; then
+				case ${rep:i+1:1} in
+				'&')	out=$out'&'; i=$(( i + 2 )); continue ;;
+				'\')	out=$out'\'; i=$(( i + 2 )); continue ;;
+				esac
+				out=$out'\'
+				i=$(( i + 1 ))
+				continue
+			fi
+			if [ "$c" = '&' ]; then
+				out=$out$m
+				i=$(( i + 1 ))
+				continue
+			fi
+			out=$out$c
+			i=$(( i + 1 ))
+		done
+		_aw_c=$(( _aw_c + 1 ))
+		rest=${rest:${#pre}+${#m}}
+		if [ "$all" != 1 ]; then
+			out=$out$rest
+			break
+		fi
+		if [ -z "$m" ]; then
+			[ -z "$rest" ] && break
+			out=$out${rest:0:1}
+			rest=${rest:1}
+			after=0
+		else
+			after=1
+		fi
+	done
+	_aw_s=$out
+	return 0
+}
+
+# --- working out what an expression comes to -------------------------------
+# Every one of these leaves the answer in _aw_v with its sort in _aw_t.
+
+# The $2'th argument of the list $1, into _aw_ag.
+_bt_awk_arg() {
+	local l=$1 i=$2
+	while [ "$l" != -1 ] && [ "$i" -gt 0 ]; do
+		l=${nb[l]}
+		i=$(( i - 1 ))
+	done
+	if [ "$l" = -1 ]; then _aw_ag=-1; else _aw_ag=${na[l]}; fi
+	return 0
+}
+
+# How many arguments the list $1 holds, into _aw_ac.
+_bt_awk_argc() {
+	local l=$1 c=0
+	while [ "$l" != -1 ]; do
+		c=$(( c + 1 ))
+		l=${nb[l]}
+	done
+	_aw_ac=$c
+	return 0
+}
+
+# The number an expression comes to, into _aw_s.
+_bt_awk_evnum() {
+	_bt_awk_ev "$1"
+	_bt_awk_tonum
+	return 0
+}
+
+# The string an expression comes to, into _aw_s.
+_bt_awk_evstr() {
+	_bt_awk_ev "$1"
+	_bt_awk_tostr
+	return 0
+}
+
+# The whole part of $1, into _aw_s.
+_bt_awk_int() {
+	_bt_bc_split "$1"
+	if [ "$_bc_int" = 0 ] || [ -z "$_bc_int" ]; then _aw_s=0; return 0; fi
+	_bt_bc_trim "$_bc_int"
+	_aw_s=$_bc_sign$_bc_str
+	[ "$_aw_s" = -0 ] && _aw_s=0
+	return 0
+}
+
+# The regular expression an expression stands for, into _aw_s.
+_bt_awk_evre() {
+	if [ "${nk[$1]}" = re ]; then
+		_aw_s=${ns[$1]}
+		return 0
+	fi
+	_bt_awk_evstr "$1"
+	return 0
+}
+
+# Put the value $2 (of sort $3) where the tree node $1 says.
+_bt_awk_store() {
+	local n=$1 v=$2 t=$3 i
+	case ${nk[n]} in
+	var)	_bt_awk_setvar "${ns[n]}" "$v" "$t" ;;
+	fld)	_bt_awk_evnum "${na[n]}"
+		_bt_awk_int "$_aw_s"
+		_bt_awk_setfield "$_aw_s" "$v" ;;
+	idx)	_bt_awk_subscript "${na[n]}"
+		_bt_awk_aname "${ns[n]}"
+		_aw_arr[$_aw_an$'\001'$_aw_k]=$v
+		_aw_at[$_aw_an$'\001'$_aw_k]=$t ;;
+	esac
+	_aw_v=$v
+	_aw_t=$t
+	return 0
+}
+
+# The value a tree node holds now.
+_bt_awk_fetch() {
+	local n=$1
+	case ${nk[n]} in
+	var)	_bt_awk_getvar "${ns[n]}" ;;
+	fld)	_bt_awk_evnum "${na[n]}"
+		_bt_awk_int "$_aw_s"
+		_bt_awk_getfield "$_aw_s" ;;
+	idx)	_bt_awk_subscript "${na[n]}"
+		_bt_awk_aname "${ns[n]}"
+		_aw_v=${_aw_arr[$_aw_an$'\001'$_aw_k]-}
+		_aw_t=${_aw_at[$_aw_an$'\001'$_aw_k]-u}
+		_aw_arr[$_aw_an$'\001'$_aw_k]=$_aw_v
+		_aw_at[$_aw_an$'\001'$_aw_k]=$_aw_t ;;
+	*)	_bt_awk_ev "$n" ;;
+	esac
+	return 0
+}
+
+_bt_awk_ev() {
+	local n=$1 a b at bt c op l k v t i m re s
+	case ${nk[n]} in
+	num)	_aw_v=${ns[n]}; _aw_t=n; return 0 ;;
+	str)	_aw_v=${ns[n]}; _aw_t=s; return 0 ;;
+	re)	# a bare expression stands for a test against the record
+		if _bt_awk_re_test "${_aw_f[0]}" "${ns[n]}"; then _aw_v=1; else _aw_v=0; fi
+		_aw_t=n; return 0 ;;
+	var|fld|idx)
+		_bt_awk_fetch "$n"; return 0 ;;
+	grp)	_bt_awk_ev "${na[n]}"; return 0 ;;
+	glist)	_bt_awk_ev "${na[na[n]]}"; return 0 ;;
+	asg)	op=${ns[n]}
+		if [ "$op" = '=' ]; then
+			_bt_awk_ev "${nb[n]}"
+			a=$_aw_v; at=$_aw_t
+			if [ "$at" = u ]; then at=s; fi
+			_bt_awk_store "${na[n]}" "$a" "$at"
+			return 0
+		fi
+		_bt_awk_fetch "${na[n]}"
+		_bt_awk_tonum
+		a=$_aw_s
+		_bt_awk_evnum "${nb[n]}"
+		b=$_aw_s
+		_bt_awk_arith "$a" "${op%=}" "$b"
+		_bt_awk_store "${na[n]}" "$_aw_s" n
+		return 0 ;;
+	cnd)	_bt_awk_ev "${na[n]}"
+		if _bt_awk_bool; then _bt_awk_ev "${nb[n]}"; else _bt_awk_ev "${nc[n]}"; fi
+		return 0 ;;
+	or)	_bt_awk_ev "${na[n]}"
+		if _bt_awk_bool; then _aw_v=1 _aw_t=n; return 0; fi
+		_bt_awk_ev "${nb[n]}"
+		if _bt_awk_bool; then _aw_v=1; else _aw_v=0; fi
+		_aw_t=n; return 0 ;;
+	and)	_bt_awk_ev "${na[n]}"
+		if ! _bt_awk_bool; then _aw_v=0 _aw_t=n; return 0; fi
+		_bt_awk_ev "${nb[n]}"
+		if _bt_awk_bool; then _aw_v=1; else _aw_v=0; fi
+		_aw_t=n; return 0 ;;
+	not)	_bt_awk_ev "${na[n]}"
+		if _bt_awk_bool; then _aw_v=0; else _aw_v=1; fi
+		_aw_t=n; return 0 ;;
+	in)	_bt_awk_subscript "${na[n]}"
+		_bt_awk_aname "${ns[n]}"
+		if [ -n "${_aw_arr[$_aw_an$'\001'$_aw_k]+x}" ]; then _aw_v=1; else _aw_v=0; fi
+		_aw_t=n; return 0 ;;
+	mat)	_bt_awk_evstr "${na[n]}"
+		s=$_aw_s
+		_bt_awk_evre "${nb[n]}"
+		re=$_aw_s
+		if _bt_awk_re_test "$s" "$re"; then v=1; else v=0; fi
+		[ "${ns[n]}" = '!~' ] && v=$(( 1 - v ))
+		_aw_v=$v _aw_t=n; return 0 ;;
+	rel)	_bt_awk_ev "${na[n]}"
+		a=$_aw_v; at=$_aw_t
+		_bt_awk_ev "${nb[n]}"
+		b=$_aw_v; bt=$_aw_t
+		_aw_v=$a _aw_t=$at
+		_bt_awk_compare "$b" "$bt"
+		case ${ns[n]} in
+		'<')	[ "$_aw_c" -lt 0 ] && v=1 || v=0 ;;
+		'<=')	[ "$_aw_c" -le 0 ] && v=1 || v=0 ;;
+		'>')	[ "$_aw_c" -gt 0 ] && v=1 || v=0 ;;
+		'>=')	[ "$_aw_c" -ge 0 ] && v=1 || v=0 ;;
+		'==')	[ "$_aw_c" = 0 ] && v=1 || v=0 ;;
+		'!=')	[ "$_aw_c" != 0 ] && v=1 || v=0 ;;
+		esac
+		_aw_v=$v _aw_t=n; return 0 ;;
+	cat)	_bt_awk_evstr "${na[n]}"
+		a=$_aw_s
+		_bt_awk_evstr "${nb[n]}"
+		_aw_v=$a$_aw_s _aw_t=s; return 0 ;;
+	bin)	_bt_awk_evnum "${na[n]}"
+		a=$_aw_s
+		_bt_awk_evnum "${nb[n]}"
+		_bt_awk_arith "$a" "${ns[n]}" "$_aw_s"
+		_aw_v=$_aw_s _aw_t=n; return 0 ;;
+	neg)	_bt_awk_evnum "${na[n]}"
+		_bt_awk_arith 0 - "$_aw_s"
+		_aw_v=$_aw_s _aw_t=n; return 0 ;;
+	pos)	_bt_awk_evnum "${na[n]}"
+		_aw_v=$_aw_s _aw_t=n; return 0 ;;
+	preinc|predec)
+		_bt_awk_fetch "${na[n]}"
+		_bt_awk_tonum
+		if [ "${nk[n]}" = preinc ]; then _bt_awk_arith "$_aw_s" + 1
+		else _bt_awk_arith "$_aw_s" - 1; fi
+		_bt_awk_store "${na[n]}" "$_aw_s" n
+		return 0 ;;
+	postinc|postdec)
+		_bt_awk_fetch "${na[n]}"
+		_bt_awk_tonum
+		a=$_aw_s
+		if [ "${nk[n]}" = postinc ]; then _bt_awk_arith "$a" + 1
+		else _bt_awk_arith "$a" - 1; fi
+		_bt_awk_store "${na[n]}" "$_aw_s" n
+		_aw_v=$a _aw_t=n
+		return 0 ;;
+	call)	_bt_awk_call "$n"; return 0 ;;
+	bic)	_bt_awk_builtin_run "$n"; return 0 ;;
+	gl)	_bt_awk_getline "$n"; return 0 ;;
+	esac
+	_aw_v= _aw_t=s
+	return 0
+}
+
+# --- printf ----------------------------------------------------------------
+# The format is walked a conversion at a time.  Each one takes the next
+# argument and hands it to the shell's own printf in the shape it wants: a
+# whole number for %d and its like, a character for %c, the string for %s.
+
+# Format $1 with the arguments in the list $2, into _aw_s.
+_bt_awk_sprintf() {
+	local fmt=$1 al=$2 out= i=0 n=${#1} c spec conv piece v t iv
+	while [ "$i" -lt "$n" ]; do
+		c=${fmt:i:1}
+		if [ "$c" != '%' ]; then
+			out=$out$c
+			i=$(( i + 1 ))
+			continue
+		fi
+		if [ "${fmt:i+1:1}" = '%' ]; then
+			out=$out'%'
+			i=$(( i + 2 ))
+			continue
+		fi
+		spec='%'
+		i=$(( i + 1 ))
+		while :; do
+			case ${fmt:i:1} in
+			'-'|'+'|' '|'#'|'0')	spec=$spec${fmt:i:1}; i=$(( i + 1 )) ;;
+			*)			break ;;
+			esac
+		done
+		if [ "${fmt:i:1}" = '*' ]; then
+			_bt_awk_nextarg
+			_bt_awk_tonum
+			_bt_awk_int "$_aw_s"
+			spec=$spec$_aw_s
+			i=$(( i + 1 ))
+		else
+			while :; do
+				case ${fmt:i:1} in
+				[0-9])	spec=$spec${fmt:i:1}; i=$(( i + 1 )) ;;
+				*)	break ;;
+				esac
+			done
+		fi
+		if [ "${fmt:i:1}" = '.' ]; then
+			spec=$spec.
+			i=$(( i + 1 ))
+			if [ "${fmt:i:1}" = '*' ]; then
+				_bt_awk_nextarg
+				_bt_awk_tonum
+				_bt_awk_int "$_aw_s"
+				spec=$spec$_aw_s
+				i=$(( i + 1 ))
+			else
+				while :; do
+					case ${fmt:i:1} in
+					[0-9])	spec=$spec${fmt:i:1}; i=$(( i + 1 )) ;;
+					*)	break ;;
+					esac
+				done
+			fi
+		fi
+		# the lengths C cares about mean nothing here
+		while :; do
+			case ${fmt:i:1} in
+			h|l|L|q|j|z|t)	i=$(( i + 1 )) ;;
+			*)		break ;;
+			esac
+		done
+		conv=${fmt:i:1}
+		i=$(( i + 1 ))
+		case $conv in
+		d|i)	_bt_awk_nextarg
+			_bt_awk_tonum
+			_bt_awk_int "$_aw_s"
+			_bt_awk_clamp "$_aw_s"
+			printf -v piece "${spec}d" "$_aw_s"
+			out=$out$piece ;;
+		o|x|X|u)
+			_bt_awk_nextarg
+			_bt_awk_tonum
+			_bt_awk_int "$_aw_s"
+			_bt_awk_clamp "$_aw_s"
+			[ "$conv" = u ] && conv=d
+			printf -v piece "${spec}${conv}" "$_aw_s"
+			out=$out$piece ;;
+		c)	_bt_awk_nextarg
+			v=$_aw_v t=$_aw_t
+			if [ "$t" = n ]; then
+				_bt_awk_int "$v"
+				iv=$_aw_s
+				if [ "$iv" -gt 0 ] && [ "$iv" -lt 256 ]; then
+					printf -v piece '\\%03o' "$iv"
+					printf -v piece "$piece"
+				else
+					piece=
+				fi
+			else
+				_bt_awk_tostr
+				piece=${_aw_s:0:1}
+			fi
+			printf -v piece "${spec}s" "$piece"
+			out=$out$piece ;;
+		e|E|f|F|g|G|a|A)
+			_bt_awk_nextarg
+			_bt_awk_tonum
+			printf -v piece "${spec}${conv}" "$_aw_s"
+			out=$out$piece ;;
+		s)	_bt_awk_nextarg
+			_bt_awk_tostr
+			printf -v piece "${spec}s" "$_aw_s"
+			out=$out$piece ;;
+		'')	out=$out$spec ;;
+		*)	out=$out$spec$conv ;;
+		esac
+	done
+	_aw_s=$out
+	return 0
+}
+
+# The next argument of the list the format is walking, into _aw_v/_aw_t.
+_bt_awk_nextarg() {
+	if [ "$al" = -1 ]; then
+		_aw_v= _aw_t=u
+		return 0
+	fi
+	_bt_awk_ev "${na[al]}"
+	al=${nb[al]}
+	return 0
+}
+
+# Hold $1 to what the shell can print as a whole number.
+_bt_awk_clamp() {
+	local v=$1
+	case $v in
+	-*)	if [ "${#v}" -gt 19 ]; then v=-9223372036854775808; fi ;;
+	*)	if [ "${#v}" -gt 18 ]; then v=9223372036854775807; fi ;;
+	esac
+	_aw_s=$v
+	return 0
+}
+
+# --- the functions awk brings with it --------------------------------------
+
+# How many things are in array $1, into _aw_ac.
+_bt_awk_arrcount() {
+	local pre=$1$'\001' k c=0
+	for k in "${!_aw_arr[@]}"; do
+		case $k in
+		"$pre"*)	c=$(( c + 1 )) ;;
+		esac
+	done
+	_aw_ac=$c
+	return 0
+}
+
+_bt_awk_builtin_run() {
+	local n=$1 name=${ns[n]} l=${na[n]} a b c s re rep t v i j nm
+	case $name in
+	length)	if [ "$l" = -1 ]; then
+			_aw_v=${#_aw_f[0]} _aw_t=n
+			return 0
+		fi
+		_bt_awk_arg "$l" 0
+		if [ "${nk[_aw_ag]}" = var ]; then
+			# a name holding an array answers with how many things are
+			# in it; no name is ever both an array and a string
+			_bt_awk_aname "${ns[_aw_ag]}"
+			_bt_awk_arrcount "$_aw_an"
+			if [ "$_aw_ac" -gt 0 ]; then
+				_aw_v=$_aw_ac _aw_t=n
+				return 0
+			fi
+		fi
+		_bt_awk_evstr "$_aw_ag"
+		_aw_v=${#_aw_s} _aw_t=n
+		return 0 ;;
+	substr)	_bt_awk_arg "$l" 0; _bt_awk_evstr "$_aw_ag"; s=$_aw_s
+		_bt_awk_arg "$l" 1; _bt_awk_evnum "$_aw_ag"
+		_bt_awk_round "$_aw_s"; a=$_aw_s
+		_bt_awk_argc "$l"
+		if [ "$_aw_ac" -ge 3 ]; then
+			_bt_awk_arg "$l" 2; _bt_awk_evnum "$_aw_ag"
+			_bt_awk_round "$_aw_s"; b=$_aw_s
+		else
+			b=${#s}
+			[ "$a" -gt 0 ] && b=$(( ${#s} - a + 1 ))
+			[ "$b" -lt 0 ] && b=0
+		fi
+		# the piece runs from a to a+b, cut down to what is there
+		i=$a
+		j=$(( a + b ))
+		[ "$i" -lt 1 ] && i=1
+		[ "$j" -gt $(( ${#s} + 1 )) ] && j=$(( ${#s} + 1 ))
+		if [ "$j" -le "$i" ]; then _aw_v= _aw_t=s; return 0; fi
+		_aw_v=${s:i-1:j-i} _aw_t=s
+		return 0 ;;
+	index)	_bt_awk_arg "$l" 0; _bt_awk_evstr "$_aw_ag"; s=$_aw_s
+		_bt_awk_arg "$l" 1; _bt_awk_evstr "$_aw_ag"; t=$_aw_s
+		if [ -z "$t" ]; then _aw_v=0 _aw_t=n; [ -n "$s" ] && _aw_v=1; return 0; fi
+		case $s in
+		*"$t"*)	a=${s%%"$t"*}
+			_aw_v=$(( ${#a} + 1 )) ;;
+		*)	_aw_v=0 ;;
+		esac
+		_aw_t=n
+		return 0 ;;
+	split)	_bt_awk_arg "$l" 0; _bt_awk_evstr "$_aw_ag"; s=$_aw_s
+		_bt_awk_arg "$l" 1
+		nm=${ns[_aw_ag]}
+		_bt_awk_argc "$l"
+		if [ "$_aw_ac" -ge 3 ]; then
+			_bt_awk_arg "$l" 2
+			_bt_awk_evre "$_aw_ag"
+			re=$_aw_s
+		else
+			re=${_aw_var[FS]}
+		fi
+		_bt_awk_aname "$nm"
+		nm=$_aw_an
+		for i in "${!_aw_arr[@]}"; do
+			case $i in
+			"$nm"$'\001'*)	unset '_aw_arr[$i]' '_aw_at[$i]' ;;
+			esac
+		done
+		local -a _sp=()
+		_bt_awk_splitinto "$s" "$re" _sp
+		i=0
+		for v in ${_sp[@]+"${_sp[@]}"}; do
+			i=$(( i + 1 ))
+			_aw_arr[$nm$'\001'$i]=$v
+			_aw_at[$nm$'\001'$i]=u
+		done
+		_aw_v=$i _aw_t=n
+		return 0 ;;
+	sub|gsub)
+		_bt_awk_arg "$l" 0; _bt_awk_evre "$_aw_ag"; re=$_aw_s
+		_bt_awk_arg "$l" 1; _bt_awk_evstr "$_aw_ag"; rep=$_aw_s
+		_bt_awk_argc "$l"
+		if [ "$_aw_ac" -ge 3 ]; then
+			_bt_awk_arg "$l" 2
+			t=$_aw_ag
+		else
+			t=-1
+		fi
+		if [ "$t" = -1 ]; then s=${_aw_f[0]}
+		else _bt_awk_fetch "$t"; _bt_awk_tostr; s=$_aw_s; fi
+		if [ "$name" = gsub ]; then _bt_awk_sub "$s" "$rep" "$re" 1
+		else _bt_awk_sub "$s" "$rep" "$re" 0; fi
+		c=$_aw_c
+		if [ "$c" != 0 ]; then
+			if [ "$t" = -1 ]; then _bt_awk_setfield 0 "$_aw_s"
+			else _bt_awk_store "$t" "$_aw_s" s; fi
+		fi
+		_aw_v=$c _aw_t=n
+		return 0 ;;
+	match)	_bt_awk_arg "$l" 0; _bt_awk_evstr "$_aw_ag"; s=$_aw_s
+		_bt_awk_arg "$l" 1; _bt_awk_evre "$_aw_ag"; re=$_aw_s
+		_bt_awk_re_find "$s" "$re"
+		_aw_var[RSTART]=$_aw_rs
+		_aw_vt[RSTART]=n
+		_aw_var[RLENGTH]=$_aw_rl
+		_aw_vt[RLENGTH]=n
+		_aw_v=$_aw_rs _aw_t=n
+		return 0 ;;
+	sprintf)
+		_bt_awk_arg "$l" 0; _bt_awk_evstr "$_aw_ag"; s=$_aw_s
+		_bt_awk_sprintf "$s" "${nb[l]}"
+		_aw_v=$_aw_s _aw_t=s
+		return 0 ;;
+	sin|cos|exp|log|sqrt|int)
+		_bt_awk_arg "$l" 0; _bt_awk_evnum "$_aw_ag"; a=$_aw_s
+		case $name in
+		sin)	_bt_awk_sin "$a"; v=$_bc_num ;;
+		cos)	_bt_awk_sin "$a" cos; v=$_bc_num ;;
+		exp)	_bt_awk_exp "$a"; v=$_bc_num ;;
+		log)	_bt_awk_log "$a"; v=$_bc_num ;;
+		sqrt)	if _bt_bc_sqrt "$a"; then v=$_bc_num; else v=0; fi ;;
+		int)	_bt_awk_int "$a"; v=$_aw_s ;;
+		esac
+		_bt_awk_trimnum "$v"
+		_aw_v=$_aw_s _aw_t=n
+		return 0 ;;
+	atan2)	_bt_awk_arg "$l" 0; _bt_awk_evnum "$_aw_ag"; a=$_aw_s
+		_bt_awk_arg "$l" 1; _bt_awk_evnum "$_aw_ag"; b=$_aw_s
+		_bt_awk_atan2 "$a" "$b"
+		_bt_awk_trimnum "$_bc_num"
+		_aw_v=$_aw_s _aw_t=n
+		return 0 ;;
+	rand)	_bt_awk_rand
+		_aw_v=$_aw_s _aw_t=n
+		return 0 ;;
+	srand)	a=$_aw_seed
+		if [ "$l" != -1 ]; then
+			_bt_awk_arg "$l" 0; _bt_awk_evnum "$_aw_ag"
+			_bt_awk_int "$_aw_s"
+			_aw_seed=$_aw_s
+		else
+			_aw_seed=$(( _aw_seed + 1 ))
+		fi
+		_aw_rstate=$(( (_aw_seed * 1103515245 + 12345) & 0x7fffffff ))
+		_aw_v=$a _aw_t=n
+		return 0 ;;
+	tolower|toupper)
+		_bt_awk_arg "$l" 0; _bt_awk_evstr "$_aw_ag"
+		if [ "$name" = tolower ]; then _aw_v=${_aw_s,,}; else _aw_v=${_aw_s^^}; fi
+		_aw_t=s
+		return 0 ;;
+	close)	_bt_awk_arg "$l" 0; _bt_awk_evstr "$_aw_ag"
+		_bt_awk_close "$_aw_s"
+		_aw_v=$_aw_c _aw_t=n
+		return 0 ;;
+	fflush)	_aw_v=0 _aw_t=n; return 0 ;;
+	system)	_bt_err "awk: system() would have to start a program, which this awk cannot do"
+		_aw_v=-1 _aw_t=n
+		return 0 ;;
+	esac
+	_aw_v= _aw_t=s
+	return 0
+}
+
+# $1 to the nearest whole number, into _aw_s.  This is what substr does with
+# a place that is not whole.
+_bt_awk_round() {
+	local v=$1
+	case $v in
+	*.*)	_bt_bc_split "$v"
+		if [ "$_bc_sign" = - ]; then _bt_bc_sub "$v" 0.5
+		else _bt_bc_add "$v" 0.5; fi
+		_bt_awk_int "$_bc_num"
+		return 0 ;;
+	esac
+	_bt_awk_int "$v"
+	return 0
+}
+
+# A number from zero up to but not including one, into _aw_s.
+_bt_awk_rand() {
+	_aw_rstate=$(( (_aw_rstate * 1103515245 + 12345) & 0x7fffffff ))
+	printf -v _aw_s '0.%015d' $(( (_aw_rstate >> 8) * 1000000000000000 / 8388608 ))
+	_bt_awk_trimnum "$_aw_s"
+	return 0
+}
+
+# --- calling a function of one's own ---------------------------------------
+# The parameters are the local variables: what is there now is put aside and
+# handed back afterwards.  An array given as an argument is not copied; the
+# name inside the function stands for the caller's array.
+
+_bt_awk_call() {
+	local n=$1 name=${ns[n]} l=${na[n]} i p
+	local -a params=() vals=() types=() refs=()
+	local -a oldv=() oldt=() olda=() hadv=() hada=()
+	if [ -z "${_aw_fn[$name]+x}" ]; then
+		_bt_err "awk: calling $name, which is not a function"
+		_aw_bad=2
+		_aw_v= _aw_t=s
+		return 0
+	fi
+	read -r -a params <<< "${_aw_fnp[$name]}"
+	i=0
+	while [ "$l" != -1 ]; do
+		if [ "${nk[na[l]]}" = var ]; then
+			_bt_awk_aname "${ns[na[l]]}"
+			refs[i]=$_aw_an
+		else
+			refs[i]=
+		fi
+		_bt_awk_ev "${na[l]}"
+		vals[i]=$_aw_v
+		types[i]=$_aw_t
+		l=${nb[l]}
+		i=$(( i + 1 ))
+	done
+	for (( i = 0; i < ${#params[@]}; i++ )); do
+		p=${params[i]}
+		if [ -n "${_aw_var[$p]+x}" ]; then
+			hadv[i]=1; oldv[i]=${_aw_var[$p]}; oldt[i]=${_aw_vt[$p]}
+		else
+			hadv[i]=0
+		fi
+		if [ -n "${_aw_alias[$p]+x}" ]; then
+			hada[i]=1; olda[i]=${_aw_alias[$p]}
+		else
+			hada[i]=0
+		fi
+	done
+	for (( i = 0; i < ${#params[@]}; i++ )); do
+		p=${params[i]}
+		if [ "$i" -lt "${#vals[@]}" ]; then
+			_aw_var[$p]=${vals[i]}
+			_aw_vt[$p]=${types[i]}
+			if [ -n "${refs[i]}" ]; then _aw_alias[$p]=${refs[i]}
+			else unset '_aw_alias[$p]'; fi
+		else
+			# what is left over is this call's own scratch
+			unset '_aw_var[$p]' '_aw_vt[$p]'
+			_aw_locals=$(( _aw_locals + 1 ))
+			_aw_alias[$p]=$'\002'$_aw_locals
+		fi
+	done
+	_aw_ret= _aw_rett=u
+	_bt_awk_exec "${_aw_fn[$name]}"
+	if [ "$_aw_ctl" = return ]; then _aw_ctl=; fi
+	for (( i = 0; i < ${#params[@]}; i++ )); do
+		p=${params[i]}
+		if [ -n "${_aw_alias[$p]+x}" ]; then
+			case ${_aw_alias[$p]} in
+			$'\002'*)	_bt_awk_clearlocal "${_aw_alias[$p]}" ;;
+			esac
+		fi
+		if [ "${hadv[i]}" = 1 ]; then
+			_aw_var[$p]=${oldv[i]}
+			_aw_vt[$p]=${oldt[i]}
+		else
+			unset '_aw_var[$p]' '_aw_vt[$p]'
+		fi
+		if [ "${hada[i]}" = 1 ]; then _aw_alias[$p]=${olda[i]}
+		else unset '_aw_alias[$p]'; fi
+	done
+	_aw_v=$_aw_ret
+	_aw_t=$_aw_rett
+	return 0
+}
+
+_bt_awk_clearlocal() {
+	local pre=$1$'\001' k
+	for k in "${!_aw_arr[@]}"; do
+		case $k in
+		"$pre"*)	unset '_aw_arr[$k]' '_aw_at[$k]' ;;
+		esac
+	done
+	return 0
+}
+
+# --- running the statements ------------------------------------------------
+
+_bt_awk_exec() {
+	local n=$1 l s t v a b i k pre keys
+	[ "$n" = -1 ] && return 0
+	case ${nk[n]} in
+	block)	l=${na[n]}
+		while [ "$l" != -1 ]; do
+			_bt_awk_exec "${na[l]}"
+			[ -n "$_aw_ctl" ] && return 0
+			[ "$_aw_bad" != 0 ] && return 0
+			l=${nb[l]}
+		done
+		return 0 ;;
+	stlist)	_bt_awk_exec "${na[n]}"; return 0 ;;
+	expr)	_bt_awk_ev "${na[n]}"; return 0 ;;
+	print)	_bt_awk_do_print "$n"; return 0 ;;
+	printf)	_bt_awk_do_printf "$n"; return 0 ;;
+	if)	_bt_awk_ev "${na[n]}"
+		if _bt_awk_bool; then _bt_awk_exec "${nb[n]}"
+		else _bt_awk_exec "${nc[n]}"; fi
+		return 0 ;;
+	while)	while :; do
+			_bt_awk_ev "${na[n]}"
+			_bt_awk_bool || break
+			_bt_awk_exec "${nb[n]}"
+			[ "$_aw_bad" != 0 ] && return 0
+			case $_aw_ctl in
+			break)		_aw_ctl=; break ;;
+			continue)	_aw_ctl= ;;
+			?*)		return 0 ;;
+			esac
+		done
+		return 0 ;;
+	do)	while :; do
+			_bt_awk_exec "${na[n]}"
+			[ "$_aw_bad" != 0 ] && return 0
+			case $_aw_ctl in
+			break)		_aw_ctl=; break ;;
+			continue)	_aw_ctl= ;;
+			?*)		return 0 ;;
+			esac
+			_bt_awk_ev "${nb[n]}"
+			_bt_awk_bool || break
+		done
+		return 0 ;;
+	for)	[ "${na[n]}" != -1 ] && _bt_awk_exec "${na[n]}"
+		while :; do
+			if [ "${nb[n]}" != -1 ]; then
+				_bt_awk_ev "${nb[n]}"
+				_bt_awk_bool || break
+			fi
+			_bt_awk_exec "${nd[n]}"
+			[ "$_aw_bad" != 0 ] && return 0
+			case $_aw_ctl in
+			break)		_aw_ctl=; break ;;
+			continue)	_aw_ctl= ;;
+			?*)		return 0 ;;
+			esac
+			[ "${nc[n]}" != -1 ] && _bt_awk_exec "${nc[n]}"
+		done
+		return 0 ;;
+	forin)	s=${ns[n]}
+		v=${s%% *}
+		a=${s#* }
+		_bt_awk_aname "$a"
+		pre=$_aw_an$'\001'
+		local -a ks=()
+		for k in "${!_aw_arr[@]}"; do
+			case $k in
+			"$pre"*)	ks+=("${k#"$pre"}") ;;
+			esac
+		done
+		for k in ${ks[@]+"${ks[@]}"}; do
+			_bt_awk_setvar "$v" "$k" u
+			_bt_awk_exec "${na[n]}"
+			[ "$_aw_bad" != 0 ] && return 0
+			case $_aw_ctl in
+			break)		_aw_ctl=; break ;;
+			continue)	_aw_ctl= ;;
+			?*)		return 0 ;;
+			esac
+		done
+		return 0 ;;
+	break)		_aw_ctl=break; return 0 ;;
+	continue)	_aw_ctl=continue; return 0 ;;
+	next)		_aw_ctl=next; return 0 ;;
+	nextfile)	_aw_ctl=nextfile; return 0 ;;
+	exit)	if [ "${na[n]}" != -1 ]; then
+			_bt_awk_evnum "${na[n]}"
+			_bt_awk_int "$_aw_s"
+			_aw_status=$(( _aw_s & 255 ))
+		fi
+		_aw_ctl=exit
+		return 0 ;;
+	return)	if [ "${na[n]}" != -1 ]; then
+			_bt_awk_ev "${na[n]}"
+			_aw_ret=$_aw_v
+			_aw_rett=$_aw_t
+		else
+			_aw_ret= _aw_rett=u
+		fi
+		_aw_ctl=return
+		return 0 ;;
+	delete)
+		if [ "${na[n]}" = -1 ]; then
+			_bt_awk_aname "${ns[n]}"
+			_bt_awk_clearlocal "$_aw_an"
+			return 0
+		fi
+		_bt_awk_subscript "${na[n]}"
+		_bt_awk_aname "${ns[n]}"
+		k=$_aw_an$'\001'$_aw_k
+		unset '_aw_arr[$k]' '_aw_at[$k]'
+		return 0 ;;
+	esac
+	return 0
+}
+
+# print, with whatever redirection it was given.
+_bt_awk_do_print() {
+	local n=$1 l=${na[n]} out= first=1 tgt=
+	# print (a, b) is print with two things to say, not one in brackets
+	if [ "$l" != -1 ] && [ "${nb[l]}" = -1 ] && [ "${nk[na[l]]}" = glist ]; then
+		l=${na[na[l]]}
+	fi
+	if [ "$l" = -1 ]; then
+		out=${_aw_f[0]}
+	else
+		while [ "$l" != -1 ]; do
+			_bt_awk_ev "${na[l]}"
+			if [ "$_aw_t" = n ]; then
+				_bt_awk_fmt "$_aw_v" "${_aw_var[OFMT]}"
+			else
+				_bt_awk_tostr
+			fi
+			if [ "$first" = 1 ]; then out=$_aw_s; first=0
+			else out=$out${_aw_var[OFS]}$_aw_s; fi
+			l=${nb[l]}
+		done
+	fi
+	out=$out${_aw_var[ORS]}
+	if [ "${nb[n]}" != -1 ]; then
+		_bt_awk_evstr "${nb[n]}"
+		tgt=$_aw_s
+	fi
+	_bt_awk_write "${ns[n]}" "$tgt" "$out"
+	return 0
+}
+
+_bt_awk_do_printf() {
+	local n=$1 l=${na[n]} fmt tgt=
+	[ "$l" = -1 ] && return 0
+	if [ "${nb[l]}" = -1 ] && [ "${nk[na[l]]}" = glist ]; then
+		l=${na[na[l]]}
+	fi
+	_bt_awk_evstr "${na[l]}"
+	fmt=$_aw_s
+	_bt_awk_sprintf "$fmt" "${nb[l]}"
+	if [ "${nb[n]}" != -1 ]; then
+		local text=$_aw_s
+		_bt_awk_evstr "${nb[n]}"
+		tgt=$_aw_s
+		_aw_s=$text
+	fi
+	_bt_awk_write "${ns[n]}" "$tgt" "$_aw_s"
+	return 0
+}
+
+# Write $3 where $1 and $2 say: nowhere in particular, or to a file.
+_bt_awk_write() {
+	local op=$1 tgt=$2 text=$3 fd
+	case $op in
+	'')	printf '%s' "$text"
+		return 0 ;;
+	'|')	_bt_err "awk: writing to a command would have to start one, which this awk cannot do"
+		_aw_bad=2
+		return 0 ;;
+	esac
+	fd=${_aw_ofd[$tgt]-}
+	if [ -z "$fd" ]; then
+		# the two the shell already has open are named, not opened: asking
+		# for /dev/stderr by name would find whatever fd 2 pointed at when
+		# the error was being hidden
+		case $tgt in
+		/dev/stdout|-)	_aw_ofd[$tgt]=1; printf '%s' "$text"; return 0 ;;
+		/dev/stderr)	_aw_ofd[$tgt]=2; printf '%s' "$text" >&2; return 0 ;;
+		esac
+		if [ "$op" = '>' ]; then
+			if ! { exec {fd}>"$tgt"; } 2>/dev/null; then
+				_bt_err "awk: cannot open $tgt"
+				_aw_bad=2
+				return 0
+			fi
+		else
+			if ! { exec {fd}>>"$tgt"; } 2>/dev/null; then
+				_bt_err "awk: cannot open $tgt"
+				_aw_bad=2
+				return 0
+			fi
+		fi
+		_aw_ofd[$tgt]=$fd
+	fi
+	case $fd in
+	1)	printf '%s' "$text"; return 0 ;;
+	2)	printf '%s' "$text" >&2; return 0 ;;
+	esac
+	printf '%s' "$text" >&"$fd"
+	return 0
+}
+
+# Shut whatever $1 names, with _aw_c saying how it went.
+_bt_awk_close() {
+	local name=$1 fd
+	_aw_c=-1
+	fd=${_aw_ofd[$name]-}
+	if [ -n "$fd" ]; then
+		case $fd in
+		0|1|2)	;;
+		*)	exec {fd}>&- ;;
+		esac
+		unset '_aw_ofd[$name]'
+		_aw_c=0
+	fi
+	fd=${_aw_ifd[$name]-}
+	if [ -n "$fd" ]; then
+		[ "$fd" != 0 ] && exec {fd}<&-
+		unset '_aw_ifd[$name]' '_aw_ibuf[$fd]' '_aw_ieof[$fd]'
+		_aw_c=0
+	fi
+	return 0
+}
+
+# --- reading records -------------------------------------------------------
+# RS decides where one record ends: a newline by default, any other single
+# character if it is set to one, a blank line if it is set to nothing at all,
+# and otherwise an expression, which means the file has to be held in hand.
+
+_bt_awk_readrec() {
+	local fd=$1 rs=${_aw_var[RS]} line acc= got=0 rc buf m pre chunk
+	if [ -z "$rs" ]; then
+		while :; do
+			if IFS= read -r line <&"$fd"; then rc=0; else rc=1; fi
+			if [ "$rc" = 1 ] && [ -z "$line" ]; then
+				[ "$got" = 1 ] && { _aw_rec=$acc; return 0; }
+				return 1
+			fi
+			if [ -z "$line" ]; then
+				[ "$got" = 1 ] && { _aw_rec=$acc; return 0; }
+				[ "$rc" = 1 ] && return 1
+				continue
+			fi
+			if [ "$got" = 1 ]; then acc=$acc$'\n'$line; else acc=$line; got=1; fi
+			[ "$rc" = 1 ] && { _aw_rec=$acc; return 0; }
+		done
+	fi
+	if [ "${#rs}" = 1 ]; then
+		if [ "$rs" = $'\n' ]; then
+			if IFS= read -r _aw_rec <&"$fd"; then return 0; fi
+		else
+			if IFS= read -r -d "$rs" _aw_rec <&"$fd"; then return 0; fi
+		fi
+		[ -n "$_aw_rec" ] && return 0
+		return 1
+	fi
+	if [ -z "${_aw_ieof[$fd]-}" ]; then
+		buf=
+		chunk=
+		while IFS= read -r chunk <&"$fd"; do
+			buf=$buf$chunk$'\n'
+			chunk=
+		done
+		[ -n "$chunk" ] && buf=$buf$chunk
+		_aw_ibuf[$fd]=$buf
+		_aw_ieof[$fd]=1
+	fi
+	buf=${_aw_ibuf[$fd]}
+	[ -z "$buf" ] && return 1
+	if [[ $buf =~ $rs ]]; then
+		m=${BASH_REMATCH[0]}
+		if [ -n "$m" ]; then
+			pre=${buf%%"$m"*}
+			_aw_rec=$pre
+			_aw_ibuf[$fd]=${buf:${#pre}+${#m}}
+			return 0
+		fi
+	fi
+	_aw_rec=$buf
+	_aw_ibuf[$fd]=
+	return 0
+}
+
+# The next file named in ARGV, opened, with FILENAME and FNR set for it.
+_bt_awk_openmain() {
+	local f fd
+	while :; do
+		if [ "$_aw_argi" -ge "${_aw_var[ARGC]}" ]; then
+			if [ "$_aw_usedstdin" = 0 ] && [ "$_aw_anyfile" = 0 ]; then
+				_aw_usedstdin=1
+				_aw_mainfd=0
+				_aw_var[FNR]=0
+				_aw_vt[FNR]=n
+				return 0
+			fi
+			return 1
+		fi
+		_bt_awk_aname ARGV
+		f=${_aw_arr[$_aw_an$'\001'$_aw_argi]-}
+		_aw_argi=$(( _aw_argi + 1 ))
+		[ -z "$f" ] && continue
+		case $f in
+		[A-Za-z_]*=*)	_bt_awk_cmdassign "$f"; continue ;;
+		esac
+		_aw_anyfile=1
+		if [ "$f" = - ]; then
+			_aw_mainfd=0
+		elif { exec {fd}<"$f"; } 2>/dev/null; then
+			_aw_mainfd=$fd
+		else
+			_bt_err "awk: cannot open file $f"
+			_aw_status=2
+			continue
+		fi
+		_aw_var[FILENAME]=$f
+		_aw_vt[FILENAME]=s
+		_aw_var[FNR]=0
+		_aw_vt[FNR]=n
+		return 0
+	done
+}
+
+# The next record of the main input, into _aw_rec.
+_bt_awk_nextmain() {
+	while :; do
+		if [ -z "$_aw_mainfd" ]; then
+			_bt_awk_openmain || return 1
+		fi
+		if _bt_awk_readrec "$_aw_mainfd"; then return 0; fi
+		[ "$_aw_mainfd" != 0 ] && exec {_aw_mainfd}<&-
+		unset '_aw_ibuf[$_aw_mainfd]' '_aw_ieof[$_aw_mainfd]'
+		_aw_mainfd=
+	done
+}
+
+# name=value from the command line, escapes and all.
+_bt_awk_cmdassign() {
+	local name=${1%%=*} val=${1#*=}
+	_bt_awk_esc "$val" 0
+	_bt_awk_setvar "$name" "$_aw_s" u
+	return 0
+}
+
+# getline, in each of the shapes it comes in.
+_bt_awk_getline() {
+	local n=$1 mode=${ns[n]} lv=${na[n]} src=${nb[n]} name fd
+	case $mode in
+	cmd)	_bt_err "awk: reading from a command would have to start one, which this awk cannot do"
+		_aw_v=-1 _aw_t=n
+		return 0 ;;
+	file)	_bt_awk_evstr "$src"
+		name=$_aw_s
+		fd=${_aw_ifd[$name]-}
+		if [ -z "$fd" ]; then
+			if [ "$name" = - ] || [ "$name" = /dev/stdin ]; then
+				fd=0
+			elif ! { exec {fd}<"$name"; } 2>/dev/null; then
+				_aw_v=-1 _aw_t=n
+				return 0
+			fi
+			_aw_ifd[$name]=$fd
+		fi
+		if ! _bt_awk_readrec "$fd"; then
+			_aw_v=0 _aw_t=n
+			return 0
+		fi
+		if [ "$lv" = -1 ]; then
+			_bt_awk_setrec "$_aw_rec"
+		else
+			_bt_awk_store "$lv" "$_aw_rec" u
+		fi
+		_aw_v=1 _aw_t=n
+		return 0 ;;
+	esac
+	if ! _bt_awk_nextmain; then
+		_aw_v=0 _aw_t=n
+		return 0
+	fi
+	_bt_awk_arith "${_aw_var[NR]}" + 1
+	_aw_var[NR]=$_aw_s
+	_aw_vt[NR]=n
+	_bt_awk_arith "${_aw_var[FNR]}" + 1
+	_aw_var[FNR]=$_aw_s
+	_aw_vt[FNR]=n
+	if [ "$lv" = -1 ]; then
+		_bt_awk_setrec "$_aw_rec"
+	else
+		_bt_awk_store "$lv" "$_aw_rec" u
+	fi
+	_aw_v=1 _aw_t=n
+	return 0
+}
+
+# --- the whole thing -------------------------------------------------------
+
+awk () {
+	local LC_ALL=C
+	local -a ak=() av=() nk=() na=() nb=() nc=() nd=() ns=()
+	local -a rk=() rp=() rp2=() ra=() rng=()
+	local -A _aw_fn=() _aw_fnp=() _aw_used=()
+	local -A _aw_var=() _aw_vt=() _aw_arr=() _aw_at=() _aw_alias=()
+	local -A _aw_ofd=() _aw_ifd=() _aw_ibuf=() _aw_ieof=()
+	local -a _aw_f=('')
+	local tp=0 _aw_bad=0 _aw_nogt=0 _aw_nd=0 _aw_lv=0
+	local _aw_s= _aw_v= _aw_t=u _aw_c=0 _aw_k= _aw_an= _aw_ag=-1 _aw_ac=0
+	local _aw_rs=0 _aw_rl=-1 _aw_ctl= _aw_ret= _aw_rett=u _aw_status=0
+	local _aw_split=1 _aw_para=0 _aw_locals=0 _aw_seed=0 _aw_rstate=0
+	local _aw_argi=1 _aw_mainfd= _aw_usedstdin=0 _aw_anyfile=0 _aw_rec=
+	local scale=20
+	local _bc_num= _bc_str= _bc_sign= _bc_int= _bc_frac= _bc_i=0 _bc_rem=
+	local _bc_a= _bc_b= _bc_sc= _bc_sa= _bc_sb=
+	local prog= fs= i n f fd line arg needmain=0 v name
+	local -a progfiles=() assigns=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-F)	shift
+			[ "$#" = 0 ] && { _bt_err "awk: -F wants a separator"; return 2; }
+			fs=$1; shift ;;
+		-F*)	fs=${1#-F}; shift ;;
+		-v)	shift
+			[ "$#" = 0 ] && { _bt_err "awk: -v wants an assignment"; return 2; }
+			assigns+=("$1"); shift ;;
+		-v*)	assigns+=("${1#-v}"); shift ;;
+		-f)	shift
+			[ "$#" = 0 ] && { _bt_err "awk: -f wants a file"; return 2; }
+			progfiles+=("$1"); shift ;;
+		-f*)	progfiles+=("${1#-f}"); shift ;;
+		-)	break ;;
+		-*)	_bt_err "awk: unknown option $1"
+			_bt_err "usage: awk [-F sepstring] [-v assignment]... program [argument...]"
+			_bt_err "       awk [-F sepstring] -f progfile... [-v assignment]... [argument...]"
+			return 2 ;;
+		*)	break ;;
+		esac
+	done
+
+	if [ "${#progfiles[@]}" = 0 ]; then
+		if [ "$#" = 0 ]; then
+			_bt_err "usage: awk [-F sepstring] [-v assignment]... program [argument...]"
+			return 2
+		fi
+		prog=$1
+		shift
+	else
+		for f in "${progfiles[@]}"; do
+			if [ "$f" = - ]; then
+				line=
+				while IFS= read -r line; do prog=$prog$line$'\n'; line=; done
+				[ -n "$line" ] && prog=$prog$line$'\n'
+			elif { exec {fd}<"$f"; } 2>/dev/null; then
+				line=
+				while IFS= read -r line <&"$fd"; do prog=$prog$line$'\n'; line=; done
+				[ -n "$line" ] && prog=$prog$line$'\n'
+				exec {fd}<&-
+			else
+				_bt_err "awk: cannot open file $f"
+				return 2
+			fi
+		done
+	fi
+
+	# what everything starts out as
+	_aw_var=([FS]=' ' [OFS]=' ' [ORS]=$'\n' [RS]=$'\n' [NR]=0 [NF]=0 [FNR]=0
+	         [FILENAME]= [SUBSEP]=$'\034' [RSTART]=0 [RLENGTH]=-1
+	         [CONVFMT]='%.6g' [OFMT]='%.6g')
+	_aw_vt=([FS]=s [OFS]=s [ORS]=s [RS]=s [NR]=n [NF]=n [FNR]=n [FILENAME]=s
+	        [SUBSEP]=s [RSTART]=n [RLENGTH]=n [CONVFMT]=s [OFMT]=s)
+	if [ -n "$fs" ]; then
+		# a lone t means a tab, which is how every awk has read it
+		if [ "$fs" = t ]; then
+			_aw_var[FS]=$'\t'
+		else
+			_bt_awk_esc "$fs" 1
+			_aw_var[FS]=$_aw_s
+		fi
+	fi
+	_aw_arr[ARGV$'\001'0]=awk
+	_aw_at[ARGV$'\001'0]=s
+	i=0
+	for arg in "$@"; do
+		i=$(( i + 1 ))
+		_aw_arr[ARGV$'\001'$i]=$arg
+		_aw_at[ARGV$'\001'$i]=u
+	done
+	_aw_var[ARGC]=$(( i + 1 ))
+	_aw_vt[ARGC]=n
+
+	for arg in ${assigns[@]+"${assigns[@]}"}; do
+		case $arg in
+		[A-Za-z_]*=*)	_bt_awk_cmdassign "$arg" ;;
+		*)		_bt_err "awk: $arg is not an assignment"; return 2 ;;
+		esac
+	done
+
+	_bt_awk_lex "$prog"
+
+	# ENVIRON costs a look through the environment, so only build it if the
+	# program named it
+	for arg in ${av[@]+"${av[@]}"}; do
+		[ "$arg" = ENVIRON ] || continue
+		for name in $( compgen -A export ); do
+			_aw_arr[ENVIRON$'\001'$name]=${!name}
+			_aw_at[ENVIRON$'\001'$name]=u
+		done
+		break
+	done
+
+	tp=0
+	_bt_awk_p_program || return 2
+	[ "$_aw_bad" = 1 ] && return 2
+
+	_bt_awk_setrec ''
+	_aw_split=1
+	_aw_var[NF]=0
+
+	# BEGIN first
+	for (( i = 0; i < ${#rk[@]}; i++ )); do
+		[ "${rk[i]}" = BEGIN ] || continue
+		_bt_awk_exec "${ra[i]}"
+		[ "$_aw_bad" != 0 ] && { _bt_awk_shut; return "$_aw_bad"; }
+		[ "$_aw_ctl" = exit ] && break
+	done
+
+	# is there anything that wants the input?
+	needmain=0
+	for (( i = 0; i < ${#rk[@]}; i++ )); do
+		case ${rk[i]} in
+		BEGIN)	;;
+		*)	needmain=1 ;;
+		esac
+	done
+
+	if [ "$_aw_ctl" != exit ] && [ "$needmain" = 1 ]; then
+		[ -z "${_aw_var[RS]}" ] && _aw_para=1
+		while _bt_awk_nextmain; do
+			_bt_awk_arith "${_aw_var[NR]}" + 1
+			_aw_var[NR]=$_aw_s
+			_aw_vt[NR]=n
+			_bt_awk_arith "${_aw_var[FNR]}" + 1
+			_aw_var[FNR]=$_aw_s
+			_aw_vt[FNR]=n
+			_bt_awk_setrec "$_aw_rec"
+			_bt_awk_runrules
+			[ "$_aw_bad" != 0 ] && { _bt_awk_shut; return "$_aw_bad"; }
+			[ "$_aw_ctl" = exit ] && break
+			if [ "$_aw_ctl" = nextfile ]; then
+				_aw_ctl=
+				if [ -n "$_aw_mainfd" ]; then
+					[ "$_aw_mainfd" != 0 ] && exec {_aw_mainfd}<&-
+					unset '_aw_ibuf[$_aw_mainfd]' '_aw_ieof[$_aw_mainfd]'
+					_aw_mainfd=
+				fi
+			fi
+			_aw_ctl=
+		done
+	fi
+
+	_aw_ctl=
+	for (( i = 0; i < ${#rk[@]}; i++ )); do
+		[ "${rk[i]}" = END ] || continue
+		_bt_awk_exec "${ra[i]}"
+		[ "$_aw_bad" != 0 ] && { _bt_awk_shut; return "$_aw_bad"; }
+		[ "$_aw_ctl" = exit ] && break
+	done
+
+	_bt_awk_shut
+	return "$_aw_status"
+}
+
+# Every rule that is not BEGIN or END, against the record in hand.
+_bt_awk_runrules() {
+	local i on
+	for (( i = 0; i < ${#rk[@]}; i++ )); do
+		[ "${rk[i]}" = rule ] || continue
+		if [ "${rp[i]}" = -1 ]; then
+			:
+		elif [ "${rp2[i]}" != -1 ]; then
+			# a pair of patterns turns the rule on and off again
+			if [ "${rng[i]}" = 0 ]; then
+				_bt_awk_ev "${rp[i]}"
+				_bt_awk_bool || continue
+				rng[i]=1
+				_bt_awk_ev "${rp2[i]}"
+				_bt_awk_bool && rng[i]=0
+			else
+				_bt_awk_ev "${rp2[i]}"
+				_bt_awk_bool && rng[i]=0
+			fi
+		else
+			_bt_awk_ev "${rp[i]}"
+			_bt_awk_bool || continue
+		fi
+		if [ "${ra[i]}" = -1 ]; then
+			printf '%s%s' "${_aw_f[0]}" "${_aw_var[ORS]}"
+		else
+			_bt_awk_exec "${ra[i]}"
+		fi
+		[ "$_aw_bad" != 0 ] && return 0
+		case $_aw_ctl in
+		next)		_aw_ctl=; return 0 ;;
+		exit|nextfile)	return 0 ;;
+		esac
+		_aw_ctl=
+	done
+	return 0
+}
+
+# Shut every file that was opened along the way.
+_bt_awk_shut() {
+	local k fd
+	for k in "${!_aw_ofd[@]}"; do
+		fd=${_aw_ofd[$k]}
+		case $fd in
+		0|1|2)	continue ;;
+		esac
+		exec {fd}>&-
+	done
+	for k in "${!_aw_ifd[@]}"; do
+		fd=${_aw_ifd[$k]}
+		[ "$fd" != 0 ] && exec {fd}<&-
+	done
+	if [ -n "$_aw_mainfd" ] && [ "$_aw_mainfd" != 0 ]; then
+		exec {_aw_mainfd}<&-
+		_aw_mainfd=
+	fi
+	return 0
+}
+

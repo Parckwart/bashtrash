@@ -28,7 +28,7 @@ for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          nohup pr dd sed who logname diff cal fuser ipcs patch tput \
          what uuencode uudecode write ps ed m4 iconv ar locale nm \
          admin delta get prs rmdel sact sccs unget val \
-         compress uncompress zcat bc make; do
+         compress uncompress zcat bc make awk; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -2580,6 +2580,171 @@ this" ]; then pass=$((pass + 1)); else note_fail "make -t changed the file"; fi
 	cd .. || exit 1
 fi
 
+
+# --- awk --------------------------------------------------------------------
+# Compared against the system awk, program by program: the output of both, and
+# the exit status.  Where the standard and this machine's awk disagree the
+# answer is checked against the standard instead.
+echo "### awk"
+if command -v awk > /dev/null 2>&1; then
+	RAWK=$(real_of awk)
+	mkdir -p awkt
+	cd awkt || exit 1
+
+	printf 'a b c\n1 2 3\nx  y   z\n10 -3 4.5\n' > w1
+	printf 'alice 30 engineer\nbob 25 doctor\ncarol 35 artist\n' > w2
+	printf 'x,1\ny,2\nz,3\n' > w3
+	printf 'one\n\ntwo\nthree\n\n\nfour\n' > w4
+
+	awkin() {	# awkin program input-file
+		local prog=$1 in=$2 a b
+		a=$( . "$BT"; awk "$prog" < "$in" 2>&1; echo "rc=$?" )
+		b=$( "$RAWK" "$prog" < "$in" 2>&1; echo "rc=$?" )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1))
+		else note_fail "awk [$prog]: [$a] not [$b]"; fi
+	}
+	awkarg() {	# awkarg argument...
+		local a b
+		a=$( . "$BT"; awk "$@" < /dev/null 2>&1; echo "rc=$?" )
+		b=$( "$RAWK" "$@" < /dev/null 2>&1; echo "rc=$?" )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1))
+		else note_fail "awk $*: [$a] not [$b]"; fi
+	}
+	awkis() {	# awkis expected program [input-file]
+		local want=$1 prog=$2 in=${3-/dev/null} a
+		a=$( . "$BT"; awk "$prog" < "$in" 2>/dev/null )
+		if [ "$a" = "$want" ]; then pass=$((pass + 1))
+		else note_fail "awk [$prog]: [$a] not [$want]"; fi
+	}
+
+	# arithmetic and numbers
+	awkarg 'BEGIN{print 1+1, 2*3, 7/2, 7%3, 2^10, -2^2}'
+	awkarg 'BEGIN{print 1/3, 2/3, 1e10, 1e-7}'
+	awkarg 'BEGIN{print 10%3, -10%3, 10%-3, 10.5%3}'
+	awkarg 'BEGIN{print int(3.9), int(-3.9), sqrt(16), 2^31, 2^53}'
+	awkarg 'BEGIN{printf "%.6f %.6f %.6f %.6f\n", sin(1), cos(1), exp(1), log(10)}'
+	awkarg 'BEGIN{printf "%.6f %.6f\n", atan2(1,1), atan2(-1,-1)}'
+	awkarg 'BEGIN{x="3x"; print x+1, "10"+5, "abc"+0, "010"+0}'
+	awkarg 'BEGIN{print 2147483647+1, int(2^31), 07, 010}'
+
+	# strings
+	awkarg 'BEGIN{print length("hello"), substr("hello",2,3), substr("hello",4), index("hello","ll")}'
+	awkarg 'BEGIN{print toupper("aBc"), tolower("aBc"), index("", "a"), index("a", "")}'
+	awkarg 'BEGIN{s="hello world"; n=gsub(/o/,"0",s); print n, s}'
+	awkarg 'BEGIN{s="aaa"; n=sub(/a/,"[&]",s); print n, s}'
+	awkarg 'BEGIN{s="abc"; gsub(/x*/,"-",s); print s}'
+	awkarg 'BEGIN{print match("foobar", /o+/), RSTART, RLENGTH}'
+	awkarg 'BEGIN{print match("x","y"), RSTART, RLENGTH}'
+	awkarg 'BEGIN{n=split("a:b:c", arr, ":"); print n, arr[1], arr[3]}'
+	awkarg 'BEGIN{n=split("  a  b ", arr); print n, "["arr[1]"]", "["arr[2]"]"}'
+	awkarg 'BEGIN{n=split("a1b2c", a, /[0-9]/); print n, a[1], a[3]}'
+	awkarg 'BEGIN{print "a.b" ~ /a\.b/, "axb" ~ /a\.b/, "a+b" ~ /a\+b/}'
+	awkarg 'BEGIN{s=sprintf("%d-%s", 5, "x"); print s, length(s)}'
+	awkarg 'BEGIN{x="a"; x = x x x; print x, length(x)}'
+
+	# printf
+	awkarg 'BEGIN{printf "%d|%5.2f|%s|%c|%x|%o|%e\n", 42, 3.14159, "hi", 65, 255, 8, 1234.5}'
+	awkarg 'BEGIN{printf "%-5s|%5s|%.3s|%*d\n", "a", "b", "abcdef", 5, 42}'
+	awkarg 'BEGIN{printf "%5.1f|%+d|% d|%05d\n", 3.14159, 5, 5, 42}'
+	awkarg 'BEGIN{printf "%i %d\n", 3.9, -3.9}'
+	awkarg 'BEGIN{printf "%c%c\n", 104, "hi"}'
+	awkarg 'BEGIN{printf "%.10f\n", 1/3}'
+
+	# records and fields
+	awkin '{print NR, NF, $1, $NF}' w1
+	awkin '{ $2 = "X"; print }' w1
+	awkin '{ NF = 2; print; print NF }' w1
+	awkin '{ $7 = "seven"; print NF; print }' w1
+	awkin '{ print $(NF-1) }' w1
+	awkin '$1 > 5 { print "big", $1 }' w1
+	awkin '/^1/ { print "starts with 1:", $0 }' w1
+	awkin '$0 ~ /b/ { print "has b" }' w1
+	awkin '!/^a/ { print "no a", $1 }' w1
+	awkin 'NR==2, NR==3 { print "range", NR }' w1
+	awkin 'END { print NR }' w1
+	awkin 'BEGIN{OFS="-"} { $1=$1; print }' w1
+	awkin 'BEGIN{FS=":"} {print $2}' w3
+	awkin 'BEGIN{FS=","} {print NF, $2}' w3
+	awkin 'BEGIN{FS=""} {print NF, $1}' w3
+	awkin 'BEGIN{FS="[0-9]+"} {print NF, $2}' w1
+	awkin 'BEGIN{RS=""} {print NR": "$0; print "NF="NF}' w4
+	awkin 'BEGIN{OFS="|"; ORS="!\n"} { $1=$1; print $1, $2 }' w3
+	awkin '{ s+=$1 } END { print s }' w1
+	awkin '{ a[NR]=$0 } END { for (i=NR;i>=1;i--) print a[i] }' w1
+	awkin '{ printf "%-10s %3d %s\n", $1, $2, toupper($3) }' w2
+	awkin '{ if ($2 == 25) next; print $1 }' w2
+	awkin '{ print; nextfile }' w2
+	awkin 'END { $0 = "x y"; print NF, $2 }' w2
+
+	# arrays, functions, control flow
+	awkarg 'BEGIN{a["x"]=1; a["y"]=2; print length(a), ("x" in a), ("z" in a)}'
+	awkarg 'BEGIN{a[1]=1; delete a[1]; print (1 in a), length(a)}'
+	awkarg 'BEGIN{SUBSEP=":"; a[1,2]=3; for (k in a) print k; print ((1,2) in a)}'
+	awkarg 'BEGIN{a[1]=1; a[2]=2; n=0; for (i in a) { delete a[i]; n++ }; print n, length(a)}'
+	awkarg 'function f(x) { return x*2 } BEGIN { print f(21) }'
+	awkarg 'function fib(n) { return n<2 ? n : fib(n-1)+fib(n-2) } BEGIN { print fib(10) }'
+	awkarg 'function g(a,   i) { for (i=1;i<=3;i++) a[i]=i*i } BEGIN { g(arr); print arr[3], length(arr) }'
+	awkarg 'function f(a) { a[1] = "changed" } BEGIN { b[1]="orig"; f(b); print b[1] }'
+	awkarg 'function f(x) { x = 99 } BEGIN { y = 1; f(y); print y }'
+	awkarg 'function cnt(arr) { return length(arr) } BEGIN { split("a b c", z); print cnt(z) }'
+	awkarg 'function r(n) { if (n <= 0) return 0; return n + r(n-1) } BEGIN { print r(50) }'
+	awkarg 'BEGIN{ while (i<3) { i++; if (i==2) continue; print i } }'
+	awkarg 'BEGIN{ do { i++ } while (i<5); print i }'
+	awkarg 'BEGIN{ for (i=0;i<3;i++) for (j=0;j<2;j++) s = s i j " "; print s }'
+	awkarg 'BEGIN{ print 1; exit 3; print 2 } END { print "end" }'
+	awkarg 'BEGIN{ i=5; print i++, i, ++i, i--, i }'
+	awkarg 'BEGIN{ x = 5; x += 2; x -= 1; x *= 3; x /= 2; x %= 5; x ^= 2; print x }'
+	awkarg 'BEGIN{ print (1>2 ? "a" : "b"), (1==1), (1=="1"), ("a"<"b"), (2<10), ("10"<"9") }'
+	awkarg 'BEGIN{ x; print x+0, "["x"]", length(x) }'
+	awkarg 'BEGIN{ print 3 == "3", "3" == "3.0", 3 == "3.0" }'
+	awkarg 'BEGIN{ n=split("", a); print n, length(a) }'
+
+	# the command line
+	awkarg -v 'x=5' 'BEGIN{print x, x+1}'
+	awkarg -v 'x=a\tb' 'BEGIN{print x}'
+	awkarg -v 'OFS=-' 'BEGIN{print "a","b"}'
+	a=$( . "$BT"; awk '{print FILENAME, FNR, NR}' w1 w2 2>&1; echo "rc=$?" )
+	b=$( "$RAWK" '{print FILENAME, FNR, NR}' w1 w2 2>&1; echo "rc=$?" )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "awk over two files: [$a] not [$b]"; fi
+	a=$( . "$BT"; awk '{print v, $1}' w1 v=9 w2 2>&1 )
+	b=$( "$RAWK" '{print v, $1}' w1 v=9 w2 2>&1 )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "awk with an assignment between files: [$a] not [$b]"; fi
+	a=$( . "$BT"; awk 'BEGIN{print ARGC, ARGV[0], ARGV[1]}' w1 w2 2>&1 )
+	b=$( "$RAWK" 'BEGIN{print ARGC, ARGV[0], ARGV[1]}' w1 w2 2>&1 )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "awk ARGV: [$a] not [$b]"; fi
+	cat > wprog <<'PEOF'
+BEGIN { FS = "," ; total = 0 }
+{ total += $2 ; names = names (NR>1 ? "," : "") $1 }
+END { printf "%s = %d\n", names, total }
+PEOF
+	a=$( . "$BT"; awk -f wprog w3 2>&1 )
+	b=$( "$RAWK" -f wprog w3 2>&1 )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "awk -f: [$a] not [$b]"; fi
+	a=$( . "$BT"; awk -F: '{print $2}' <<< 'a:b:c' 2>&1 )
+	b=$( "$RAWK" -F: '{print $2}' <<< 'a:b:c' 2>&1 )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "awk -F: [$a] not [$b]"; fi
+
+	# getline, and writing to files
+	awkin '{ if ((getline nxt) > 0) print $0 "+" nxt; else print $0 "+EOF" }' w1
+	awkin 'NR==1 { while ((getline x) > 0) n++; print n }' w1
+	a=$( . "$BT"; awk 'BEGIN { while ((getline l < "w3") > 0) print "got", l }' 2>&1 )
+	b=$( "$RAWK" 'BEGIN { while ((getline l < "w3") > 0) print "got", l }' 2>&1 )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "awk getline from a file: [$a] not [$b]"; fi
+	awkarg 'BEGIN { print (getline l < "nosuchfile") }'
+	a=$( . "$BT"; awk 'BEGIN { print "x" > "wo"; print "y" >> "wo"; close("wo"); while ((getline l < "wo")>0) print "read", l }' 2>&1 )
+	b='read x
+read y'
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "awk writing and reading back: [$a] not [$b]"; fi
+
+	# where this awk follows the standard and the system awk does not
+	awkis 'he' 'BEGIN { print substr("hello", 0, 3) }'
+	awkis 'h' 'BEGIN { print substr("hello", -1, 3) }'
+	awkis 'a ' 'BEGIN { printf "%s %s\n", "a" }'
+	awkis '1' 'BEGIN { print 0.1 + 0.2 == 0.3 }'
+	awkis '-1' 'BEGIN { print system("true") }'
+
+	cd .. || exit 1
+fi
 
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"

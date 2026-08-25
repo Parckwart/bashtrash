@@ -48,13 +48,14 @@ Run the test suite with:
 
 ## What is implemented
 
-74 of the 160 utilities in POSIX.1-2017, as of now.
+75 of the 160 utilities in POSIX.1-2017, as of now.
 
 | utility | synopsis |
 | --- | --- |
 | `admin` | `admin -i[file] [-n] [-r SID] [-y comment] [-fflag] s.file` · `admin [-a user] [-e user] [-fflag] [-dflag] [-t[file]] s.file` |
 | `ar` | `ar -d\|-m\|-p\|-q\|-r\|-t\|-x [-abcisuv] [posname] archive [file...]` |
 | `asa` | `asa [file...]` |
+| `awk` | `awk [-F sepstring] [-v assignment]... program [argument...]`<br>`awk [-F sepstring] -f progfile... [-v assignment]... [argument...]` |
 | `basename` | `basename string [suffix]` |
 | `bc` | `bc [-l] [file...]` |
 | `cal` | `cal [[month] year]` |
@@ -200,6 +201,20 @@ the point rather than five. The library behind `-l` is written in bc itself and
 read by the same parser as anything else; `a(1)`, `e(1)`, `l(2)`, `s(1)` and
 `c(1)` all agree with the real bc to every one of the twenty digits it prints.
 
+**`awk` is a language, so it gets a lexer, a parser and a tree.** The tree
+lives in half a dozen parallel arrays — a kind, three or four children and a
+name to a node — because that is what a language with no structs leaves you.
+Its regular expressions are handed to the shell's own `=~`, which is the ERE
+matcher the standard asks for; and since `=~` reports the leftmost match, the
+text it matched cannot occur any earlier in the string than the match itself,
+which is how `match()` works out RSTART without hunting for it. Numbers are
+decimal strings on bc's arithmetic, with a fast path through the shell's own
+`$(( ))` for the whole ones, which is most of them; `sin`, `log`, `exp` and
+`atan2` are the same series bc's library uses, agreeing with the real awk to
+more digits than a double has. Whether a comparison is done on numbers or on
+text follows the standard's rule about where the value came from, so `$1 == 0`
+is true for a field holding `0.0` and false for one holding `x`.
+
 **`m4` puts what a macro expanded to back in front of the cursor** and reads it
 again, which is m4's whole model and the reason a macro can call itself. The
 arguments of a call are collected with their quoting intact and expanded on
@@ -291,19 +306,17 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 74 |
+| implemented here | 75 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **52** |
-| reachable, not yet written | 12 |
+| reachable, not yet written | 11 |
 
 **The ceiling is 86 of 160**, or about 54% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 12 that remain are wildly uneven. `awk`, `lex` and `yacc` are
-interpreters and compilers, each larger than everything here put together,
-written in a language with no arrays of structs and no way to turn a character
-into an integer except `printf '%d' "'$c"`.
+The 11 that remain are wildly uneven. `lex` and `yacc` are compilers whose
+output is C, and `sh` would be a shell written in a shell.
 
 ### Smaller deviations, all deliberate
 
@@ -341,6 +354,16 @@ into an integer except `printf '%d' "'$c"`.
   `ar` itself writes in the deterministic mode it defaults to now — and just as
   well, since `stat()` is unreachable. It does not build the symbol table that
   `ar s` and `ranlib` maintain for archives of object files.
+* `awk` cannot start a program, so `system()` returns -1, `"cmd" | getline`
+  returns -1 and `print | "cmd"` is an error — the three places awk asks for a
+  shell of its own. Its arithmetic is exact decimal rather than binary floating
+  point, which shows up in the corners: `0.1 + 0.2 == 0.3` is true here and
+  false everywhere else, and a whole number keeps all its digits where a double
+  would have rounded it. `substr` with a starting place below one follows the
+  standard, counting the characters that are really there, which is what gawk
+  does and not what mawk does; a `printf` given fewer arguments than
+  conversions treats the missing ones as empty, as the standard says, rather
+  than stopping.
 * `make` hands each command line to a subshell of the shell it is running in,
   rather than to `/bin/sh`, so a recipe can use anything this library defines
   and nothing it does not. Whether a target is out of date is decided with the
