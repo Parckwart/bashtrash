@@ -28,7 +28,7 @@ for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          nohup pr dd sed who logname diff cal fuser ipcs patch tput \
          what uuencode uudecode write ps ed m4 iconv ar locale nm \
          admin delta get prs rmdel sact sccs unget val \
-         compress uncompress zcat bc make awk gencat ctags cflow cxref file lex yacc man mailx localedef; do
+         compress uncompress zcat bc make awk gencat ctags cflow cxref file lex yacc man mailx localedef sh; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -4223,6 +4223,215 @@ fi
 
 cd .. || exit 1
 
+# --- sh ---------------------------------------------------------------------
+# The reference here is bash rather than /bin/sh.  /bin/sh on this machine is
+# dash, which exits 2 where the standard asks for 127, and does not search
+# PATH for a script named without a slash; bash follows the standard on both,
+# and bash is the interpreter this sh hands its commands to.
+echo "### sh"
+mkdir -p sht
+cd sht || exit 1
+REALSH=$(real_of bash)
+
+shchk() { # NAME ARGS...
+	local name=$1; shift
+	( . "$BT"; sh "$@" ) >bt.out 2>bt.err </dev/null; local a=$?
+	"$REALSH" "$@" >re.out 2>re.err </dev/null; local b=$?
+	if cmp -s bt.out re.out && [ "$a" = "$b" ]; then pass=$((pass + 1))
+	else report "sh $name (exit $a vs $b)"; fi
+}
+
+shchks() { # NAME INFILE ARGS...
+	local name=$1 in=$2; shift 2
+	( . "$BT"; sh "$@" ) <"$in" >bt.out 2>bt.err; local a=$?
+	"$REALSH" "$@" <"$in" >re.out 2>re.err; local b=$?
+	if cmp -s bt.out re.out && [ "$a" = "$b" ]; then pass=$((pass + 1))
+	else report "sh $name <$in (exit $a vs $b)"; fi
+}
+
+# -c: the command string, and what it does with the operands after it
+shchk 'echo'            -c 'echo hi'
+shchk 'empty string'    -c ''
+shchk 'blanks only'     -c '   
+	# nothing but a comment
+'
+shchk 'name and args'   -c 'echo "$0 $1 $2 $#"' nm a b
+shchk 'star'            -c 'echo "$*"' nm one two three
+shchk 'at'              -c 'printf "[%s]" "$@"; echo' nm 'a b' c
+shchk 'no args'         -c 'echo "[$*] $#"' nm
+shchk 'shift'           -c 'shift; echo "$* $#"' nm a b c
+shchk 'exit status'     -c 'exit 7'
+shchk 'last status'     -c 'true; false'
+shchk 'arithmetic'      -c 'echo $((2 + 3 * 4))'
+shchk 'for loop'        -c 'for i in 1 2 3; do echo $i; done'
+shchk 'while loop'      -c 'i=0; while [ $i -lt 3 ]; do echo $i; i=$((i + 1)); done'
+shchk 'case'            -c 'case abc in a*) echo yes ;; *) echo no ;; esac'
+shchk 'function'        -c 'f() { echo "in f: $1"; }; f arg'
+shchk 'here-doc'        -c 'cat <<EOF
+one
+two
+EOF' 
+shchk 'pipeline'        -c 'echo one two three | { read a b c; echo "$c/$b/$a"; }'
+shchk 'subshell'        -c '(cd /; pwd)'
+# names picked so nothing the harness itself left behind can be seen: a
+# script here runs in this process, so it inherits shell variables too
+shchk 'param expansion' -c 'shvar=abcdef; echo "${shvar#a} ${shvar%f} ${shvar:2:2} ${#shvar} ${shunset_zz-def}"'
+shchk 'cmd sub'         -c 'echo "[$(echo nested)]"'
+shchk 'trap exit'       -c 'trap "echo bye" EXIT; echo hi'
+shchk 'syntax error'    -c 'if'
+shchk 'unbalanced'      -c 'echo "unterminated'
+
+# a command_file, its $0, and its arguments
+printf 'echo "0=$0"\necho "n=$# args=$*"\n' > s1
+shchk 'script'          ./s1 x y z
+shchk 'script no args'  ./s1
+printf 'echo one\nexit 3\necho two\n' > s2
+shchk 'script exit'     ./s2
+printf 'printf no-final-newline' > s3
+shchk 'script unterminated' ./s3
+: > s4
+shchk 'empty script'    ./s4
+printf '# just a comment\n' > s5
+shchk 'comment only'    ./s5
+shchk 'after --'        -- ./s1 p q
+
+# the statuses POSIX names for a command_file that cannot be run
+a=$( . "$BT"; sh ./no-such-script-here 2>/dev/null; echo $? )
+b=$( "$REALSH" ./no-such-script-here 2>/dev/null; echo $? )
+if [ "$a" = 127 ] && [ "$b" = 127 ]; then pass=$((pass + 1))
+else note_fail "sh missing script: $a vs $b (want 127)"; fi
+
+mkdir -p adir
+a=$( . "$BT"; sh ./adir 2>/dev/null; echo $? )
+b=$( "$REALSH" ./adir 2>/dev/null; echo $? )
+if [ "$a" = 126 ] && [ "$b" = 126 ]; then pass=$((pass + 1))
+else note_fail "sh directory as script: $a vs $b (want 126)"; fi
+
+# a name with no slash comes from PATH, as the standard says
+mkdir -p sbin
+printf 'echo found-on-path\n' > sbin/onpath
+a=$( PATH=$PWD/sbin; export PATH; . "$BT"; sh onpath 2>&1 )
+b=$( PATH=$PWD/sbin "$REALSH" onpath 2>&1 )
+if [ "$a" = "$b" ] && [ "$a" = found-on-path ]; then pass=$((pass + 1))
+else note_fail "sh PATH search: [$a] vs [$b]"; fi
+
+# -s and the bare invocation read the script from standard input
+printf 'echo "in=$1 $2"\necho done\n' > fromin
+shchks 'stdin -s' fromin -s aa bb
+shchks 'stdin bare' fromin
+printf 'read line\necho "got $line"\ncat\n' > readsome
+printf 'read line\necho "got $line"\nwhile read x; do echo "x=$x"; done\n' > readrest
+{ cat readrest; printf 'first\nsecond\nthird\n'; } > mixed
+shchks 'script shares stdin' mixed -s
+
+# a script on standard input is gathered a command at a time, so everything
+# that spans lines has to survive the gathering
+printf 'echo start \\\n  continued\n'                  > contin
+printf 'cat <<E\nbody $HOME\nE\necho after\n'           > sheredoc
+cat > shquoteddoc <<'SEOF'
+cat <<'E'
+no $expansion
+E
+echo after
+SEOF
+printf 'if true\nthen\n echo t\nelse\n echo f\nfi\n'    > sifelse
+printf 'case ab in\n a*)\n  echo A\n  ;;\n *)\n  echo B\n  ;;\nesac\n' > scase
+printf 'v=$(\n echo sub\n)\necho "[$v]"\n'              > ssub
+printf 'echo a\\\nb\n'                                  > sjoin
+printf '# comment\n\n\necho after-blanks\n'             > sblanks
+for f in contin sheredoc shquoteddoc sifelse scase ssub sjoin sblanks; do
+	shchks "stdin $f" "$f" -s
+done
+
+# the options, in both their short and their -o spellings
+shchk 'errexit'         -e -c 'false; echo unreached'
+shchk 'errexit off'     +e -c 'false; echo reached'
+shchk 'o errexit'       -o errexit -c 'false; echo unreached'
+shchk 'errexit ok'      -e -c 'true; echo reached'
+shchk 'noglob'          -f -c 'echo /no/such/dir/*'
+shchk 'o noglob'        -o noglob -c 'echo /no/such/dir/*'
+shchk 'noglob off'      +f -c 'echo /no/such/dir/*'
+shchk 'xtrace'          -x -c 'echo traced'
+shchk 'verbose'         -v -c 'echo verbose'
+shchk 'clustered'       -ex -c 'echo clustered'
+shchk 'cluster then o'  -eo errexit -c 'false; echo unreached'
+shchk 'noclobber'       -C -c 'echo x > ncf.$$; echo y > ncf.$$; echo "rc=$?"'
+shchk 'allexport'       -a -c 'FOO=bar; case $(export -p) in *FOO*) echo yes ;; *) echo no ;; esac'
+shchk 'allexport off'   -c 'FOO=bar; case $(export -p) in *FOO*) echo yes ;; *) echo no ;; esac'
+shchk 'monitor'         -m -c 'echo monitored'
+shchk 'notify'          -b -c 'echo notified'
+shchk 'hashall'         -h -c 'echo hashed'
+shchk 'nolog'           -o nolog -c 'echo logged'
+shchk 'ignoreeof'       -o ignoreeof -c 'echo eof'
+
+# -n reads the commands and runs none of them
+shchk 'noexec'          -n -c 'echo never'
+shchk 'noexec bad'      -n -c 'if'
+shchk 'o noexec'        -o noexec -c 'echo never'
+shchk 'noexec script'   -n ./s1
+printf 'while :; do\n' > sbad
+shchk 'noexec bad script' -n ./sbad
+shchks 'noexec stdin'   fromin -n -s
+
+# usage errors
+for bad in '-q' '-o bogus' '-c'; do
+	# shellcheck disable=SC2086
+	a=$( . "$BT"; sh $bad 2>/dev/null; echo $? )
+	if [ "$a" -gt 0 ] && [ "$a" -le 125 ]; then pass=$((pass + 1))
+	else note_fail "sh $bad: exit $a, want a usage error"; fi
+done
+
+# the synopsis is `-o option', so an attached name is not an option-argument
+# and is refused here exactly as bash refuses it
+shchk 'o name attached' -oerrexit -c 'false; echo unreached'
+shchk 'dash ends opts'  - ./s1 zz
+shchk 'c after s'       -sc 'echo from-c' nm
+shchk 'plus o'          -e +o errexit -c 'false; echo reached'
+
+# no process of its own, so $$ is the caller's and $BASHPID is the shell's
+got=$( . "$BT"; sh -c 'if [ "$$" = "$BASHPID" ]; then echo same; else echo different; fi' )
+if [ "$got" = different ]; then pass=$((pass + 1))
+else note_fail "sh \$\$ against \$BASHPID: [$got]"; fi
+
+# an interactive shell gathers a construct across its PS2 prompts
+got=$( . "$BT"; printf 'for i in 1 2; do\necho "i=$i"\ndone\n' | sh -i 2>/dev/null )
+if [ "$got" = 'i=1
+i=2' ]; then pass=$((pass + 1))
+else note_fail "sh -i continuation: [$got]"; fi
+
+# and prompts on standard error, PS1 then PS2
+got=$( . "$BT"; printf 'while :; do\nbreak\ndone\n' | PS1='P1 ' PS2='P2 ' sh -i 2>&1 >/dev/null )
+if [ "$got" = 'P1 P2 P2 P1 ' ]; then pass=$((pass + 1))
+else note_fail "sh -i prompts: [$got]"; fi
+
+# $ENV is read before the first prompt, after expansion
+printf 'FROMENV=yes\n' > envfile
+got=$( . "$BT"; EDIR=$PWD ENV='$EDIR/envfile'; export EDIR ENV
+       printf 'echo "[$FROMENV]"\n' | sh -i 2>/dev/null )
+if [ "$got" = '[yes]' ]; then pass=$((pass + 1))
+else note_fail "sh -i ENV: [$got]"; fi
+
+# -n names the file, and the line bash itself would name for the same script
+printf 'echo one\necho two\nif true\necho three\n' > sbad2
+got=$( . "$BT"; sh -n ./sbad2 2>&1 )
+ref=$( "$REALSH" -n ./sbad2 2>&1 )
+if [ "${got##*: line }" = "${ref##*: line }" ] && [ "${got#*sbad2}" != "$got" ]; then
+	pass=$((pass + 1))
+else note_fail "sh -n diagnostic: [$got] vs [$ref]"; fi
+
+# nothing the shell does leaks back into the caller
+got=$( . "$BT"; LEAK=before; sh -c 'LEAK=after; cd /'; echo "$LEAK $(pwd | grep -c . )" )
+case $got in
+'before '*)	pass=$((pass + 1)) ;;
+*)		note_fail "sh leaked into its caller: [$got]" ;;
+esac
+
+# a script run this way sees the library, the way a make recipe does
+got=$( . "$BT"; sh -c 'basename /a/b/c.txt .txt' )
+if [ "$got" = c ]; then pass=$((pass + 1))
+else note_fail "sh does not see the library: [$got]"; fi
+
+cd .. || exit 1
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"
 mkdir -p pure
@@ -4265,6 +4474,8 @@ printf '$set 1\n1 hello\n' > pure/cat.msg
 printf 'a b c\n1 2 3\n' > pure/data
 printf 'all:\n\t@echo made\n' > pure/Makefile
 printf '0\tstring\ta\tstarts with an a\n' > pure/magic
+printf 'echo "$0 $#"\nfor i in 1 2; do echo $i; done\n' > pure/script.sh
+printf 'LC_NUMERIC\ndecimal_point "<comma>"\nEND LC_NUMERIC\n' > pure/locsrc
 mkdir -p pure/manpath/man1
 cp pure/page.1 pure/manpath/man1/pure.1
 out=$(env -i PATH= "$BASH" --noprofile --norc -c '
@@ -4303,6 +4514,11 @@ out=$(env -i PATH= "$BASH" --noprofile --norc -c '
 	printf "a message\n" | mailx -s hi "$(id -un)" || exit 1
 	mailx -H > /dev/null			|| exit 1
 	printf "q\n" | mailx -N > /dev/null	|| exit 1
+	localedef -i locsrc ./alocale		|| exit 1
+	sh -c "exit 0"				|| exit 1
+	sh script.sh a b > /dev/null		|| exit 1
+	printf "echo hi\n" | sh -s > /dev/null	|| exit 1
+	sh -n script.sh				|| exit 1
 	echo ok' _ "$BT" "$work" 2>&1)
 if [ "$out" = ok ]; then
 	pass=$((pass + 1)); echo "everything above runs with an empty PATH"

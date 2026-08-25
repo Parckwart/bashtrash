@@ -48,7 +48,7 @@ Run the test suite with:
 
 ## What is implemented
 
-85 of the 160 utilities in POSIX.1-2017, as of now.
+86 of the 160 utilities in POSIX.1-2017 — every one that can be, as of now.
 
 | utility | synopsis |
 | --- | --- |
@@ -111,6 +111,7 @@ Run the test suite with:
 | `sact` | `sact s.file...` |
 | `sccs` | `sccs [-r] [-d path] [-p path] command [options] [operands]` |
 | `sed` | `sed [-n] script [file...]` · `sed [-n] [-e script]... [-f file]... [file...]` |
+| `sh` | `sh [-abCefhimnuvx] [-o option]... [+abCefhimnuvx] [+o option]... [command_file [argument...]]`<br>`sh -c [options] command_string [command_name [argument...]]` · `sh -s [options] [argument...]` |
 | `sleep` | `sleep time` |
 | `sort` | `sort [-m] [-o out] [-bdfinru] [-t char] [-k keydef]... [file...]` · `sort -c ...` |
 | `split` | `split [-l line_count] [-a suffix_length] [file [name]]` · `split -b n[k\|m] ...` |
@@ -304,6 +305,27 @@ arrives as whatever `foo` is. `eval` hands its expression to the shell's
 arithmetic, but only after checking that every character in it belongs to an
 expression — otherwise `eval(PATH)` would quietly become something interesting.
 
+**`sh` does not write a second shell.** The interpreter this library is
+written in is already a POSIX shell, so `sh` puts the requested options in
+place, sets `$0` and the positional parameters, and hands the commands to
+bash inside a subshell — nothing is forked to a program on disk, so a script
+run this way sees every function this file defines, exactly as a `make`
+recipe does. Three parts of it are less obvious than they look. `-n` has to
+parse the script and run none of it, and bash will not turn `noexec` on for
+input it has already begun reading: by the time `set -n` has run, the source
+that would follow it is itself read and not executed. So the flag is
+prepended to the script text and the two are read together, and the injected
+line is subtracted back out of the line numbers in the diagnostic. And a
+script arriving on standard input is read a line at a time rather than all at
+once, gathering lines until they make a whole command — reading no further
+than the command needs is what leaves the rest of the stream for the command
+itself, so `read x` inside such a script still takes the line after it, the
+way the standard says it must. Gathering means asking bash after every line
+whether what is in hand parses yet — with one case bash cannot answer, since
+`echo a \` with the backslash last parses perfectly well on its own, the
+continuation joining it to nothing. A line ending in an odd number of
+backslashes is therefore counted as unfinished before bash is asked at all.
+
 **`ed` is checked by the thing it exists for.** `diff -e` writes an ed script,
 so running that script has to turn one file into the other — which exercises
 every address form, `a`, `c`, `d`, `s` and `w` at once, against a diff nobody
@@ -354,7 +376,9 @@ each sort. `man` formats a page written for the purpose, and then the same page
 gzipped, and the two have to come out identical -- which is also how the gzip
 reader is checked, against `zcat`, on text, on random bytes and on every manual
 page this machine has. `localedef` compiles a locale definition that `locale`
-then has to read back, odd characters and all.
+then has to read back, odd characters and all. `sh` is compared against bash
+rather than against `/bin/sh`, which on this machine is dash and departs from
+the standard on exactly the two points listed below.
 
 `lex` and `yacc` write C, so the only honest test is to compile what they write
 and run it: the scanners are fed input and have to return the right tokens in
@@ -371,7 +395,7 @@ fall back on.
 
 ## Limitations, and why they exist
 
-The interesting limitation isn't that the remaining utilities are unwritten.
+The interesting limitation isn't which utilities are missing.
 It's that **a large part of POSIX cannot be written this way at all.**
 
 Bash has no builtin that mutates the filesystem. Not one:
@@ -410,19 +434,15 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 85 |
+| implemented here | 86 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **52** |
-| reachable, not yet written | 1 |
+| reachable, not yet written | 0 |
 
-**The ceiling is 86 of 160**, or about 54% of the standard. Getting past that
-would need bash's loadable builtins — which are C, and would rather defeat the
-point.
-
-The one that remains is `sh`, whose whole purpose -- running a program -- is
-the one thing this library will not do. The shell this is written in is
-already a POSIX shell; writing a second one inside it would be a curiosity
-rather than a utility.
+**86 of 160**, or about 54% of the standard, and that is the ceiling: every
+utility not in the table needs a system call bash does not expose. Getting
+past it would need bash's loadable builtins — which are C, and would rather
+defeat the point.
 
 ### Smaller deviations, all deliberate
 
@@ -607,6 +627,27 @@ rather than a utility.
   asks for a BRE, so the two are translated. `sed` implements the POSIX
   command set; GNU's own extensions, such as the `first~step` address, are
   not there.
+* `sh` runs its commands in a subshell of this shell rather than in a process
+  of its own, which shows up in four places. The script inherits every
+  function this library defines, so `sh -c 'cat f'` runs the `cat` in here.
+  It also inherits the caller's shell variables, not just the exported
+  environment a real `sh` would be started with. Job control is whatever bash
+  gives a subshell, so `-m` and `-b` are accepted and set but there are no job
+  numbers to report. And a fatal shell error — an unset variable under `-u`,
+  say — ends the subshell with status 1, which is what POSIX asks for (1 to
+  125), where bash invoked as a command would exit 127.
+* `sh -i` prompts with `PS1` and `PS2` and reads `$ENV` first, but it is a
+  loop over `read` rather than bash's own interactive mode: no history, no
+  job table, and `$-` does not contain `i`.
+* Having no process of its own, `sh` has no `$$` of its own either: a script
+  sees the calling shell's process ID, since bash keeps `$$` the same in a
+  subshell. As a temporary file name that is harmless, but a script that
+  signals itself with `kill $$` would signal the caller instead. `$BASHPID`
+  is the subshell's own ID and does what `$$` would have.
+* `sh` follows the standard on the two points where `/bin/sh` on a Debian
+  system does not: a `command_file` that cannot be found exits 127 and one
+  that cannot be read exits 126, and a `command_file` named without a slash
+  is looked for along `PATH`.
 * Everything is byte oriented; multibyte locales are not interpreted.
 
 ## Speed

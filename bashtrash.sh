@@ -25267,3 +25267,332 @@ localedef () {
 	[ "$_ld_warn" != 0 ] && return 1
 	return 0
 }
+# ---------------------------------------------------------------------------
+# sh -- the standard command language interpreter.
+#
+# The shell this file is written in is already a POSIX shell, so sh does not
+# write a second one: it puts the requested options in place, sets $0 and the
+# positional parameters, and hands the commands to bash inside a subshell.
+# Nothing is forked to a program on disk and nothing is execed, so a script
+# run this way sees every function this file defines, exactly as a make
+# recipe does.
+# ---------------------------------------------------------------------------
+
+# The option names POSIX gives `set -o`.  An unknown one is a usage error
+# rather than something to hand to bash, which would only warn and carry on.
+_BT_SH_OPTS=' allexport errexit ignoreeof monitor noclobber noexec noglob nolog notify nounset verbose vi xtrace '
+
+_bt_sh_usage() {
+	_bt_err 'usage: sh [-abCefhimnuvx] [-o option]... [+abCefhimnuvx] [+o option]... [command_file [argument...]]'
+	_bt_err '       sh -c [options] command_string [command_name [argument...]]'
+	_bt_err '       sh -s [options] [argument...]'
+}
+
+# Read FILE into _bt_str, keeping it byte for byte apart from the trailing
+# newlines the shell drops anyway -- a script's last line needs no terminator.
+_bt_sh_slurp() {
+	local line out=
+	while IFS= read -r line; do
+		out=$out$line$'\n'
+	done < "$1"
+	[ -n "$line" ] && out=$out$line
+	_bt_str=$out
+	return 0
+}
+
+# Parse $1 without running any of it, reporting errors against the name $2.
+#
+# bash will not turn noexec on for input it has already begun reading, so the
+# flag cannot be set and the script then sourced: by the time `set -n` has
+# run, the source that follows it is itself read and not executed.  The flag
+# is therefore prepended to the text, and the two sourced together.  That
+# shifts every line bash names by one, which the diagnostic puts back.
+# Sets _bt_str to what bash said, and returns bash's status.
+_bt_sh_syntax() {
+	local text=$1 name=$2 err rc line n msg
+	# <<< supplies the last newline itself; leaving one on would add a
+	# blank line at the end and move the line bash names for an
+	# unfinished construct, which is the end of the input
+	text=${text%$'\n'}
+	err=$( ( . /dev/stdin ) 2>&1 <<< "set -n"$'\n'"$text" )
+	rc=$?
+	_bt_str=
+	[ "$rc" = 0 ] && return 0
+	# bash writes `/dev/stdin: line N: message'; say it the way sh does
+	while IFS= read -r line; do
+		msg=$line
+		case $line in
+		'/dev/stdin: line '*)
+			n=${line#'/dev/stdin: line '}
+			msg=${n#*': '}
+			n=${n%%':'*}
+			case $n in
+			*[!0-9]*)	;;
+			'')		;;
+			*)		msg="$name: line $(( n - 1 )): $msg" ;;
+			esac ;;
+		'/dev/stdin: '*)
+			msg="$name: ${line#'/dev/stdin: '}" ;;
+		esac
+		_bt_str=$_bt_str"sh: $msg"$'\n'
+	done <<< "$err"
+	printf '%s' "$_bt_str" >&2
+	return "$rc"
+}
+
+# True when the line in $1 ends in a line continuation -- an odd number of
+# trailing backslashes.  bash's own parser cannot report this one: `echo a \'
+# with the backslash last parses perfectly well on its own, the continuation
+# simply joining it to nothing, so no error is raised and the line that was
+# meant to follow it would be run as a command of its own.
+_bt_sh_continues() {
+	local t=$1 n=0
+	while :; do
+		case $t in
+		*'\')	t=${t%'\'}; n=$(( n + 1 )) ;;
+		*)	break ;;
+		esac
+	done
+	[ "$(( n % 2 ))" = 1 ]
+}
+
+# True when the text in $1 is not a whole command yet, so the shell should
+# read another line before running it.  A syntax error anywhere else is real.
+# An unfinished here-document is only a warning to bash, so it is looked for
+# whether the parse succeeded or not.
+_bt_sh_incomplete() {
+	local err
+	# the check is expected to fail; errexit must not act on that
+	err=$( ( . /dev/stdin ) 2>&1 <<< "set -n"$'\n'"$1" ) || :
+	case $err in
+	*'unexpected end of file'*)	return 0 ;;
+	*'unexpected EOF'*)		return 0 ;;
+	*'delimited by end-of-file'*)	return 0 ;;
+	esac
+	return 1
+}
+
+# Run the commands arriving on standard input, a line at a time, gathering
+# lines until they make a whole command and only then running it.  Reading no
+# further than the command needs is the point: it leaves the rest of the
+# stream where the command can have it, so a `read' inside a script fed to
+# sh on standard input still takes the line after the script, the way POSIX
+# says it must.  _bt_sh_prompt says whether to prompt, which is all an
+# interactive shell adds; the script's arguments are this function's own, so
+# that $1 and shift mean inside the script what they should.  It has to run
+# inside the subshell that holds the options, so that a cd or an assignment
+# lasts as long as the shell does.
+_bt_sh_stream() {
+	local _sh_line _sh_buf= _sh_rc=0 _sh_p _sh_eof=0
+	while [ "$_sh_eof" = 0 ]; do
+		_sh_line=
+		if [ "$_bt_sh_prompt" = 1 ]; then
+			if [ -n "$_sh_buf" ]; then _sh_p=${PS2-'> '}
+			else _sh_p=${PS1-'$ '}; fi
+			# read -p prompts only at a terminal, and POSIX wants the
+			# prompt on standard error whatever is on standard input
+			if [ -t 0 ]; then
+				IFS= read -r -e -p "$_sh_p" _sh_line || _sh_eof=1
+			else
+				printf '%s' "$_sh_p" >&2
+				IFS= read -r _sh_line || _sh_eof=1
+			fi
+		else
+			IFS= read -r _sh_line || _sh_eof=1
+		fi
+		if [ -n "$_sh_buf" ]; then _sh_buf=$_sh_buf$'\n'$_sh_line
+		else _sh_buf=$_sh_line; fi
+		[ -n "$_sh_buf" ] || continue
+		if [ "$_sh_eof" = 0 ] &&
+		   { _bt_sh_continues "$_sh_buf" ||
+		     _bt_sh_incomplete "$_sh_buf"; }; then
+			continue
+		fi
+		eval "$_sh_buf"
+		_sh_rc=$?
+		_sh_buf=
+	done
+	return "$_sh_rc"
+}
+
+# What an interactive shell does before its first prompt: read $ENV, which
+# POSIX has the shell expand before using it as a pathname.
+_bt_sh_env() {
+	local _sh_envf=
+	[ -n "${ENV-}" ] || return 0
+	eval "_sh_envf=\"$ENV\"" 2>/dev/null || _sh_envf=
+	if [ -n "$_sh_envf" ] && [ -r "$_sh_envf" ]; then
+		. "$_sh_envf" "$@"
+	fi
+	return 0
+}
+
+# Find the script named in $1, the way POSIX has sh find it: a name with no
+# slash in it comes from PATH, and only then from the directory in hand.
+# Sets _bt_str to the pathname to read.
+_bt_sh_find() {
+	local name=$1 dir rest
+	case $name in
+	*/*)	_bt_str=$name; return 0 ;;
+	esac
+	rest=${PATH-}
+	while [ -n "$rest" ]; do
+		dir=${rest%%:*}
+		case $rest in
+		*:*)	rest=${rest#*:} ;;
+		*)	rest= ;;
+		esac
+		[ -n "$dir" ] || dir=.
+		if [ -f "$dir/$name" ] && [ -r "$dir/$name" ]; then
+			_bt_str=$dir/$name
+			return 0
+		fi
+	done
+	_bt_str=./$name
+	return 0
+}
+
+sh () {
+	local arg opt sign oname file name text
+	local usecmd=0 usestdin=0 interactive=0 noexec=0 endopts=0
+	local _bt_sh_prompt=0
+	local -a setargs=() args=()
+
+	while [ "$#" -gt 0 ] && [ "$endopts" = 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	shift; break ;;
+		-o|+o)	sign=${1:0:1}; shift
+			if [ "$#" = 0 ]; then
+				_bt_err "sh: ${sign}o wants an option name"
+				_bt_sh_usage
+				return 2
+			fi
+			oname=$1; shift
+			case $_BT_SH_OPTS in
+			*" $oname "*)	;;
+			*)	_bt_err "sh: $oname: unknown option"
+				_bt_sh_usage
+				return 2 ;;
+			esac
+			[ "$oname" = noexec ] && [ "$sign" = - ] && noexec=1
+			[ "$oname" = noexec ] && [ "$sign" = + ] && noexec=0
+			setargs+=("${sign}o" "$oname") ;;
+		[-+]?*)	sign=${1:0:1}; arg=${1:1}; shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				c)	usecmd=1 ;;
+				s)	usestdin=1 ;;
+				i)	interactive=1 ;;
+				o)	# the synopsis is `-o option': the name is
+					# always the next argument, never attached
+					if [ "$#" -gt 0 ]; then
+						oname=$1; shift
+					else
+						_bt_err "sh: ${sign}o wants an option name"
+						_bt_sh_usage
+						return 2
+					fi
+					case $_BT_SH_OPTS in
+					*" $oname "*)	;;
+					*)	_bt_err "sh: $oname: unknown option"
+						_bt_sh_usage
+						return 2 ;;
+					esac
+					[ "$oname" = noexec ] && [ "$sign" = - ] && noexec=1
+					[ "$oname" = noexec ] && [ "$sign" = + ] && noexec=0
+					setargs+=("${sign}o" "$oname") ;;
+				a|b|C|e|f|h|m|n|u|v|x)
+					[ "$opt" = n ] && [ "$sign" = - ] && noexec=1
+					[ "$opt" = n ] && [ "$sign" = + ] && noexec=0
+					setargs+=("$sign$opt") ;;
+				*)	_bt_err "sh: illegal option -- $opt"
+					_bt_sh_usage
+					return 2 ;;
+				esac
+			done ;;
+		*)	endopts=1 ;;
+		esac
+	done
+
+	# $0 is the parent's argv[0] unless an operand names something else
+	name=$0
+	file=
+
+	if [ "$usecmd" = 1 ]; then
+		if [ "$#" = 0 ]; then
+			_bt_err 'sh: -c wants a command string'
+			_bt_sh_usage
+			return 2
+		fi
+		text=$1; shift
+		if [ "$#" -gt 0 ]; then name=$1; shift; fi
+		args=("$@")
+	elif [ "$usestdin" = 1 ] || [ "$#" = 0 ]; then
+		args=("$@")
+	else
+		file=$1; shift
+		name=$file
+		args=("$@")
+	fi
+
+	if [ "$usecmd" = 0 ] && [ -n "$file" ]; then
+		_bt_sh_find "$file"
+		file=$_bt_str
+		if [ ! -e "$file" ]; then
+			_bt_err "sh: $name: No such file or directory"
+			return 127
+		fi
+		if [ -d "$file" ]; then
+			_bt_err "sh: $name: Is a directory"
+			return 126
+		fi
+		if [ ! -r "$file" ]; then
+			_bt_err "sh: $name: Permission denied"
+			return 126
+		fi
+	fi
+
+	# -n reads the commands and checks them, and runs nothing at all
+	if [ "$noexec" = 1 ]; then
+		if [ "$usecmd" = 0 ]; then
+			if [ -n "$file" ]; then
+				_bt_sh_slurp "$file"
+				text=$_bt_str
+			else
+				_bt_sh_slurp /dev/stdin
+				text=$_bt_str
+			fi
+		fi
+		_bt_sh_syntax "$text" "$name"
+		return $?
+	fi
+
+	# With no script to run and a terminal on both sides, sh is interactive
+	if [ "$usecmd" = 0 ] && [ -z "$file" ] && [ "$usestdin" = 0 ] &&
+	   [ -t 0 ] && [ -t 2 ]; then
+		interactive=1
+	fi
+
+	(
+		BASH_ARGV0=$name
+		set -- ${args[@]+"${args[@]}"}
+		set -o posix
+		if [ "${#setargs[@]}" -gt 0 ]; then set "${setargs[@]}"; fi
+		if [ "$usecmd" = 1 ]; then
+			eval "$text"
+		elif [ -n "$file" ]; then
+			. "$file"
+		elif [ "$interactive" = 1 ]; then
+			_bt_sh_prompt=1
+			_bt_sh_env "$@"
+			_bt_sh_stream "$@"
+		else
+			_bt_sh_prompt=0
+			_bt_sh_stream "$@"
+		fi
+	)
+	return $?
+}
