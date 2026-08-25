@@ -25,7 +25,8 @@ fi
 for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          fold head id nl od paste pathchk sleep sort split strings tabs \
          tail tee tr tsort tty uname unexpand uniq wc join csplit grep xargs \
-         nohup pr dd sed who logname diff cal fuser ipcs; do
+         nohup pr dd sed who logname diff cal fuser ipcs patch tput \
+         what uuencode uudecode write ps; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -966,13 +967,16 @@ echo "### who logname diff"
 
 # There is no utmp in most containers, so a synthetic one is built and both
 # implementations are pointed at it -- who takes the file as an operand.
+# A field longer than the space it goes in would ask head for a negative count,
+# which means "all but the last n bytes" and never stops on /dev/zero.
+pad() { [ "$1" -gt 0 ] && head -c "$1" /dev/zero; return 0; }
 mkutmp() { # type pid line id user host tv_sec
 	printf "$(printf '\\%03o\\%03o\\000\\000' $(( $1 & 255 )) $(( $1 >> 8 )))"
 	printf "$(printf '\\%03o\\%03o\\%03o\\%03o' $(( $2 & 255 )) $(( $2 >> 8 & 255 )) $(( $2 >> 16 & 255 )) $(( $2 >> 24 & 255 )))"
-	printf '%s' "$3"; head -c $(( 32 - ${#3} )) /dev/zero
-	printf '%s' "$4"; head -c $(( 4 - ${#4} )) /dev/zero
-	printf '%s' "$5"; head -c $(( 32 - ${#5} )) /dev/zero
-	printf '%s' "$6"; head -c $(( 256 - ${#6} )) /dev/zero
+	printf '%s' "${3:0:32}"; pad $(( 32 - ${#3} ))
+	printf '%s' "${4:0:4}"; pad $(( 4 - ${#4} ))
+	printf '%s' "${5:0:32}"; pad $(( 32 - ${#5} ))
+	printf '%s' "${6:0:256}"; pad $(( 256 - ${#6} ))
 	head -c 8 /dev/zero
 	printf "$(printf '\\%03o\\%03o\\%03o\\%03o' $(( $7 & 255 )) $(( $7 >> 8 & 255 )) $(( $7 >> 16 & 255 )) $(( $7 >> 24 & 255 )))"
 	head -c 4 /dev/zero
@@ -1152,6 +1156,411 @@ if command -v ipcs > /dev/null 2>&1; then
 		id=$("$(real_of ipcs)" -$t 2>/dev/null | awk 'NR==4{print $2}')
 		[ -n "$id" ] && ipcrm -$t "$id" 2>/dev/null
 	done
+fi
+
+# --- patch ----------------------------------------------------------------
+# What matters is the file that comes out, not the chatter on stdout, so each
+# case applies the same patch with both implementations and compares the result
+# and the exit status.
+echo "### patch"
+if command -v patch > /dev/null 2>&1; then
+	RPATCH=$(real_of patch)
+	patchchk() {	# patchchk desc source patchfile [options...]
+		local desc=$1 src=$2 pf=$3 orc rrc
+		shift 3
+		rm -f pw pr pw.orig pr.orig
+		cp "$src" pw; cp "$src" pr
+		( . "$BT"; patch "$@" -i "$pf" pw < /dev/null ) > /dev/null 2>&1; orc=$?
+		"$RPATCH" "$@" -i "$pf" pr < /dev/null > /dev/null 2>&1; rrc=$?
+		if [ "$orc" = "$rrc" ] && cmp -s pw pr; then pass=$((pass + 1))
+		else note_fail "patch $desc (rc $orc vs $rrc)"; fi
+	}
+
+	printf 'alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\ngolf\nhotel\nindia\njuliet\n' > pa
+	printf 'alpha\nbravo\nCHARLIE\ndelta\necho\nfoxtrot\ngolf\nHOTEL\nindia\njuliet\nkilo\n' > pb
+	"$(real_of diff)" -u pa pb > pu.patch
+	"$(real_of diff)" pa pb > pn.patch
+
+	patchchk "unified"          pa pu.patch
+	patchchk "normal"           pa pn.patch
+	patchchk "unified reversed" pb pu.patch -R
+	patchchk "normal reversed"  pb pn.patch -R
+	patchchk "unified already applied" pb pu.patch
+	patchchk "normal already applied"  pb pn.patch
+	patchchk "unified with -b"  pa pu.patch -b
+
+	# a hunk that is not where its header says it is has to be found nearby
+	{ echo PRE1; echo PRE2; echo PRE3; cat pa; } > pshift
+	patchchk "unified at an offset" pshift pu.patch
+	patchchk "normal at an offset"  pshift pn.patch
+
+	# a missing newline at the end of a file survives in both directions
+	printf 'a\nb\nc\n' > pnl1
+	printf 'a\nB\nc' > pnl2
+	"$(real_of diff)" -u pnl1 pnl2 > pnu.patch
+	"$(real_of diff)" pnl1 pnl2 > pnn.patch
+	patchchk "unified losing the final newline" pnl1 pnu.patch
+	patchchk "normal losing the final newline"  pnl1 pnn.patch
+	patchchk "unified gaining the final newline" pnl2 pnu.patch -R
+	patchchk "normal gaining the final newline"  pnl2 pnn.patch -R
+
+	# -p and the filename in the header
+	rm -rf pd1 pd2 pw1 pw2
+	mkdir -p pd1/sub pd2/sub pw1 pw2
+	cp pa pd1/sub/f; cp pb pd2/sub/f
+	"$(real_of diff)" -u pd1/sub/f pd2/sub/f > pp.patch
+	for o in "" -p0 -p1 -p2 -p3; do
+		cp pa pw1/f; cp pa pw2/f
+		# shellcheck disable=SC2086
+		a=$( cd pw1 && . "$BT"; patch $o -i ../pp.patch < /dev/null > /dev/null 2>&1; echo $? )
+		# shellcheck disable=SC2086
+		b=$( cd pw2 && "$RPATCH" $o -i ../pp.patch < /dev/null > /dev/null 2>&1; echo $? )
+		if [ "$a" = "$b" ] && cmp -s pw1/f pw2/f; then pass=$((pass + 1))
+		else note_fail "patch ${o:--p unset} naming the file from the header ($a vs $b)"; fi
+	done
+
+	# -o writes elsewhere and leaves the original alone
+	rm -f pw po1 po2
+	cp pa pw
+	( . "$BT"; patch -o po1 -i pu.patch pw < /dev/null ) > /dev/null 2>&1; a=$?
+	"$RPATCH" -o po2 -i pu.patch pw < /dev/null > /dev/null 2>&1; b=$?
+	if [ "$a" = "$b" ] && cmp -s po1 po2 && cmp -s pw pa; then pass=$((pass + 1))
+	else note_fail "patch -o ($a vs $b)"; fi
+
+	# the patch on standard input rather than behind -i
+	rm -f pw pr
+	cp pa pw; cp pa pr
+	( . "$BT"; patch pw < pu.patch ) > /dev/null 2>&1; a=$?
+	"$RPATCH" pr < pu.patch > /dev/null 2>&1; b=$?
+	if [ "$a" = "$b" ] && cmp -s pw pr; then pass=$((pass + 1))
+	else note_fail "patch reading the patch from stdin ($a vs $b)"; fi
+
+	# nothing usable in the input, and a file that is not there
+	( . "$BT"; patch -i pu.patch nosuch < /dev/null ) > /dev/null 2>&1; a=$?
+	"$RPATCH" -i pu.patch nosuch < /dev/null > /dev/null 2>&1; b=$?
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "patch on a missing file ($a vs $b)"; fi
+	printf 'not a patch at all\n' > pjunk.patch
+	( . "$BT"; patch -i pjunk.patch < /dev/null ) > /dev/null 2>&1; a=$?
+	"$RPATCH" -i pjunk.patch < /dev/null > /dev/null 2>&1; b=$?
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "patch on garbage input ($a vs $b)"; fi
+
+	# random pairs, both formats, both directions: lines carry spaces, tabs and
+	# backslashes, and half of them end without a final newline
+	for seed in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+		RANDOM=$seed
+		: > px
+		n=$(( 5 + RANDOM % 25 ))
+		for i in $(seq 1 "$n"); do
+			printf '  line%d\tx %d \\ *\n' "$((RANDOM % 9))" "$i" >> px
+		done
+		: > py
+		i=0
+		while IFS= read -r ln; do
+			i=$((i + 1))
+			[ $(( RANDOM % 7 )) = 0 ] && continue
+			[ $(( RANDOM % 7 )) = 0 ] && printf '  NEW-%d \\t\n' "$i" >> py
+			printf '%s\n' "$ln" >> py
+		done < px
+		[ $(( RANDOM % 2 )) = 0 ] && printf 'TAIL with no newline' >> py
+		{ echo Z1; echo Z2; echo Z3; echo Z4; cat px; } > pxs
+		"$(real_of diff)" -u px py > pru.patch
+		"$(real_of diff)" px py > prn.patch
+		patchchk "random $seed unified"           px pru.patch
+		patchchk "random $seed normal"            px prn.patch
+		patchchk "random $seed unified reversed"  py pru.patch -R
+		patchchk "random $seed normal reversed"   py prn.patch -R
+		patchchk "random $seed unified applied"   py pru.patch
+		patchchk "random $seed normal applied"    py prn.patch
+		patchchk "random $seed unified shifted"   pxs pru.patch
+		patchchk "random $seed normal shifted"    pxs prn.patch
+	done
+	# how far a hunk may travel, and which hunks are pinned to the ends of the
+	# file because the patch left them short of context
+	i=1
+	: > pf0
+	while [ "$i" -le 20 ]; do printf 'c%d\n' "$i" >> pf0; i=$((i + 1)); done
+	for u in 1 2 3; do
+		for k in 1 2 3 5 18 20; do
+			"$(real_of sed)" "${k}s/.*/CHANGED/" pf0 > pf1
+			"$(real_of diff)" -U$u pf0 pf1 > pk.patch
+			for off in 0 1 2 4 6 9; do
+				i=1
+				: > pfs
+				while [ "$i" -le "$off" ]; do printf 'Z%d\n' "$i" >> pfs; i=$((i + 1)); done
+				cat pf0 >> pfs
+				patchchk "-U$u change at $k, $off lines down" pfs pk.patch
+			done
+		done
+	done
+fi
+
+# --- tput -----------------------------------------------------------------
+# Every capability of every terminfo entry on this machine, compared name by
+# name against the real tput: the value it prints and the status it exits with.
+echo "### tput"
+if command -v tput > /dev/null 2>&1 && command -v infocmp > /dev/null 2>&1; then
+	RTPUT=$(real_of tput)
+	terms=
+	for d in /usr/share/terminfo /lib/terminfo /etc/terminfo; do
+		[ -d "$d" ] || continue
+		for f in "$d"/*/*; do
+			[ -f "$f" ] || continue
+			terms="$terms ${f##*/}"
+		done
+		[ -n "$terms" ] && break
+	done
+	caps=$( . "$BT"; echo "$_BT_TI_BOOLS $_BT_TI_NUMS $_BT_TI_STRS" )
+	# a handful of terminals get every capability; the rest get a sample, so
+	# that the suite does not spend a minute here
+	i=0
+	for t in $terms; do
+		i=$((i + 1))
+		if [ $(( i % 6 )) = 1 ]; then
+			use=$caps
+		else
+			use="clear longname cols lines am bw colors cbt bel cr sgr0
+			     smso rmso el ed smcup rmcup flash civis cnorm kf5 is2
+			     rs1 acsc u6 enacs smkx rmkx nosuchcapability"
+		fi
+		# shellcheck disable=SC2086
+		a=$( . "$BT"
+		     for c in $use; do
+			printf '%s|' "$c"
+			tput -T"$t" "$c" 2> /dev/null
+			printf '|%s\n' "$?"
+		     done )
+		# shellcheck disable=SC2086
+		b=$( for c in $use; do
+			printf '%s|' "$c"
+			"$RTPUT" -T"$t" "$c" 2> /dev/null
+			printf '|%s\n' "$?"
+		     done )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "tput -T$t"; fi
+	done
+
+	# the ones that take parameters, where the terminfo parameter machine
+	# actually has something to do
+	for t in $terms; do
+		a=$( . "$BT"
+		     for c in "cup 5 10" "cup 0 0" "setaf 3" "setab 4" "hpa 10" \
+			      "vpa 4" "dch 3" "cud 7" "il 2" "ich 4" "cub 3" \
+			      "cuf 9" "csr 2 20" "mrcup 1 2" "wind 1 2 3 4" \
+			      "sgr 0 0 0 0 0 0 0 0 0" "sgr 0 1 0 0 1 0 0 0 0" \
+			      "sgr 1 0 0 0 0 0 0 0 1" "tsl 3" "pfkey 1 abc"; do
+			printf '%s|' "$c"
+			# shellcheck disable=SC2086
+			tput -T"$t" $c 2> /dev/null
+			printf '|%s\n' "$?"
+		     done )
+		b=$( for c in "cup 5 10" "cup 0 0" "setaf 3" "setab 4" "hpa 10" \
+			      "vpa 4" "dch 3" "cud 7" "il 2" "ich 4" "cub 3" \
+			      "cuf 9" "csr 2 20" "mrcup 1 2" "wind 1 2 3 4" \
+			      "sgr 0 0 0 0 0 0 0 0 0" "sgr 0 1 0 0 1 0 0 0 0" \
+			      "sgr 1 0 0 0 0 0 0 0 1" "tsl 3" "pfkey 1 abc"; do
+			printf '%s|' "$c"
+			# shellcheck disable=SC2086
+			"$RTPUT" -T"$t" $c 2> /dev/null
+			printf '|%s\n' "$?"
+		     done )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "tput -T$t with parameters"; fi
+	done
+
+	( . "$BT"; tput -T nosuchterminal clear ) > /dev/null 2>&1; a=$?
+	"$RTPUT" -T nosuchterminal clear > /dev/null 2>&1; b=$?
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "tput on an unknown terminal ($a vs $b)"; fi
+	( . "$BT"; tput ) > /dev/null 2>&1; a=$?
+	"$RTPUT" > /dev/null 2>&1; b=$?
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "tput with no operand ($a vs $b)"; fi
+fi
+
+# --- what, uuencode, uudecode, write ---------------------------------------
+# Nothing on this machine implements these, so they are held to the standard
+# and to known-good encodings rather than to another program.
+echo "### what uuencode uudecode write"
+
+printf 'x\n@(#)hello world"trailing\nmore\n@(#)second>cut\n' > what1
+printf 'nothing to see\n' > what2
+printf 'AAA\000@(#)ident\000BBB\n' > what3
+a=$( . "$BT"; what what1 2>&1 )
+b=$( printf 'what1:\n\thello world\n\tsecond' )
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "what: [$a]"; fi
+a=$( . "$BT"; what -s what1 2>&1 )
+b=$( printf 'what1:\n\thello world' )
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "what -s: [$a]"; fi
+a=$( . "$BT"; what what3 2>&1 )
+b=$( printf 'what3:\n\tident' )
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "what on a file with NUL bytes: [$a]"; fi
+( . "$BT"; what what2 ) > /dev/null 2>&1
+if [ "$?" -eq 1 ]; then pass=$((pass + 1)); else note_fail "what should exit 1 when it finds nothing"; fi
+( . "$BT"; what what1 what2 ) > /dev/null 2>&1
+if [ "$?" -eq 0 ]; then pass=$((pass + 1)); else note_fail "what should exit 0 when any file matches"; fi
+a=$( . "$BT"; what what1 what2 2>&1 )
+b=$( printf 'what1:\n\thello world\n\tsecond\nwhat2:' )
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "what over several files: [$a]"; fi
+
+# the encodings themselves, against vectors computed elsewhere
+uuvec() {	# uuvec text expected
+	local a
+	a=$( . "$BT"; printf '%s' "$1" | uuencode n | sed -n 2p )
+	if [ "$a" = "$2" ]; then pass=$((pass + 1))
+	else note_fail "uuencode '$1': [$a] not [$2]"; fi
+}
+uuvec f '!9@``'
+uuvec fo '"9F\`'
+uuvec foo '#9F]O'
+uuvec foob '$9F]O8@``'
+uuvec fooba '%9F]O8F$`'
+uuvec foobar '&9F]O8F%R'
+
+b64vec() {	# b64vec text expected
+	local a
+	a=$( . "$BT"; printf '%s' "$1" | uuencode -m n | sed -n 2p )
+	if [ "$a" = "$2" ]; then pass=$((pass + 1))
+	else note_fail "uuencode -m '$1': [$a] not [$2]"; fi
+}
+b64vec f 'Zg=='
+b64vec fo 'Zm8='
+b64vec foo 'Zm9v'
+b64vec foob 'Zm9vYg=='
+b64vec fooba 'Zm9vYmE='
+b64vec foobar 'Zm9vYmFy'
+
+a=$( . "$BT"; printf 'abc' | uuencode name.txt )
+b=$( printf 'begin 644 name.txt\n#86)C\n\140\nend' )
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "uuencode header and terminator: [$a]"; fi
+a=$( . "$BT"; printf 'abc' | uuencode -m name.txt )
+b=$( printf 'begin-base64 644 name.txt\nYWJj\n====' )
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "uuencode -m header and terminator: [$a]"; fi
+
+# round trips, including the awkward lengths and a file full of NUL bytes
+i=0
+while [ "$i" -le 10 ]; do
+	head -c "$i" /dev/urandom > uu.in
+	for o in "" -m; do
+		# shellcheck disable=SC2086
+		( . "$BT"; uuencode $o uu.in carried ) > uu.enc 2>&1
+		( . "$BT"; uudecode -o uu.out uu.enc ) 2>&1
+		if cmp -s uu.in uu.out; then pass=$((pass + 1))
+		else note_fail "uuencode${o:+ -m} round trip at $i bytes"; fi
+	done
+	i=$((i + 1))
+done
+for n in 44 45 46 90 1000; do
+	head -c "$n" /dev/urandom > uu.in
+	for o in "" -m; do
+		# shellcheck disable=SC2086
+		( . "$BT"; uuencode $o uu.in carried ) > uu.enc 2>&1
+		( . "$BT"; uudecode -o uu.out uu.enc ) 2>&1
+		if cmp -s uu.in uu.out; then pass=$((pass + 1))
+		else note_fail "uuencode${o:+ -m} round trip at $n bytes"; fi
+	done
+done
+"$(real_of tr)" '\000-\377' '\000' < /dev/zero 2>/dev/null | head -c 200 > uu.in
+( . "$BT"; uuencode uu.in carried ) > uu.enc 2>&1
+( . "$BT"; uudecode -o uu.out uu.enc ) 2>&1
+if cmp -s uu.in uu.out; then pass=$((pass + 1)); else note_fail "uuencode round trip over NUL bytes"; fi
+
+# the historical form encodes a zero as a space rather than a backquote, and
+# uudecode has to take either
+( . "$BT"; uuencode uu.in carried ) > uu.enc 2>&1
+"$(real_of tr)" '\140' ' ' < uu.enc > uu.enc2
+( . "$BT"; uudecode -o uu.out uu.enc2 ) 2>&1
+if cmp -s uu.in uu.out; then pass=$((pass + 1)); else note_fail "uudecode of the space-padded form"; fi
+
+# with no -o the name in the header decides where it lands
+rm -f uu.named
+printf 'hello\n' > uu.in
+( . "$BT"; uuencode uu.in uu.named ) > uu.enc 2>&1
+( . "$BT"; uudecode uu.enc ) 2>&1
+if cmp -s uu.in uu.named; then pass=$((pass + 1)); else note_fail "uudecode using the name in the header"; fi
+( . "$BT"; uudecode -o uu.out what2 ) > /dev/null 2>&1
+if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "uudecode should refuse input with no begin line"; fi
+( . "$BT"; uuencode ) > /dev/null 2>&1
+if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "uuencode should refuse to run with no operand"; fi
+
+# write: the paths that do not need a second user sitting at a terminal
+a=$( . "$BT"; write nosuchuser 2>&1 < /dev/null )
+if [ "$a" = "write: nosuchuser is not logged in" ]; then pass=$((pass + 1))
+else note_fail "write to an absent user: [$a]"; fi
+a=$( . "$BT"; write nosuchuser pts/99 2>&1 < /dev/null )
+if [ "$a" = "write: nosuchuser is not logged in on pts/99" ]; then pass=$((pass + 1))
+else note_fail "write naming a terminal: [$a]"; fi
+( . "$BT"; write ) > /dev/null 2>&1
+if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "write should refuse to run with no operand"; fi
+( . "$BT"; write a b c ) > /dev/null 2>&1
+if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "write should refuse three operands"; fi
+# with a utmp of its own it finds the terminal, and then cannot open it
+mkutmp 7 999 pts/99 '/99' fakeuser '' 1700000000 > utmp.write
+a=$( . "$BT"; _BT_UTMP=utmp.write; write fakeuser 2>&1 < /dev/null )
+case $a in
+"write: permission denied on /dev/pts/99")	pass=$((pass + 1)) ;;
+*)						note_fail "write to a terminal that is not there: [$a]" ;;
+esac
+
+# --- ps ---------------------------------------------------------------------
+# A listing of everything running changes between two runs, so a process that
+# will sit still is started first and compared in full, and the system-wide
+# listings are compared only on the processes both runs saw and only on the
+# columns that cannot change underneath them.
+echo "### ps"
+if command -v ps > /dev/null 2>&1 && [ -r /proc/1/stat ]; then
+	RPS=$(real_of ps)
+	"$(real_of sleep)" 30 &
+	victim=$!
+	"$(real_of sleep)" 0.3
+
+	for spec in "-p $victim" "-fp $victim" "-lp $victim" "-p $victim -o pid,ppid,user,tty,stat,comm" \
+		    "-p $victim -o pid=,comm=" "-p $victim -o pid=PROCESS,comm=NAME" \
+		    "-p 1" "-p 1,$victim" "-p 999999" "-p 1 -o pid,ppid,uid,gid,vsz,sz,nice,pri,stat"; do
+		# shellcheck disable=SC2086
+		a=$( . "$BT"; ps $spec 2>&1; echo "rc=$?" )
+		# shellcheck disable=SC2086
+		b=$( "$RPS" $spec 2>&1; echo "rc=$?" )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "ps $spec"; fi
+	done
+
+	for f in pid ppid pgid sid uid gid user euser ruser group egroup rgroup \
+		 tty comm args stat state wchan nice pri opri vsz rss sz thcount \
+		 nlwp f addr time stime c pcpu; do
+		a=$( . "$BT"; ps -p "$victim" -o "$f" 2>&1 )
+		b=$( "$RPS" -p "$victim" -o "$f" 2>&1 )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "ps -o $f: [$a] vs [$b]"; fi
+		a=$( . "$BT"; ps -p 1 -o "$f" 2>&1 )
+		b=$( "$RPS" -p 1 -o "$f" 2>&1 )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "ps -p 1 -o $f: [$a] vs [$b]"; fi
+	done
+
+	( . "$BT"; ps -o nosuchfield ) > /dev/null 2>&1
+	if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "ps should refuse an unknown -o field"; fi
+	( . "$BT"; ps -p 999999 ) > /dev/null 2>&1
+	if [ "$?" -eq 1 ]; then pass=$((pass + 1)); else note_fail "ps should exit 1 when it selects nothing"; fi
+
+	# the whole-system listings, on the columns that hold still
+	for spec in "-e" "-A" "-d" "-a" "-u root" "-U root" "-G root"; do
+		# shellcheck disable=SC2086
+		( . "$BT"; ps $spec -o pid=,ppid=,uid=,pgid=,sid=,tty= ) > ps.ours 2>/dev/null
+		# shellcheck disable=SC2086
+		"$RPS" $spec -o pid=,ppid=,uid=,pgid=,sid=,tty= > ps.ref 2>/dev/null
+		n=$( "$(real_of awk)" 'NR==FNR{r[$1]=$0; next} ($1 in r) && r[$1]!=$0 {n++} END{print n+0}' \
+			ps.ref ps.ours )
+		k=$( "$(real_of awk)" 'NR==FNR{r[$1]=1; next} ($1 in r){n++} END{print n+0}' ps.ref ps.ours )
+		# -a can legitimately select nothing when no process has a terminal
+		if [ "$n" = 0 ] && { [ "$k" -gt 5 ] ||
+		     { [ ! -s ps.ours ] && [ ! -s ps.ref ]; }; }; then pass=$((pass + 1))
+		else note_fail "ps $spec: $n of $k shared rows differ"; fi
+	done
+
+	# the heading of each fixed layout, which is the part that never moves
+	for spec in "" "-f" "-l"; do
+		# shellcheck disable=SC2086
+		a=$( . "$BT"; ps -e $spec 2>/dev/null | head -1 )
+		# shellcheck disable=SC2086
+		b=$( "$RPS" -e $spec 2>/dev/null | head -1 )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "ps -e $spec heading: [$a] vs [$b]"; fi
+	done
+
+	kill "$victim" 2>/dev/null
+	wait "$victim" 2>/dev/null
 fi
 
 # --- the pure-bash claim itself -------------------------------------------

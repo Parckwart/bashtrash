@@ -6165,13 +6165,22 @@ sed () {
 _BT_UTMP=/var/run/utmp
 
 # Read every byte of $1 into the _bt_b array as numbers.
-_bt_utmp_bytes() {
-	local fd i len rc
+# Read every byte of file $1 into the array _bt_b, NUL bytes included.
+_bt_file_bytes() {
+	local fd
+	{ exec {fd}<"$1"; } 2>/dev/null || return 1
+	_bt_fd_bytes "$fd"
+	exec {fd}<&-
+	return 0
+}
+
+# The same, for whatever is already open on fd $1.
+_bt_fd_bytes() {
+	local i len rc
 	local _bt_buf _bt_nul v
 	_bt_b=()
-	{ exec {fd}<"$1"; } 2>/dev/null || return 1
 	while :; do
-		if _bt_read "$fd"; then rc=0; else rc=1; fi
+		if _bt_read "$1"; then rc=0; else rc=1; fi
 		len=${#_bt_buf}
 		for (( i = 0; i < len; i++ )); do
 			printf -v v '%d' "'${_bt_buf:i:1}"
@@ -6180,12 +6189,11 @@ _bt_utmp_bytes() {
 		[ "$rc" = 0 ] && [ "$_bt_nul" = 1 ] && _bt_b+=(0)
 		[ "$rc" = 1 ] && break
 	done
-	exec {fd}<&-
 	return 0
 }
 
 # The NUL terminated string of $2 bytes starting at offset $1 of _bt_b.
-_bt_utmp_str() {
+_bt_b_str() {
 	local off=$1 max=$2 i out= _bt_c
 	for (( i = 0; i < max; i++ )); do
 		[ "${_bt_b[off+i]}" -eq 0 ] && break
@@ -6197,7 +6205,7 @@ _bt_utmp_str() {
 }
 
 # The little-endian 32-bit number at offset $1.
-_bt_utmp_int() {
+_bt_b_int() {
 	_bt_int=$(( _bt_b[$1] | _bt_b[$1+1] << 8 | _bt_b[$1+2] << 16 | _bt_b[$1+3] << 24 ))
 	return 0
 }
@@ -6244,18 +6252,18 @@ who () {
 		[ -n "$me" ] || return 0
 	fi
 
-	_bt_utmp_bytes "$file" || return 0
+	_bt_file_bytes "$file" || return 0
 	n=$(( ${#_bt_b[@]} / 384 ))
 	for (( r = 0; r < n; r++ )); do
 		off=$(( r * 384 ))
 		type=$(( _bt_b[off] | _bt_b[off+1] << 8 ))
 		# USER_PROCESS only
 		[ "$type" -eq 7 ] || continue
-		_bt_utmp_str $(( off + 8 )) 32;  line=$_bt_str
-		_bt_utmp_str $(( off + 44 )) 32; user=$_bt_str
-		_bt_utmp_str $(( off + 76 )) 256; host=$_bt_str
-		_bt_utmp_int $(( off + 340 ));   sec=$_bt_int
-		_bt_utmp_int $(( off + 4 ));     pid=$_bt_int
+		_bt_b_str $(( off + 8 )) 32;  line=$_bt_str
+		_bt_b_str $(( off + 44 )) 32; user=$_bt_str
+		_bt_b_str $(( off + 76 )) 256; host=$_bt_str
+		_bt_b_int $(( off + 340 ));   sec=$_bt_int
+		_bt_b_int $(( off + 4 ));     pid=$_bt_int
 		[ -n "$user" ] || continue
 		if [ "$mine" = 1 ] && [ "$line" != "$me" ]; then
 			continue
@@ -6292,15 +6300,15 @@ logname () {
 			break
 		fi
 	done
-	if [ -n "$me" ] && _bt_utmp_bytes "$_BT_UTMP"; then
+	if [ -n "$me" ] && _bt_file_bytes "$_BT_UTMP"; then
 		n=$(( ${#_bt_b[@]} / 384 ))
 		for (( r = 0; r < n; r++ )); do
 			off=$(( r * 384 ))
 			type=$(( _bt_b[off] | _bt_b[off+1] << 8 ))
 			[ "$type" -eq 7 ] || continue
-			_bt_utmp_str $(( off + 8 )) 32; line=$_bt_str
+			_bt_b_str $(( off + 8 )) 32; line=$_bt_str
 			[ "$line" = "$me" ] || continue
-			_bt_utmp_str $(( off + 44 )) 32; user=$_bt_str
+			_bt_b_str $(( off + 44 )) 32; user=$_bt_str
 			if [ -n "$user" ]; then
 				printf '%s\n' "$user"
 				return 0
@@ -6883,4 +6891,1684 @@ ipcs () {
 	esac
 	printf '\n'
 	return 0
+}
+
+# ---------------------------------------------------------------------------
+# patch -- POSIX.1-2017:
+#	patch [-blNR] [-c|-e|-n|-u] [-D define] [-i patchfile] [-o outfile]
+#	      [-p num] [-r rejectfile] [file]
+#
+# The normal and unified formats are understood.  A hunk that does not sit
+# exactly where its header says is searched for nearby, as patch does.
+# ---------------------------------------------------------------------------
+
+# Strip $1 leading path components from $2 into _bt_stripped; a negative $1
+# means the caller gave no -p, in which case only the basename is used.  Asking
+# for more
+# components than the name has is an error, the way it is for patch: that is how
+# a wrong -p is caught rather than silently applied to the bare basename.
+_bt_patch_strip() {
+	local num=$1 p=$2
+	# no -p at all: only the basename is used
+	if [ "$num" -lt 0 ]; then _bt_stripped=${p##*/}; return 0; fi
+	while [ "$num" -gt 0 ]; do
+		case $p in
+		*/*)	p=${p#*/} ;;
+		*)	_bt_stripped=; return 1 ;;
+		esac
+		num=$(( num - 1 ))
+	done
+	_bt_stripped=$p
+	return 0
+}
+
+patch () {
+	local LC_ALL=C
+	local arg opt val patchfile= outfile= target= strip=-1 reverse=0 backup=0
+	local status=0 fd i j k n line _bt_reason _bt_stripped _bt_at
+	local -a P=() T=() out=()
+	local pi hstart lhs rhs delta failed=0 hunk=0 name prev
+	local nonl=0 orig_nonl=0 sawhdr=0 revskip=0 lastoff=0
+	local ctx=0 pre suf lead hnonl anchor_start anchor_end
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				R)	reverse=1 ;;
+				b)	backup=1 ;;
+				l|N|n|u|c|e)	;;	# the format is detected from the patch itself
+				i|o|p|d|D|r)
+					if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "patch: option requires an argument -- $opt"
+						return 2
+					fi
+					case $opt in
+					i)	patchfile=$val ;;
+					o)	outfile=$val ;;
+					p)	strip=$(( 10#$val )) ;;
+					esac ;;
+				*)	_bt_err "patch: illegal option -- $opt"
+					_bt_err "usage: patch [-blNR] [-i patchfile] [-o outfile] [-p num] [file]"
+					return 2 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	[ "$#" -ge 1 ] && target=$1
+
+	if [ -n "$patchfile" ]; then
+		if ! { exec {fd}<"$patchfile"; } 2>/dev/null; then
+			_bt_why "$patchfile"
+			_bt_err "patch: $patchfile: $_bt_reason"
+			return 2
+		fi
+	else
+		fd=0
+	fi
+	line=
+	while IFS= read -r line <&"$fd"; do P+=("$line"); line=; done
+	[ -n "$line" ] && P+=("$line")
+	[ -n "$patchfile" ] && exec {fd}<&-
+
+	# The name comes from the headers when the caller did not give one.  The
+	# "+++" name wins if it exists on disk, which is what patch settles on for
+	# the common case of a diff between two copies of the same file.
+	if [ -z "$target" ]; then
+		for (( i = 0; i < ${#P[@]}; i++ )); do
+			case ${P[i]} in
+			'--- '*)	name=${P[i]#--- }
+					name=${name%%$'\t'*}
+					name=${name%% *}
+					sawhdr=1
+					_bt_patch_strip "$strip" "$name" &&
+					[ -e "$_bt_stripped" ] && target=$_bt_stripped ;;
+			'+++ '*)	name=${P[i]#+++ }
+					name=${name%%$'\t'*}
+					name=${name%% *}
+					sawhdr=1
+					if [ -z "$target" ]; then
+						_bt_patch_strip "$strip" "$name" &&
+						[ -e "$_bt_stripped" ] && target=$_bt_stripped
+					fi
+					break ;;
+			esac
+		done
+	fi
+	if [ -z "$target" ]; then
+		if [ "$sawhdr" = 1 ]; then
+			_bt_err "patch: can't find file to patch"
+			_bt_err "patch: perhaps you used the wrong -p option?"
+			return 1
+		fi
+		_bt_err "patch: **** Only garbage was found in the patch input."
+		return 2
+	fi
+	if [ -d "$target" ] || ! { exec {fd}<"$target"; } 2>/dev/null; then
+		_bt_why "$target"
+		_bt_err "patch: $target: $_bt_reason"
+		return 2
+	fi
+	line=
+	while IFS= read -r line <&"$fd"; do T+=("$line"); line=; done
+	if [ -n "$line" ]; then T+=("$line"); orig_nonl=1; fi
+	exec {fd}<&-
+	nonl=$orig_nonl
+
+	# How much context the patch was made with decides which hunks are pinned in
+	# place: a hunk short of context at one end is the one that sits at that end
+	# of the file, and looking for it elsewhere would be wrong.  Two lines of
+	# slack are allowed, which is the fuzz patch permits by default.
+	pre=0 suf=0
+	for (( i = 0; i < ${#P[@]}; i++ )); do
+		case ${P[i]} in
+		'@@ -'*)	pre=0 suf=0 lead=1
+				for (( j = i + 1; j < ${#P[@]}; j++ )); do
+					case ${P[j]} in
+					' '*|'')	suf=$(( suf + 1 ))
+							[ "$lead" = 1 ] && pre=$suf ;;
+					-*|+*|'\'*)	lead=0; suf=0 ;;
+					*)		break ;;
+					esac
+				done
+				[ "$pre" -gt "$ctx" ] && ctx=$pre
+				[ "$suf" -gt "$ctx" ] && ctx=$suf ;;
+		esac
+	done
+
+	printf 'patching file %s\n' "$target"
+	out=( ${T[@]+"${T[@]}"} )
+	delta=0
+	pi=0
+	while [ "$pi" -lt "${#P[@]}" ]; do
+		line=${P[pi]}
+		case $line in
+		'@@ -'*)
+			hunk=$(( hunk + 1 ))
+			# @@ -oldstart,oldcount +newstart,newcount @@
+			val=${line#@@ -}
+			lhs=${val%% *}
+			rhs=${val#* +}
+			rhs=${rhs%% *}
+			if [ "$reverse" = 1 ]; then
+				hstart=${rhs%%,*}
+			else
+				hstart=${lhs%%,*}
+			fi
+			pi=$(( pi + 1 ))
+			local -a want=() repl=()
+			prev= pre=0 suf=0 lead=1 hnonl=-1
+			while [ "$pi" -lt "${#P[@]}" ]; do
+				line=${P[pi]}
+				case $line in
+				' '*)	want+=("${line:1}"); repl+=("${line:1}"); prev=' '
+					suf=$(( suf + 1 ))
+					[ "$lead" = 1 ] && pre=$suf ;;
+				'-'*)	if [ "$reverse" = 1 ]; then repl+=("${line:1}"); else want+=("${line:1}"); fi
+					prev='-'; suf=0 lead=0 ;;
+				'+'*)	if [ "$reverse" = 1 ]; then want+=("${line:1}"); else repl+=("${line:1}"); fi
+					prev='+'; suf=0 lead=0 ;;
+				'\'*)	_bt_patch_nonl ;;
+				'')	want+=(''); repl+=(''); prev=' '
+					suf=$(( suf + 1 ))
+					[ "$lead" = 1 ] && pre=$suf ;;
+				*)	break ;;
+				esac
+				pi=$(( pi + 1 ))
+			done
+			_bt_patch_apply || failed=$(( failed + 1 ))
+			[ "$revskip" = 1 ] && break
+			continue ;;
+		[0-9]*)
+			# normal format: l1[,l2]a l3[,l4], likewise c and d
+			case $line in
+			*[acd]*)	;;
+			*)		pi=$(( pi + 1 )); continue ;;
+			esac
+			hunk=$(( hunk + 1 ))
+			opt=${line//[0-9,]/}
+			opt=${opt:0:1}
+			lhs=${line%%[acd]*}
+			rhs=${line#*[acd]}
+			pi=$(( pi + 1 ))
+			want=() repl=()
+			prev= pre=0 suf=0 lead=1 hnonl=-1
+			while [ "$pi" -lt "${#P[@]}" ]; do
+				case ${P[pi]} in
+				'< '*)	want+=("${P[pi]:2}"); prev='-' ;;
+				'> '*)	repl+=("${P[pi]:2}"); prev='+' ;;
+				'---')	prev= ;;
+				'\'*)	_bt_patch_nonl ;;
+				*)	break ;;
+				esac
+				pi=$(( pi + 1 ))
+			done
+			if [ "$reverse" = 1 ]; then
+				local -a tmp=( ${want[@]+"${want[@]}"} )
+				want=( ${repl[@]+"${repl[@]}"} )
+				repl=( ${tmp[@]+"${tmp[@]}"} )
+				# reversed, the hunk sits at its right-hand line numbers, and
+				# an addition becomes the deletion it undoes (and vice versa)
+				hstart=${rhs%%,*}
+				[ "$opt" = d ] && hstart=$(( hstart + 1 ))
+			else
+				hstart=${lhs%%,*}
+				[ "$opt" = a ] && hstart=$(( hstart + 1 ))
+			fi
+			_bt_patch_apply || failed=$(( failed + 1 ))
+			[ "$revskip" = 1 ] && break
+			continue ;;
+		esac
+		pi=$(( pi + 1 ))
+	done
+
+	# A patch whose very first hunk is already in place is the patch someone
+	# just applied, or one they meant to hand -R.  Either way nothing good comes
+	# of applying the rest of it, so the file is left as it was.
+	if [ "$revskip" = 1 ]; then
+		_bt_err "patch: Reversed (or previously applied) patch detected!  Skipping patch."
+		_bt_err "patch: $hunk out of $hunk hunks ignored"
+		return 1
+	fi
+
+	if [ -n "$outfile" ]; then
+		if ! { exec {fd}>"$outfile"; } 2>/dev/null; then
+			_bt_err "patch: cannot create $outfile"
+			return 2
+		fi
+	else
+		if [ "$backup" = 1 ] && { exec {j}>"$target.orig"; } 2>/dev/null; then
+			n=${#T[@]}
+			for (( i = 0; i < n; i++ )); do
+				if [ "$i" = $(( n - 1 )) ] && [ "$orig_nonl" = 1 ]
+				then printf '%s' "${T[i]}" >&"$j"
+				else printf '%s\n' "${T[i]}" >&"$j"
+				fi
+			done
+			exec {j}>&-
+		fi
+		if ! { exec {fd}>"$target"; } 2>/dev/null; then
+			_bt_err "patch: cannot write $target"
+			return 2
+		fi
+	fi
+	n=${#out[@]}
+	for (( i = 0; i < n; i++ )); do
+		if [ "$i" = $(( n - 1 )) ] && [ "$nonl" = 1 ]
+		then printf '%s' "${out[i]}" >&"$fd"
+		else printf '%s\n' "${out[i]}" >&"$fd"
+		fi
+	done
+	exec {fd}>&-
+
+	if [ "$failed" -gt 0 ]; then
+		_bt_err "patch: $failed out of $hunk hunks FAILED"
+		return 1
+	fi
+	return "$status"
+}
+
+# A "\ No newline at end of file" marker refers to the line just before it, so
+# whether the patched file ends in a newline depends on which side that was.
+# Relies on its caller's locals.
+_bt_patch_nonl() {
+	case $prev in
+	' ')	hnonl=1 ;;
+	'+')	[ "$reverse" = 1 ] || hnonl=1 ;;
+	'-')	[ "$reverse" = 1 ] && hnonl=1 ;;
+	esac
+	return 0
+}
+
+# Place the pending hunk: `want` is what should be there, `repl` what replaces
+# it, `hstart` where the patch says it is.  Relies on its caller's locals.
+_bt_patch_apply() {
+	local at best oldlen=${#out[@]}
+	# a hunk short of context at one end belongs at that end of the file
+	if [ $(( pre + 2 )) -lt "$ctx" ]; then anchor_start=1; else anchor_start=0; fi
+	if [ $(( suf + 2 )) -lt "$ctx" ]; then anchor_end=1; else anchor_end=0; fi
+	# earlier hunks that landed off their stated line move this one along too
+	at=$(( hstart - 1 + delta + lastoff ))
+	_bt_patch_find "$at" want
+	best=$_bt_at
+	if [ "$best" -lt 0 ]; then
+		# already there in its patched form?  then this is a reversed patch
+		if [ "$hunk" = 1 ]; then
+			_bt_patch_find "$at" repl
+			[ "$_bt_at" -ge 0 ] && revskip=1
+		fi
+		[ "$revskip" = 1 ] || _bt_err "patch: Hunk #$hunk FAILED at $hstart"
+		return 1
+	fi
+	lastoff=$(( best - ( hstart - 1 + delta ) ))
+	out=( ${out[@]+"${out[@]:0:best}"} ${repl[@]+"${repl[@]}"} \
+	      ${out[@]+"${out[@]:best+${#want[@]}}"} )
+	delta=$(( delta + ${#repl[@]} - ${#want[@]} ))
+	# a "no newline" marker only decides anything for the hunk that runs to the
+	# end of the file; anywhere else the line it belongs to gets one after all
+	if [ $(( best + ${#want[@]} )) -eq "$oldlen" ]; then
+		if [ "$hnonl" = 1 ]; then nonl=1; else nonl=0; fi
+	fi
+	return 0
+}
+
+# Look for the lines of array $2 in `out` at or near index $1, nearest first,
+# and leave where they start in _bt_at (-1 when they are nowhere to be found).
+_bt_patch_find() {
+	local at=$1 d=0 i k n ok lim
+	local -n lines=$2
+	n=${#lines[@]}
+	lim=${#out[@]}
+	# a hunk pinned to the top of the file has only the one place to go
+	[ "$anchor_start" = 1 ] && at=0
+	while :; do
+		for i in $(( at + d )) $(( at - d )); do
+			if [ "$i" -ge 0 ] && [ $(( i + n )) -le "$lim" ] &&
+			   { [ "$anchor_start" != 1 ] || [ "$i" = 0 ]; } &&
+			   { [ "$anchor_end" != 1 ] || [ $(( i + n )) = "$lim" ]; }
+			then
+				ok=1
+				for (( k = 0; k < n; k++ )); do
+					if [ "${out[i+k]}" != "${lines[k]}" ]; then ok=0; break; fi
+				done
+				if [ "$ok" = 1 ]; then _bt_at=$i; return 0; fi
+			fi
+			[ "$d" = 0 ] && break
+		done
+		[ "$anchor_start" = 1 ] && break
+		d=$(( d + 1 ))
+		if [ $(( at + d + n )) -gt "$lim" ] && [ $(( at - d )) -lt 0 ]; then break; fi
+	done
+	_bt_at=-1
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+# tput -- POSIX.1-2017: tput [-T type] operand [parm...]
+#
+# A terminfo entry is a small binary file: a header of six 16-bit counts, the
+# terminal's names, one byte per boolean, one 16-bit (or, in the newer format,
+# 32-bit) word per number, one 16-bit offset per string into a string table,
+# and then whatever user-defined capabilities were compiled in after that.  The
+# names belonging to each slot are not in the file, only their order, so the
+# three lists below are that order.
+# ---------------------------------------------------------------------------
+# The entry that is loaded, and what came out of it.
+declare -A _BT_TI=() _BT_TI_KIND=()
+_BT_TI_TERM=
+
+_BT_TI_BOOLS='bw am xsb xhp xenl eo gn hc km hs in da db mir msgr os eslok xt hz
+	ul xon nxon mc5i chts nrrmc npc ndscr ccc bce hls xhpa crxm daisy
+	xvpa sam cpix lpix OTbs OTns OTnc OTMT OTNL OTpt OTxr'
+
+_BT_TI_NUMS='cols it lines lm xmc pb vt wsl nlab lh lw ma wnum colors pairs ncv
+	bufsz spinv spinh maddr mjump mcs mls npins orc orl orhi orvi cps
+	widcs btns bitwin bitype OTug OTdC OTdN OTdB OTdT OTkn'
+
+_BT_TI_STRS='cbt bel cr csr tbc clear el ed hpa cmdch cup cud1 home civis cub1
+	mrcup cnorm cuf1 ll cuu1 cvvis dch1 dl1 dsl hd smacs blink bold
+	smcup smdc dim smir invis prot rev smso smul ech rmacs sgr0 rmcup
+	rmdc rmir rmso rmul flash ff fsl is1 is2 is3 if ich1 il1 ip kbs
+	ktbc kclr kctab kdch1 kdl1 kcud1 krmir kel ked kf0 kf1 kf10 kf2
+	kf3 kf4 kf5 kf6 kf7 kf8 kf9 khome kich1 kil1 kcub1 kll knp kpp
+	kcuf1 kind kri khts kcuu1 rmkx smkx lf0 lf1 lf10 lf2 lf3 lf4 lf5
+	lf6 lf7 lf8 lf9 rmm smm nel pad dch dl cud ich indn il cub cuf rin
+	cuu pfkey pfloc pfx mc0 mc4 mc5 rep rs1 rs2 rs3 rf rc vpa sc ind
+	ri sgr hts wind ht tsl uc hu iprog ka1 ka3 kb2 kc1 kc3 mc5p rmp
+	acsc pln kcbt smxon rmxon smam rmam xonc xoffc enacs smln rmln
+	kbeg kcan kclo kcmd kcpy kcrt kend kent kext kfnd khlp kmrk kmsg
+	kmov knxt kopn kopt kprv kprt krdo kref krfr krpl krst kres ksav
+	kspd kund kBEG kCAN kCMD kCPY kCRT kDC kDL kslt kEND kEOL kEXT
+	kFND kHLP kHOM kIC kLFT kMSG kMOV kNXT kOPT kPRV kPRT kRDO kRPL
+	kRIT kRES kSAV kSPD kUND rfi kf11 kf12 kf13 kf14 kf15 kf16 kf17
+	kf18 kf19 kf20 kf21 kf22 kf23 kf24 kf25 kf26 kf27 kf28 kf29 kf30
+	kf31 kf32 kf33 kf34 kf35 kf36 kf37 kf38 kf39 kf40 kf41 kf42 kf43
+	kf44 kf45 kf46 kf47 kf48 kf49 kf50 kf51 kf52 kf53 kf54 kf55 kf56
+	kf57 kf58 kf59 kf60 kf61 kf62 kf63 el1 mgc smgl smgr fln sclk dclk
+	rmclk cwin wingo hup dial qdial tone pulse hook pause wait u0 u1
+	u2 u3 u4 u5 u6 u7 u8 u9 op oc initc initp scp setf setb cpi lpi
+	chr cvr defc swidm sdrfq sitm slm smicm snlq snrmq sshm ssubm
+	ssupm sum rwidm ritm rlm rmicm rshm rsubm rsupm rum mhpa mcud1
+	mcub1 mcuf1 mvpa mcuu1 porder mcud mcub mcuf mcuu scs smgb smgbp
+	smglp smgrp smgt smgtp sbim scsd rbim rcsd subcs supcs docr zerom
+	csnm kmous minfo reqmp getm setaf setab pfxl devt csin s0ds s1ds
+	s2ds s3ds smglr smgtb birep binel bicr colornm defbi endbi
+	setcolor slines dispc smpch rmpch smsc rmsc pctrm scesc scesa
+	ehhlm elhlm elohlm erhlm ethlm evhlm sgr1 slength OTi2 OTrs OTnl
+	OTbc OTko OTma OTG2 OTG3 OTG1 OTG4 OTGR OTGL OTGU OTGD OTGH OTGV
+	OTGC meml memu box1'
+
+# Read a 16-bit little-endian word out of _bt_b at $1 into _bt_int, signed the
+# way terminfo means it: -1 for absent, -2 for cancelled.
+_bt_ti_short() {
+	_bt_int=$(( _bt_b[$1] | _bt_b[$1+1] << 8 ))
+	[ "$_bt_int" -ge 32768 ] && _bt_int=$(( _bt_int - 65536 ))
+	return 0
+}
+
+# The same, for the 32-bit numbers of the newer terminfo format.
+_bt_ti_long() {
+	_bt_int=$(( _bt_b[$1] | _bt_b[$1+1] << 8 | _bt_b[$1+2] << 16 | _bt_b[$1+3] << 24 ))
+	[ "$_bt_int" -ge 2147483648 ] && _bt_int=$(( _bt_int - 4294967296 ))
+	return 0
+}
+
+# Load the entry for terminal $1 into _BT_TI (name -> value) and _BT_TI_KIND
+# (name -> b, n or s).  Anything already loaded for the same terminal stays.
+_bt_ti_load() {
+	local term=$1 d h f= i j off nsz nb nn ns stsz wide=0 nw=2
+	local xb xn xs xoff xsz base
+	local -a bools=() nums=() strs=()
+	[ "${_BT_TI_TERM-}" = "$term" ] && return 0
+	[ -n "$term" ] || return 1
+	case $term in */*|.|..) return 1 ;; esac
+
+	printf -v h '%02x' "'${term:0:1}"
+	for d in ${TERMINFO:+"$TERMINFO"} ${HOME:+"$HOME/.terminfo"} \
+		 ${TERMINFO_DIRS:+${TERMINFO_DIRS//:/ }} \
+		 /etc/terminfo /lib/terminfo /usr/share/terminfo; do
+		if [ -f "$d/${term:0:1}/$term" ]; then f=$d/${term:0:1}/$term; break; fi
+		if [ -f "$d/$h/$term" ]; then f=$d/$h/$term; break; fi
+	done
+	[ -n "$f" ] || return 1
+	_bt_file_bytes "$f" || return 1
+	[ "${#_bt_b[@]}" -gt 12 ] || return 1
+
+	_bt_ti_short 0
+	case $_bt_int in
+	282)	wide=0 nw=2 ;;
+	542)	wide=1 nw=4 ;;
+	*)	return 1 ;;
+	esac
+	_bt_ti_short 2;  nsz=$_bt_int
+	_bt_ti_short 4;  nb=$_bt_int
+	_bt_ti_short 6;  nn=$_bt_int
+	_bt_ti_short 8;  ns=$_bt_int
+	_bt_ti_short 10; stsz=$_bt_int
+
+	_BT_TI=() _BT_TI_KIND=()
+	bools=($_BT_TI_BOOLS) nums=($_BT_TI_NUMS) strs=($_BT_TI_STRS)
+	# every capability the standard names exists whether or not this entry
+	# fills it in; only then is an unknown name really unknown
+	for i in "${bools[@]}"; do _BT_TI_KIND[$i]=b; done
+	for i in "${nums[@]}"; do _BT_TI_KIND[$i]=n; done
+	for i in "${strs[@]}"; do _BT_TI_KIND[$i]=s; done
+
+	off=12
+	_bt_b_str "$off" "$nsz"
+	_BT_TI[.names]=$_bt_str
+	off=$(( off + nsz ))
+
+	for (( i = 0; i < nb; i++ )); do
+		[ "$i" -lt "${#bools[@]}" ] || break
+		[ "${_bt_b[off+i]}" = 1 ] && _BT_TI[${bools[i]}]=1
+	done
+	off=$(( off + nb ))
+	[ $(( off % 2 )) = 1 ] && off=$(( off + 1 ))
+
+	for (( i = 0; i < nn; i++ )); do
+		[ "$i" -lt "${#nums[@]}" ] || break
+		if [ "$wide" = 1 ]; then _bt_ti_long $(( off + i * 4 ))
+		else _bt_ti_short $(( off + i * 2 )); fi
+		[ "$_bt_int" -ge 0 ] && _BT_TI[${nums[i]}]=$_bt_int
+	done
+	off=$(( off + nn * nw ))
+
+	base=$(( off + ns * 2 ))
+	for (( i = 0; i < ns; i++ )); do
+		[ "$i" -lt "${#strs[@]}" ] || break
+		_bt_ti_short $(( off + i * 2 ))
+		[ "$_bt_int" -lt 0 ] && continue
+		_bt_b_str $(( base + _bt_int )) "$stsz"
+		_BT_TI[${strs[i]}]=$_bt_str
+	done
+	off=$(( base + stsz ))
+
+	# The user-defined capabilities live past the standard ones, and there the
+	# names are in the file: first the values, then a name for every one of the
+	# three kinds, all pointing into a second string table.
+	[ $(( off % 2 )) = 1 ] && off=$(( off + 1 ))
+	if [ $(( off + 10 )) -le "${#_bt_b[@]}" ]; then
+		_bt_ti_short "$off";        xb=$_bt_int
+		_bt_ti_short $(( off + 2 )); xn=$_bt_int
+		_bt_ti_short $(( off + 4 )); xs=$_bt_int
+		_bt_ti_short $(( off + 6 )); xoff=$_bt_int
+		_bt_ti_short $(( off + 8 )); xsz=$_bt_int
+		off=$(( off + 10 ))
+		if [ "$xb" -ge 0 ] && [ "$xn" -ge 0 ] && [ "$xs" -ge 0 ] &&
+		   [ "$xoff" -ge 0 ] && [ "$xsz" -ge 0 ]; then
+			bools=() nums=() strs=()
+			for (( i = 0; i < xb; i++ )); do bools+=("${_bt_b[off+i]}"); done
+			off=$(( off + xb ))
+			[ $(( off % 2 )) = 1 ] && off=$(( off + 1 ))
+			for (( i = 0; i < xn; i++ )); do
+				if [ "$wide" = 1 ]; then _bt_ti_long $(( off + i * 4 ))
+				else _bt_ti_short $(( off + i * 2 )); fi
+				nums+=("$_bt_int")
+			done
+			off=$(( off + xn * nw ))
+			# The value strings come first; the names that follow are
+			# offset from where those left off, not from the table.
+			base=$(( off + xoff * 2 ))
+			j=0
+			for (( i = 0; i < xs; i++ )); do
+				_bt_ti_short $(( off + i * 2 ))
+				if [ "$_bt_int" -lt 0 ]; then strs+=(""); continue; fi
+				_bt_b_str $(( base + _bt_int )) "$xsz"
+				strs+=("$_bt_str")
+				[ $(( _bt_int + ${#_bt_str} + 1 )) -gt "$j" ] &&
+					j=$(( _bt_int + ${#_bt_str} + 1 ))
+			done
+			for (( i = xs; i < xoff; i++ )); do
+				_bt_ti_short $(( off + i * 2 ))
+				if [ "$_bt_int" -lt 0 ]; then strs+=(""); continue; fi
+				_bt_b_str $(( base + j + _bt_int )) "$xsz"
+				strs+=("$_bt_str")
+			done
+			for (( i = 0; i < xb + xn + xs; i++ )); do
+				j=$(( xs + i ))
+				[ "$j" -lt "${#strs[@]}" ] || break
+				[ -n "${strs[j]}" ] || continue
+				if [ "$i" -lt "$xb" ]; then
+					_BT_TI_KIND[${strs[j]}]=b
+					[ "${bools[i]}" = 1 ] && _BT_TI[${strs[j]}]=1
+				elif [ "$i" -lt $(( xb + xn )) ]; then
+					_BT_TI_KIND[${strs[j]}]=n
+					[ "${nums[i-xb]}" -ge 0 ] &&
+						_BT_TI[${strs[j]}]=${nums[i-xb]}
+				else
+					_BT_TI_KIND[${strs[j]}]=s
+					_BT_TI[${strs[j]}]=${strs[i-xb-xn]}
+				fi
+			done
+		fi
+	fi
+
+	_BT_TI_TERM=$term
+	return 0
+}
+
+# Pop the parameter stack into _bt_v.  Relies on its caller's `st`.
+_bt_ti_pop() {
+	local k=$(( ${#st[@]} - 1 ))
+	if [ "$k" -lt 0 ]; then
+		# the older capabilities take their parameters in order rather
+		# than naming them with %p, so an empty stack means "the next one"
+		_bt_v=${P[pnext]-0}
+		pnext=$(( pnext + 1 ))
+		return 0
+	fi
+	_bt_v=${st[k]}
+	unset "st[$k]"
+	return 0
+}
+
+# Skip forward past a conditional: to the matching %e when $1 is e, otherwise
+# to the matching %;.  Relies on its caller's `s`, `i` and `n`.
+_bt_ti_skip() {
+	local depth=0 ch
+	while [ "$i" -lt "$n" ]; do
+		if [ "${s:i:1}" != % ]; then i=$(( i + 1 )); continue; fi
+		ch=${s:i+1:1}
+		i=$(( i + 2 ))
+		case $ch in
+		'?')	depth=$(( depth + 1 )) ;;
+		';')	[ "$depth" = 0 ] && return 0
+			depth=$(( depth - 1 )) ;;
+		e)	[ "$depth" = 0 ] && [ "$1" = e ] && return 0 ;;
+		esac
+	done
+	return 0
+}
+
+# Run a capability string through the terminfo parameter machine: $1 is the
+# string, the rest are its parameters, and the result lands in _bt_out.
+_bt_tparm() {
+	local s=$1
+	shift
+	local -a st=() P=("$@")
+	local i=0 n=${#1} c f v x y pnext=0 _bt_v _bt_c
+	local -A dyn=()
+	n=${#s}
+	_bt_out=
+	while [ "$i" -lt "$n" ]; do
+		c=${s:i:1}
+		if [ "$c" != % ]; then _bt_out=$_bt_out$c; i=$(( i + 1 )); continue; fi
+		i=$(( i + 1 ))
+		c=${s:i:1}
+		i=$(( i + 1 ))
+		case $c in
+		%)	_bt_out=$_bt_out% ;;
+		p)	x=${s:i:1}; i=$(( i + 1 ))
+			st+=("${P[x-1]-0}") ;;
+		P)	x=${s:i:1}; i=$(( i + 1 ))
+			_bt_ti_pop; dyn[$x]=$_bt_v ;;
+		g)	x=${s:i:1}; i=$(( i + 1 ))
+			st+=("${dyn[$x]-0}") ;;
+		"'")	x=${s:i:1}; i=$(( i + 2 ))
+			_bt_ord "$x"; st+=("$_bt_n") ;;
+		'{')	x=
+			while [ "$i" -lt "$n" ] && [ "${s:i:1}" != '}' ]; do
+				x=$x${s:i:1}; i=$(( i + 1 ))
+			done
+			i=$(( i + 1 ))
+			st+=("$(( x ))") ;;
+		l)	_bt_ti_pop; st+=("${#_bt_v}") ;;
+		'+'|'-'|'*'|'/'|m|'&'|'|'|'^'|=|'>'|'<'|A|O)
+			_bt_ti_pop; y=$_bt_v
+			_bt_ti_pop; x=$_bt_v
+			case $c in
+			'+')	st+=("$(( x + y ))") ;;
+			'-')	st+=("$(( x - y ))") ;;
+			'*')	st+=("$(( x * y ))") ;;
+			'/')	if [ "$y" = 0 ]; then st+=(0); else st+=("$(( x / y ))"); fi ;;
+			m)	if [ "$y" = 0 ]; then st+=(0); else st+=("$(( x % y ))"); fi ;;
+			'&')	st+=("$(( x & y ))") ;;
+			'|')	st+=("$(( x | y ))") ;;
+			'^')	st+=("$(( x ^ y ))") ;;
+			=)	st+=("$(( x == y ))") ;;
+			'>')	st+=("$(( x > y ))") ;;
+			'<')	st+=("$(( x < y ))") ;;
+			A)	st+=("$(( x != 0 && y != 0 ))") ;;
+			O)	st+=("$(( x != 0 || y != 0 ))") ;;
+			esac ;;
+		'!')	_bt_ti_pop; st+=("$(( _bt_v == 0 ))") ;;
+		'~')	_bt_ti_pop; st+=("$(( ~_bt_v ))") ;;
+		i)	P[0]=$(( ${P[0]-0} + 1 )); P[1]=$(( ${P[1]-0} + 1 )) ;;
+		'?')	;;
+		t)	_bt_ti_pop
+			[ "$_bt_v" = 0 ] && _bt_ti_skip e ;;
+		e)	_bt_ti_skip ';' ;;
+		';')	;;
+		*)	# whatever is left is a printf-style conversion
+			f=%
+			[ "$c" = : ] && { c=${s:i:1}; i=$(( i + 1 )); }
+			while :; do
+				case $c in
+				[-+\ #0-9.])	f=$f$c; c=${s:i:1}; i=$(( i + 1 )) ;;
+				*)		break ;;
+				esac
+			done
+			case $c in
+			d|o|x|X)	_bt_ti_pop; printf -v v "$f$c" "$_bt_v"
+					_bt_out=$_bt_out$v ;;
+			s)		_bt_ti_pop; printf -v v "${f}s" "$_bt_v"
+					_bt_out=$_bt_out$v ;;
+			c)		_bt_ti_pop
+					# a string cannot hold a NUL, so terminfo
+					# spells that character 0200 instead
+					[ "$_bt_v" = 0 ] && _bt_v=128
+					_bt_chr "$_bt_v"; _bt_out=$_bt_out$_bt_c ;;
+			esac ;;
+		esac
+	done
+	return 0
+}
+
+# Strip the padding out of a capability string: with no terminal to be slow,
+# the delays a curses program would sit through mean nothing here.
+_bt_ti_unpad() {
+	local s=$1 out= pre post d
+	while [ -n "$s" ]; do
+		case $s in
+		*'$<'*)	pre=${s%%'$<'*}
+			post=${s#*'$<'}
+			case $post in
+			*'>'*)	d=${post%%'>'*}
+				case $d in
+				''|*[!0-9.*/]*)	out=$out$pre'$<'; s=$post ;;
+				*)		out=$out$pre; s=${post#*'>'} ;;
+				esac ;;
+			*)	out=$out$s; s= ;;
+			esac ;;
+		*)	out=$out$s; s= ;;
+		esac
+	done
+	_bt_out=$out
+	return 0
+}
+
+# Expand a capability for output: with parameters it goes through the parameter
+# machine, without them it is written as it stands, which is what tput does.
+_bt_ti_out() {
+	local cap=$1
+	shift
+	if [ "$#" -gt 0 ]; then
+		_bt_tparm "$cap" "$@"
+	else
+		_bt_out=$cap
+	fi
+	_bt_ti_unpad "$_bt_out"
+	printf '%s' "$_bt_out"
+	return 0
+}
+
+tput () {
+	local LC_ALL=C
+	local arg opt term=${TERM-} op kind val useenv=1
+	local _bt_out _bt_str _bt_int _bt_c _bt_n
+	local -a _bt_b=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-T)	shift
+			if [ "$#" = 0 ]; then
+				_bt_err "tput: option requires an argument -- T"
+				return 2
+			fi
+			term=$1 useenv=0; shift ;;
+		-T*)	term=${1#-T} useenv=0; shift ;;
+		-*)	_bt_err "tput: illegal option -- ${1#-}"
+			_bt_err "usage: tput [-T term] capname [parm...]"
+			return 2 ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" = 0 ]; then
+		_bt_err "usage: tput [-T term] capname [parm...]"
+		return 2
+	fi
+
+	if ! _bt_ti_load "$term"; then
+		_bt_err "tput: unknown terminal \"$term\""
+		return 3
+	fi
+	op=$1
+	shift
+
+	case $op in
+	longname)	printf '%s' "${_BT_TI[.names]##*|}"
+			return 0 ;;
+	init)		for op in is1 is2 is3; do
+				[ -n "${_BT_TI[$op]-}" ] || continue
+				_bt_ti_out "${_BT_TI[$op]}"
+			done
+			return 0 ;;
+	reset)		for op in rs1 rs2 rs3; do
+				[ -n "${_BT_TI[$op]-}" ] || continue
+				_bt_ti_out "${_BT_TI[$op]}"
+			done
+			return 0 ;;
+	clear)		# a terminal with no way to clear its screen is an error,
+			# not just an empty answer
+			[ -n "${_BT_TI[clear]-}" ] || return 2
+			_bt_ti_out "${_BT_TI[clear]}"
+			# the scrollback-clearing string goes out with it when the
+			# terminal has one, which is what curses does
+			[ -n "${_BT_TI[E3]-}" ] && _bt_ti_out "${_BT_TI[E3]}"
+			return 0 ;;
+	esac
+
+	kind=${_BT_TI_KIND[$op]-}
+	if [ -z "$kind" ]; then
+		_bt_err "tput: unknown terminfo capability '$op'"
+		return 4
+	fi
+	val=${_BT_TI[$op]-}
+	case $kind in
+	b)	[ "$val" = 1 ] && return 0
+		return 1 ;;
+	n)	# a number nobody filled in still gets an answer, as -1
+		if [ "$useenv" = 1 ]; then
+			# without -T the size of the window wins, the way it does
+			# for the curses programs this stands in for
+			case $op in
+			cols)	[ -n "${COLUMNS-}" ] && val=$COLUMNS
+				[ -n "$val" ] || val=80 ;;
+			lines)	[ -n "${LINES-}" ] && val=$LINES
+				[ -n "$val" ] || val=24 ;;
+			esac
+		fi
+		printf '%s\n' "${val:--1}"
+		return 0 ;;
+	s)	# a capability can be present and still be the empty string, which
+		# is not the same thing as the terminal not having it at all
+		[ -n "${_BT_TI[$op]+set}" ] || return 1
+		_bt_ti_out "$val" "$@"
+		return 0 ;;
+	esac
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# what -- POSIX.1-2017: what [-s] file...
+#
+# Looks for the marker SCCS substitutes for %Z%, which is @(#), and prints what
+# follows it up to the first of " > \ <newline> or NUL.
+# ---------------------------------------------------------------------------
+
+# Print every identification string in $1.  Relies on its caller's `one` and
+# sets `found` when it prints anything.
+_bt_what_scan() {
+	local seg=$1 rest out ch nl=$'\n'
+	while [ -n "$seg" ]; do
+		case $seg in
+		*'@(#)'*)	rest=${seg#*'@(#)'} ;;
+		*)		return 0 ;;
+		esac
+		out=$rest
+		for ch in '"' '>' '\' "$nl"; do
+			out=${out%%"$ch"*}
+		done
+		printf '\t%s\n' "$out"
+		found=1
+		[ "$one" = 1 ] && return 0
+		seg=$rest
+	done
+	return 0
+}
+
+what () {
+	local LC_ALL=C
+	local arg opt one=0 file fd found=0 any=0 carry
+	local _bt_buf _bt_nul _bt_reason
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				s)	one=1 ;;
+				*)	_bt_err "what: illegal option -- $opt"
+					_bt_err "usage: what [-s] file..."
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	if [ "$#" = 0 ]; then
+		_bt_err "usage: what [-s] file..."
+		return 1
+	fi
+
+	for file in "$@"; do
+		if ! { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_why "$file"
+			_bt_err "what: $file: $_bt_reason"
+			continue
+		fi
+		printf '%s:\n' "$file"
+		# a NUL ends an identification string, so a block that stopped at
+		# one carries nothing over; a block that merely filled up does
+		found=0
+		carry=
+		while _bt_read "$fd"; do
+			_bt_what_scan "$carry$_bt_buf"
+			[ "$one" = 1 ] && [ "$found" = 1 ] && break
+			if [ "$_bt_nul" = 1 ]; then carry=; else carry=${_bt_buf: -3}; fi
+		done
+		[ "$one" = 1 ] && [ "$found" = 1 ] || _bt_what_scan "$carry$_bt_buf"
+		exec {fd}<&-
+		[ "$found" = 1 ] && any=1
+	done
+	[ "$any" = 1 ] && return 0
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+# uuencode, uudecode -- POSIX.1-2017:
+#	uuencode [-m] [file] decode_pathname
+#	uudecode [-o outfile] [file]
+#
+# Both formats are handled: the historical one, where every six bits become a
+# printable character by adding 32, and the base64 one behind -m.
+#
+# The mode in the header is a guess.  Nothing in a shell can read the mode bits
+# of a file -- there is no stat -- so what goes out is 0755 for something this
+# user can execute and 0644 otherwise, and uudecode cannot chmod what it writes
+# in any case.
+# ---------------------------------------------------------------------------
+_BT_B64=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/
+
+# Encode $1 (0..63) the historical way, into _bt_c.
+_bt_uu_c() {
+	if [ "$1" = 0 ]; then _bt_c='`'; else _bt_chr $(( $1 + 32 )); fi
+	return 0
+}
+
+uuencode () {
+	local LC_ALL=C
+	local arg opt b64=0 file= name mode=644 i j n cnt line
+	local b0 b1 b2 _bt_c _bt_reason
+	local -a _bt_b=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-*)	[ "$1" = - ] && break
+			arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				m)	b64=1 ;;
+				*)	_bt_err "uuencode: illegal option -- $opt"
+					_bt_err "usage: uuencode [-m] [file] decode_pathname"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	case $# in
+	1)	name=$1 ;;
+	2)	file=$1 name=$2 ;;
+	*)	_bt_err "usage: uuencode [-m] [file] decode_pathname"
+		return 1 ;;
+	esac
+
+	if [ -n "$file" ]; then
+		if [ ! -r "$file" ] || ! _bt_file_bytes "$file"; then
+			_bt_why "$file"
+			_bt_err "uuencode: $file: $_bt_reason"
+			return 1
+		fi
+		[ -x "$file" ] && mode=755
+	else
+		_bt_fd_bytes 0
+	fi
+
+	n=${#_bt_b[@]}
+	i=0
+	if [ "$b64" = 1 ]; then
+		printf 'begin-base64 %s %s\n' "$mode" "$name"
+		while [ "$i" -lt "$n" ]; do
+			cnt=$(( n - i ))
+			[ "$cnt" -gt 45 ] && cnt=45
+			line=
+			for (( j = i; j < i + cnt; j += 3 )); do
+				b0=${_bt_b[j]} b1=${_bt_b[j+1]-0} b2=${_bt_b[j+2]-0}
+				line=$line${_BT_B64:$(( b0 >> 2 )):1}
+				line=$line${_BT_B64:$(( (b0 & 3) << 4 | b1 >> 4 )):1}
+				if [ $(( j + 1 )) -lt $(( i + cnt )) ]
+				then line=$line${_BT_B64:$(( (b1 & 15) << 2 | b2 >> 6 )):1}
+				else line=$line=
+				fi
+				if [ $(( j + 2 )) -lt $(( i + cnt )) ]
+				then line=$line${_BT_B64:$(( b2 & 63 )):1}
+				else line=$line=
+				fi
+			done
+			printf '%s\n' "$line"
+			i=$(( i + cnt ))
+		done
+		printf '====\n'
+		return 0
+	fi
+
+	printf 'begin %s %s\n' "$mode" "$name"
+	while [ "$i" -lt "$n" ]; do
+		cnt=$(( n - i ))
+		[ "$cnt" -gt 45 ] && cnt=45
+		_bt_uu_c "$cnt"
+		line=$_bt_c
+		for (( j = i; j < i + cnt; j += 3 )); do
+			b0=${_bt_b[j]} b1=${_bt_b[j+1]-0} b2=${_bt_b[j+2]-0}
+			_bt_uu_c $(( b0 >> 2 )); line=$line$_bt_c
+			_bt_uu_c $(( (b0 & 3) << 4 | b1 >> 4 )); line=$line$_bt_c
+			_bt_uu_c $(( (b1 & 15) << 2 | b2 >> 6 )); line=$line$_bt_c
+			_bt_uu_c $(( b2 & 63 )); line=$line$_bt_c
+		done
+		printf '%s\n' "$line"
+		i=$(( i + cnt ))
+	done
+	printf '\140\nend\n'
+	return 0
+}
+
+uudecode () {
+	local LC_ALL=C
+	local arg opt out= file= fd=0 ofd line name mode b64=0 started=0
+	local i n cnt c v acc bits _bt_n _bt_reason
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-o)	shift
+			if [ "$#" = 0 ]; then
+				_bt_err "uudecode: option requires an argument -- o"
+				return 1
+			fi
+			out=$1; shift ;;
+		-o*)	out=${1#-o}; shift ;;
+		-*)	[ "$1" = - ] && break
+			_bt_err "uudecode: illegal option -- ${1#-}"
+			_bt_err "usage: uudecode [-o outfile] [file]"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+	[ "$#" -ge 1 ] && file=$1
+
+	if [ -n "$file" ]; then
+		if ! { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_why "$file"
+			_bt_err "uudecode: $file: $_bt_reason"
+			return 1
+		fi
+	fi
+
+	while IFS= read -r line <&"$fd"; do
+		case $line in
+		'begin-base64 '*)	b64=1 ;;
+		'begin '*)		b64=0 ;;
+		*)			continue ;;
+		esac
+		line=${line#* }
+		mode=${line%% *}
+		name=${line#* }
+		started=1
+		break
+	done
+	if [ "$started" = 0 ]; then
+		[ -n "$file" ] && exec {fd}<&-
+		_bt_err "uudecode: no begin line"
+		return 1
+	fi
+	[ -n "$out" ] || out=$name
+	if [ -z "$out" ]; then
+		[ -n "$file" ] && exec {fd}<&-
+		_bt_err "uudecode: no output name"
+		return 1
+	fi
+	if [ "$out" = /dev/stdout ] || [ "$out" = - ]; then
+		ofd=1
+	elif ! { exec {ofd}>"$out"; } 2>/dev/null; then
+		[ -n "$file" ] && exec {fd}<&-
+		_bt_err "uudecode: cannot create $out"
+		return 1
+	fi
+
+	acc=0 bits=0
+	while IFS= read -r line <&"$fd"; do
+		if [ "$b64" = 1 ]; then
+			case $line in
+			'===='*)	break ;;
+			esac
+			n=${#line}
+			for (( i = 0; i < n; i++ )); do
+				c=${line:i:1}
+				[ "$c" = '=' ] && break
+				v=${_BT_B64%%"$c"*}
+				[ "${#v}" = "${#_BT_B64}" ] && continue
+				acc=$(( acc << 6 | ${#v} ))
+				bits=$(( bits + 6 ))
+				if [ "$bits" -ge 8 ]; then
+					bits=$(( bits - 8 ))
+					printf -v c '%03o' $(( (acc >> bits) & 255 ))
+					printf "\\$c" >&"$ofd"
+				fi
+			done
+			continue
+		fi
+		case $line in
+		end)	break ;;
+		''|'`')	continue ;;
+		esac
+		_bt_ord "${line:0:1}"
+		cnt=$(( _bt_n - 32 ))
+		[ "$cnt" -lt 0 ] && cnt=0
+		[ "$cnt" = 0 ] && continue
+		n=0
+		for (( i = 1; i + 3 < ${#line} + 1 && n < cnt; i += 4 )); do
+			acc=0
+			for (( v = 0; v < 4; v++ )); do
+				_bt_ord "${line:i+v:1}"
+				acc=$(( acc << 6 | ( ( _bt_n - 32 ) & 63 ) ))
+			done
+			for (( v = 16; v >= 0 && n < cnt; v -= 8 )); do
+				printf -v c '%03o' $(( (acc >> v) & 255 ))
+				printf "\\$c" >&"$ofd"
+				n=$(( n + 1 ))
+			done
+		done
+	done
+
+	[ "$ofd" = 1 ] || exec {ofd}>&-
+	[ -n "$file" ] && exec {fd}<&-
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# write -- POSIX.1-2017: write user_name [terminal]
+#
+# The recipient's terminal comes out of utmp, and whether they are willing to
+# be written to is settled by whether the terminal can be opened for writing --
+# which is exactly what the group-write bit mesg(1) turns on and off.
+# ---------------------------------------------------------------------------
+write () {
+	local LC_ALL=C
+	local user term= n r off type line me sender now fd l
+	local -a _bt_b=() found=() _bt_supp=()
+	local _bt_str _bt_int _bt_c _bt_name _bt_uid _bt_gid
+	local _bt_ruid _bt_euid _bt_rgid _bt_egid
+
+	case $# in
+	1)	user=$1 ;;
+	2)	user=$1 term=${2#/dev/} ;;
+	*)	_bt_err "usage: write user_name [terminal]"
+		return 1 ;;
+	esac
+
+	if _bt_file_bytes "$_BT_UTMP"; then
+		n=$(( ${#_bt_b[@]} / 384 ))
+		for (( r = 0; r < n; r++ )); do
+			off=$(( r * 384 ))
+			type=$(( _bt_b[off] | _bt_b[off+1] << 8 ))
+			[ "$type" -eq 7 ] || continue
+			_bt_b_str $(( off + 44 )) 32
+			[ "$_bt_str" = "$user" ] || continue
+			_bt_b_str $(( off + 8 )) 32
+			line=$_bt_str
+			[ -n "$line" ] || continue
+			[ -n "$term" ] && [ "$line" != "$term" ] && continue
+			found+=("$line")
+		done
+	fi
+	if [ "${#found[@]}" = 0 ]; then
+		if [ -n "$term" ]; then
+			_bt_err "write: $user is not logged in on $term"
+		else
+			_bt_err "write: $user is not logged in"
+		fi
+		return 1
+	fi
+	# the most recent session wins, which is the last record written
+	line=${found[${#found[@]} - 1]}
+
+	_bt_self_ids
+	if _bt_passwd "$_bt_euid" uid; then sender=$_bt_name; else sender=$_bt_euid; fi
+	me=
+	for r in /dev/pts/[0-9]* /dev/tty[0-9]* /dev/console; do
+		[ -c "$r" ] || continue
+		if [ "$r" -ef /proc/self/fd/0 ] 2>/dev/null; then
+			me=${r#/dev/}
+			break
+		fi
+	done
+	printf -v now '%(%H:%M)T' -1
+
+	if ! { exec {fd}>"/dev/$line"; } 2>/dev/null; then
+		_bt_err "write: permission denied on /dev/$line"
+		return 1
+	fi
+	printf '\007\nMessage from %s (%s) [%s]...\n' "$sender" "${me:-?}" "$now" >&"$fd"
+	while IFS= read -r l; do
+		printf '%s\n' "$l" >&"$fd"
+	done
+	[ -n "$l" ] && printf '%s\n' "$l" >&"$fd"
+	printf 'EOF\n' >&"$fd"
+	exec {fd}>&-
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# ps -- POSIX.1-2017:
+#	ps [-aA] [-defl] [-G grouplist] [-o format]... [-p proclist]
+#	   [-t termlist] [-U userlist] [-g grouplist] [-n namelist]
+#	   [-u userlist]
+#
+# Everything here comes out of /proc: one line of stat per process for most of
+# it, status for the identities and the locked pages, cmdline for the arguments
+# and wchan for what a sleeping process is waiting on.
+#
+# Columns are laid out the way ps lays them out: each one is as wide as its
+# heading or its widest value, whichever is more, and never narrower than the
+# width that belongs to the field.
+# ---------------------------------------------------------------------------
+
+# name:heading:minimum width:alignment
+_BT_PS_FIELDS='
+pid:PID:5:r ppid:PPID:5:r pgid:PGID:5:r pgrp:PGID:5:r sid:SID:5:r
+sess:SID:5:r uid:UID:5:r gid:GID:5:r ruid:RUID:5:r rgid:RGID:5:r
+user:USER:8:l euser:EUSER:8:l ruser:RUSER:8:l group:GROUP:8:l
+egroup:EGROUP:8:l rgroup:RGROUP:8:l comm:COMMAND:15:l ucmd:COMMAND:15:l
+args:COMMAND:27:l command:COMMAND:27:l tty:TT:8:l tname:TT:8:l
+stat:STAT:4:l state:S:1:l s:S:1:l wchan:WCHAN:6:l stime:STIME:5:l
+start_time:START:5:l f:F:1:r flag:F:1:r flags:F:1:r time:TIME:8:r
+cputime:TIME:8:r etime:ELAPSED:11:r nice:NI:3:r ni:NI:3:r pri:PRI:3:r
+pcpu:%CPU:4:r c:C:2:r vsz:VSZ:6:r vsize:VSZ:6:r rss:RSS:5:r rssize:RSS:5:r
+sz:SZ:5:r thcount:THCNT:5:r nlwp:NLWP:4:r addr:ADDR:4:l opri:PRI:3:r'
+
+# The fixed layouts, as field:heading:heading width:value width.  The two
+# widths differ only where ps itself lets them: the ADDR column of -l is four
+# wide in the heading and holds a single dash underneath, and the SZ beside it
+# takes the room back.
+_BT_PS_DEFAULT='pid:PID:5:5 tty:TTY:8:8 time:TIME:8:8 ucmd:CMD:3:3'
+_BT_PS_FULL='user:UID:8:8 pid:PID:5:5 ppid:PPID:5:5 c:C:2:2 stime:STIME:5:5
+	     tty:TTY:8:8 time:TIME:8:8 args:CMD:3:3'
+_BT_PS_LONG='f:F:1:1 state:S:1:1 uid:UID:5:5 pid:PID:5:5 ppid:PPID:5:5 c:C:2:2
+	     opri:PRI:3:3 nice:NI:3:3 addr:ADDR:4:1 sz:SZ:2:5 wchan:WCHAN:6:6
+	     tty:TTY:8:8 time:TIME:8:8 ucmd:CMD:3:3'
+
+# The device name for the tty device number $1, in _bt_str.
+_bt_ps_tty() {
+	local dev=$1 maj min
+	if [ "$dev" = 0 ]; then _bt_str='?'; return 0; fi
+	maj=$(( (dev >> 8) & 0xfff ))
+	min=$(( (dev & 0xff) | ((dev >> 12) & 0xfff00) ))
+	case $maj in
+	136|137|138|139|140|141|142|143)
+		_bt_str=pts/$(( min + (maj - 136) * 256 )) ;;
+	4)	if [ "$min" -lt 64 ]; then _bt_str=tty$min
+		else _bt_str=ttyS$(( min - 64 )); fi ;;
+	5)	case $min in
+		0)	_bt_str=tty ;;
+		1)	_bt_str=console ;;
+		*)	_bt_str=? ;;
+		esac ;;
+	*)	_bt_str='?' ;;
+	esac
+	return 0
+}
+
+# Clock ticks $1 as ps writes a cpu time.
+_bt_ps_time() {
+	local t=$(( $1 / 100 )) d h
+	h=$(( t / 3600 ))
+	d=$(( h / 24 ))
+	if [ "$d" -gt 0 ]; then
+		printf -v _bt_str '%d-%02d:%02d:%02d' "$d" $(( h % 24 )) \
+			$(( t / 60 % 60 )) $(( t % 60 ))
+	else
+		printf -v _bt_str '%02d:%02d:%02d' "$h" $(( t / 60 % 60 )) $(( t % 60 ))
+	fi
+	return 0
+}
+
+# Seconds $1 as ps writes an elapsed time.
+_bt_ps_etime() {
+	local t=$1 d h
+	[ "$t" -lt 0 ] && t=0
+	h=$(( t / 3600 ))
+	d=$(( h / 24 ))
+	if [ "$d" -gt 0 ]; then
+		printf -v _bt_str '%d-%02d:%02d:%02d' "$d" $(( h % 24 )) \
+			$(( t / 60 % 60 )) $(( t % 60 ))
+	elif [ "$h" -gt 0 ]; then
+		printf -v _bt_str '%02d:%02d:%02d' "$h" $(( t / 60 % 60 )) $(( t % 60 ))
+	else
+		printf -v _bt_str '%02d:%02d' $(( t / 60 )) $(( t % 60 ))
+	fi
+	return 0
+}
+
+ps () {
+	local LC_ALL=C
+	local arg opt val i j k n fd line rest w hdr ttyname oldifs
+	local noheader=1
+	local IFS=$' \t\n'
+	local pid comm state ppid pgrp sess ttynr tpgid flags utime stime_t
+	local cutime cstime prio nice_v threads starttime vsize rss_p policy
+	local ruid_v euid_v rgid_v egid_v vmlck vmrss wch cmdline now boot=0
+	local sel_all=0 sel_a=0 sel_d=0 sel_f=0 sel_l=0 mytty= myeuid
+	local -a pids=() ttys=() users=() rusers=() sess_g=() rgroups=()
+	local -a cols=() rows=() cw=() vals=()
+	local _bt_str _bt_int _bt_name _bt_uid _bt_gid _bt_grname _bt_reason
+	local _bt_ruid _bt_euid _bt_rgid _bt_egid
+	local -a _bt_supp=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-*)	[ "$1" = - ] && break
+			arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				A|e)	sel_all=1 ;;
+				a)	sel_a=1 ;;
+				d)	sel_d=1 ;;
+				f)	sel_f=1 ;;
+				l)	sel_l=1 ;;
+				o|p|t|u|U|g|G|n)
+					if [ -n "$arg" ]; then
+						val=$arg; arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1; shift
+					else
+						_bt_err "ps: option requires an argument -- $opt"
+						return 1
+					fi
+					case $opt in
+					o)	cols+=(${val//,/ }) ;;
+					p)	pids+=(${val//,/ }) ;;
+					t)	ttys+=(${val//,/ }) ;;
+					u)	users+=(${val//,/ }) ;;
+					U)	rusers+=(${val//,/ }) ;;
+					g)	sess_g+=(${val//,/ }) ;;
+					G)	rgroups+=(${val//,/ }) ;;
+					n)	;;	# a namelist means nothing here
+					esac ;;
+				*)	_bt_err "ps: illegal option -- $opt"
+					_bt_err "usage: ps [-aAdefl] [-G grouplist] [-o format] [-p proclist]"
+					_bt_err "          [-t termlist] [-U userlist] [-g grouplist] [-u userlist]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	# what to print
+	if [ "${#cols[@]}" = 0 ]; then
+		noheader=0
+		if [ "$sel_l" = 1 ]; then cols=($_BT_PS_LONG)
+		elif [ "$sel_f" = 1 ]; then cols=($_BT_PS_FULL)
+		else cols=($_BT_PS_DEFAULT); fi
+	else
+		# an -o name carries its own heading after an = sign; a name given
+		# without one gets the standard heading, and a listing where every
+		# name was given an empty heading has no heading line at all
+		local -a spec=()
+		local usedef
+		for i in "${cols[@]}"; do
+			case $i in
+			*=*)	hdr=${i#*=}; i=${i%%=*} usedef=0
+				[ -n "$hdr" ] && noheader=0 ;;
+			*)	hdr= usedef=1 noheader=0 ;;
+			esac
+			w=0
+			for j in $_BT_PS_FIELDS; do
+				case $j in
+				"$i":*)	rest=${j#*:}
+					[ "$usedef" = 1 ] && hdr=${rest%%:*}
+					rest=${rest#*:}
+					w=${rest%%:*}
+					break ;;
+				esac
+			done
+			if [ "$w" = 0 ]; then
+				_bt_err "ps: unknown user-defined format specifier \"$i\""
+				return 1
+			fi
+			[ "${#hdr}" -gt "$w" ] && w=${#hdr}
+			spec+=("$i:$hdr:$w:$w")
+		done
+		cols=("${spec[@]}")
+	fi
+
+	_bt_self_ids
+	myeuid=$_bt_euid
+	for i in /dev/pts/[0-9]* /dev/tty[0-9]* /dev/console; do
+		[ -c "$i" ] || continue
+		if [ "$i" -ef /proc/self/fd/0 ] 2>/dev/null; then
+			mytty=${i#/dev/}
+			break
+		fi
+	done
+
+	printf -v now '%(%s)T' -1
+	if { exec {fd}</proc/stat; } 2>/dev/null; then
+		while read -r arg val rest <&"$fd"; do
+			[ "$arg" = btime ] && boot=$val && break
+		done
+		exec {fd}<&-
+	fi
+
+	# ps lists processes in numeric order.  The glob gives them in the order a
+	# sort would put strings in, so grouping by how many digits they have and
+	# taking the shorter groups first is the same thing without a sort.
+	local -a bylen=()
+	local plist=
+	for i in /proc/[0-9]*; do
+		[ -d "$i" ] || continue
+		pid=${i#/proc/}
+		bylen[${#pid}]="${bylen[${#pid}]-} $pid"
+	done
+	for (( n = 1; n < 12; n++ )); do
+		plist="$plist${bylen[n]-}"
+	done
+
+	for pid in $plist; do
+		i=/proc/$pid
+		{ exec {fd}<"$i/stat"; } 2>/dev/null || continue
+		IFS= read -r line <&"$fd"
+		exec {fd}<&-
+		[ -n "$line" ] || continue
+		rest=${line#*(}
+		comm=${rest%)*}
+		rest=${rest##*") "}
+		# shellcheck disable=SC2086
+		set -- $rest
+		state=$1 ppid=$2 pgrp=$3 sess=$4 ttynr=$5 tpgid=$6 flags=$7
+		utime=${12} stime_t=${13} cutime=${14} cstime=${15}
+		prio=${16} nice_v=${17} threads=${18} starttime=${20}
+		vsize=${21} rss_p=${22} policy=${39}
+
+		ruid_v= euid_v= rgid_v= egid_v= vmlck=0 vmrss=0
+		if { exec {fd}<"$i/status"; } 2>/dev/null; then
+			while IFS= read -r arg <&"$fd"; do
+				case $arg in
+				'Uid:'*)	set -- $arg; ruid_v=$2 euid_v=$3 ;;
+				'Gid:'*)	set -- $arg; rgid_v=$2 egid_v=$3 ;;
+				'VmLck:'*)	set -- $arg; vmlck=$2 ;;
+				# the resident size in stat counts differently
+				# from the one ps reports; this is ps's
+				'VmRSS:'*)	set -- $arg; vmrss=$2 ;;
+				esac
+			done
+			exec {fd}<&-
+		fi
+		[ -n "$euid_v" ] || euid_v=0
+		[ -n "$ruid_v" ] || ruid_v=$euid_v
+		[ -n "$egid_v" ] || egid_v=0
+		[ -n "$rgid_v" ] || rgid_v=$egid_v
+
+		_bt_ps_tty "$ttynr"
+		ttyname=$_bt_str
+
+		# selection
+		if [ "${#pids[@]}" -gt 0 ] || [ "${#ttys[@]}" -gt 0 ] ||
+		   [ "${#users[@]}" -gt 0 ] || [ "${#rusers[@]}" -gt 0 ] ||
+		   [ "${#sess_g[@]}" -gt 0 ] || [ "${#rgroups[@]}" -gt 0 ]; then
+			k=0
+			for j in ${pids[@]+"${pids[@]}"}; do
+				[ "$j" = "$pid" ] && k=1
+			done
+			for j in ${ttys[@]+"${ttys[@]}"}; do
+				j=${j#/dev/}
+				[ "$j" = "$ttyname" ] && k=1
+			done
+			for j in ${users[@]+"${users[@]}"}; do
+				if _bt_isnum "$j"; then
+					[ "$j" = "$euid_v" ] && k=1
+				elif _bt_passwd "$j" name && [ "$_bt_uid" = "$euid_v" ]; then
+					k=1
+				fi
+			done
+			for j in ${rusers[@]+"${rusers[@]}"}; do
+				if _bt_isnum "$j"; then
+					[ "$j" = "$ruid_v" ] && k=1
+				elif _bt_passwd "$j" name && [ "$_bt_uid" = "$ruid_v" ]; then
+					k=1
+				fi
+			done
+			for j in ${sess_g[@]+"${sess_g[@]}"}; do
+				[ "$j" = "$sess" ] && k=1
+			done
+			for j in ${rgroups[@]+"${rgroups[@]}"}; do
+				if _bt_isnum "$j"; then
+					[ "$j" = "$rgid_v" ] && k=1
+				else
+					_bt_group_name "$rgid_v"
+					[ "$_bt_grname" = "$j" ] && k=1
+				fi
+			done
+			[ "$k" = 1 ] || continue
+		elif [ "$sel_all" = 1 ]; then
+			:
+		elif [ "$sel_d" = 1 ]; then
+			[ "$sess" = "$pid" ] && continue
+		elif [ "$sel_a" = 1 ]; then
+			[ "$ttyname" = '?' ] && continue
+			[ "$sess" = "$pid" ] && continue
+		else
+			[ "$euid_v" = "$myeuid" ] || continue
+			[ "$ttyname" = "${mytty:-?}" ] || continue
+		fi
+
+		# the values this listing actually asks for
+		vals=()
+		for j in "${cols[@]}"; do
+			arg=${j%%:*}
+			case $arg in
+			pid)	val=$pid ;;
+			ppid)	val=$ppid ;;
+			pgid|pgrp)	val=$pgrp ;;
+			sid|sess)	val=$sess ;;
+			uid)	val=$euid_v ;;
+			ruid)	val=$ruid_v ;;
+			gid)	val=$egid_v ;;
+			rgid)	val=$rgid_v ;;
+			user|euser)
+				if _bt_passwd "$euid_v" uid; then val=$_bt_name
+				else val=$euid_v; fi ;;
+			ruser)	if _bt_passwd "$ruid_v" uid; then val=$_bt_name
+				else val=$ruid_v; fi ;;
+			group|egroup)
+				_bt_group_name "$egid_v"
+				val=${_bt_grname:-$egid_v} ;;
+			rgroup)	_bt_group_name "$rgid_v"
+				val=${_bt_grname:-$rgid_v} ;;
+			comm|ucmd)	val=$comm ;;
+			args|command)
+				cmdline=
+				if { exec {fd}<"$i/cmdline"; } 2>/dev/null; then
+					while IFS= read -r -d '' arg <&"$fd"; do
+						cmdline=${cmdline:+$cmdline }$arg
+					done
+					exec {fd}<&-
+				fi
+				if [ -n "$cmdline" ]; then val=$cmdline
+				else val="[$comm]"; fi ;;
+			tty|tname)	val=$ttyname ;;
+			state|s)	val=$state ;;
+			stat)	val=$state
+				[ "$nice_v" -lt 0 ] && val=$val'<'
+				[ "$nice_v" -gt 0 ] && val=${val}N
+				[ "$vmlck" -gt 0 ] && val=${val}L
+				[ "$sess" = "$pid" ] && val=${val}s
+				[ "$threads" -gt 1 ] && val=${val}l
+				[ "$tpgid" = "$pgrp" ] && val=$val'+' ;;
+			wchan)	wch=
+				if { exec {fd}<"$i/wchan"; } 2>/dev/null; then
+					IFS= read -r wch <&"$fd"
+					exec {fd}<&-
+				fi
+				case $wch in
+				''|0)	val='-' ;;
+				*)	val=$wch ;;
+				esac ;;
+			stime|start_time)
+				val=$(( boot + starttime / 100 ))
+				if [ $(( now - val )) -lt 86400 ]; then
+					printf -v val '%(%H:%M)T' "$val"
+				else
+					printf -v val '%(%b%d)T' "$val"
+				fi ;;
+			f|flag|flags)
+				val=0
+				[ $(( flags & 0x40 )) != 0 ] && val=$(( val | 1 ))
+				[ $(( flags & 0x100 )) != 0 ] && val=$(( val | 4 )) ;;
+			time|cputime)
+				_bt_ps_time $(( utime + stime_t ))
+				val=$_bt_str ;;
+			etime)	_bt_ps_etime $(( now - boot - starttime / 100 ))
+				val=$_bt_str ;;
+			nice|ni)	# a process on a real-time policy has no nice
+					# value to speak of, and ps says so
+					case ${policy:-0} in
+					0|3)	val=$nice_v ;;
+					*)	val='-' ;;
+					esac ;;
+			pri)	val=$(( 39 - prio )) ;;
+			opri)	val=$(( prio + 60 )) ;;
+			pcpu|c)	k=$(( now - boot - starttime / 100 ))
+				[ "$k" -lt 1 ] && k=1
+				n=$(( ( utime + stime_t ) * 10 / k ))
+				[ "$n" -gt 999 ] && n=999
+				if [ "$arg" = c ]; then val=$(( n / 10 ))
+				else printf -v val '%d.%d' $(( n / 10 )) $(( n % 10 )); fi ;;
+			vsz|vsize)	val=$(( vsize / 1024 )) ;;
+			rss|rssize)	val=$vmrss ;;
+			sz)	val=$(( vsize / 4096 )) ;;
+			thcount|nlwp)	val=$threads ;;
+			addr)	val='-' ;;
+			*)	val= ;;
+			esac
+			vals+=("$val")
+		done
+		printf -v line '%s\037' "${vals[@]}"
+		rows+=("$line")
+	done
+
+	# The columns sit at fixed places on the line.  A value too wide for its
+	# column pushes what follows to the right, and the padding of the next
+	# column that has any to spare takes the shift back -- which is how ps
+	# keeps a listing lined up despite the odd enormous number.
+	local -a hw=() ht=() dt=()
+	local pos pad sp
+	n=0
+	for (( i = 0; i < ${#cols[@]}; i++ )); do
+		arg=${cols[i]}
+		rest=${arg#*:}
+		hdr=${rest%%:*}
+		rest=${rest#*:}
+		w=${rest%%:*}
+		[ "${#hdr}" -gt "$w" ] && w=${#hdr}
+		hw+=("$w")
+		ht+=("$n")
+		n=$(( n + w + 1 ))
+		cw+=("${arg##*:}")
+	done
+	n=0
+	for (( i = 0; i < ${#cols[@]}; i++ )); do
+		dt+=("$n")
+		n=$(( n + cw[i] + 1 ))
+	done
+
+	if [ "$noheader" = 0 ]; then
+		line= pos=0
+		for (( i = 0; i < ${#cols[@]}; i++ )); do
+			arg=${cols[i]#*:}; hdr=${arg%%:*}
+			arg=${cols[i]%%:*}
+			if [ "$pos" -lt "${ht[i]}" ]; then pad=$(( ht[i] - pos ))
+			elif [ "$i" -gt 0 ]; then pad=1
+			else pad=0; fi
+			printf -v sp '%*s' "$pad" ''
+			if _bt_ps_right "$arg"; then
+				printf -v val '%*s' "${hw[i]}" "$hdr"
+			else
+				val=$hdr
+			fi
+			line=$line$sp$val
+			pos=$(( pos + pad + ${#val} ))
+		done
+		while [ "${line% }" != "$line" ]; do line=${line% }; done
+		printf '%s\n' "$line"
+	fi
+	for line in ${rows[@]+"${rows[@]}"}; do
+		oldifs=$IFS; IFS=$'\037'
+		# shellcheck disable=SC2206
+		vals=($line)
+		IFS=$oldifs
+		rest= pos=0
+		for (( i = 0; i < ${#cols[@]}; i++ )); do
+			arg=${cols[i]%%:*}
+			val=${vals[i]}
+			if [ "$pos" -lt "${dt[i]}" ]; then pad=$(( dt[i] - pos ))
+			elif [ "$i" -gt 0 ]; then pad=1
+			else pad=0; fi
+			printf -v sp '%*s' "$pad" ''
+			if _bt_ps_right "$arg"; then
+				printf -v val '%*s' "${cw[i]}" "$val"
+			elif [ $(( i + 1 )) -lt "${#cols[@]}" ] &&
+			     [ "${#val}" -gt "${cw[i]}" ]; then
+				# text too wide for its column is cut, but only
+				# where there is another column after it
+				val=${val:0:${cw[i]}}
+			fi
+			rest=$rest$sp$val
+			pos=$(( pos + pad + ${#val} ))
+		done
+		while [ "${rest% }" != "$rest" ]; do rest=${rest% }; done
+		printf '%s\n' "$rest"
+	done
+	# the heading still goes out, but selecting nothing is a failure
+	[ "${#rows[@]}" = 0 ] && return 1
+	return 0
+}
+
+# Whether field $1 is one of the ones ps writes right up against its column.
+_bt_ps_right() {
+	case $1 in
+	pid|ppid|pgid|pgrp|sid|sess|uid|gid|ruid|rgid|time|cputime|etime|nice|ni|\
+	pri|opri|pcpu|c|vsz|vsize|rss|rssize|sz|thcount|nlwp|f|flag|flags|addr)
+		return 0 ;;
+	esac
+	return 1
 }

@@ -80,8 +80,10 @@ Run the test suite with:
 | `nohup` | `nohup utility [argument...]` |
 | `od` | `od [-v] [-A base] [-j skip] [-N count] [-t type]... [file...]` |
 | `paste` | `paste [-s] [-d list] file...` |
+| `patch` | `patch [-blNR] [-c\|-e\|-n\|-u] [-D define] [-i patchfile] [-o outfile] [-p num] [-r rejectfile] [file]` |
 | `pathchk` | `pathchk [-p] pathname...` |
 | `pr` | `pr [+page] [-column] [-adFmrt] [-h header] [-l lines] [-o offset] [-w width] [file...]` |
+| `ps` | `ps [-aA] [-defl] [-G grouplist] [-o format]... [-p proclist] [-t termlist] [-U userlist] [-g grouplist] [-n namelist] [-u userlist]` |
 | `sed` | `sed [-n] script [file...]` · `sed [-n] [-e script]... [-f file]... [file...]` |
 | `sleep` | `sleep time` |
 | `sort` | `sort [-m] [-o out] [-bdfinru] [-t char] [-k keydef]... [file...]` · `sort -c ...` |
@@ -90,14 +92,19 @@ Run the test suite with:
 | `tabs` | `tabs [-n] [+m[n]] [n1[,n2,...]]` |
 | `tail` | `tail [-f] [-c number \| -n number] [file]` |
 | `tee` | `tee [-ai] [file...]` |
+| `tput` | `tput [-T type] operand [parm...]` |
 | `tr` | `tr [-c\|-C] [-s] string1 string2` · `tr -d [-c\|-C] string1` · `tr -s ...` · `tr -ds ...` |
 | `tsort` | `tsort [file]` |
 | `tty` | `tty` |
 | `uname` | `uname [-amnrsv]` |
 | `unexpand` | `unexpand [-a] [-t tablist] [file...]` |
 | `uniq` | `uniq [-c\|-d\|-u] [-f fields] [-s chars] [input [output]]` |
+| `uudecode` | `uudecode [-o outfile] [file]` |
+| `uuencode` | `uuencode [-m] [file] decode_pathname` |
 | `wc` | `wc [-c\|-m] [-lw] [file...]` |
+| `what` | `what [-s] file...` |
 | `who` | `who [-mTu] [file]` |
+| `write` | `write user_name [terminal]` |
 | `xargs` | `xargs [-t] [-E eof] [-I repl] [-L n] [-n n] [-s size] [utility [arg...]]` |
 
 Including the parts that are easy to forget: `--` ends the options and a lone
@@ -139,6 +146,30 @@ padded to the width of the combined size of the regular-file inputs. Since
 `stat()` is unreachable, the counts for every input are gathered *before*
 anything is written — the bytes have to be counted to be known.
 
+**terminfo really is a binary file.** `tput` parses it: six 16-bit counts, the
+terminal's names, one byte per boolean, one word per number, one offset per
+string into a string table, and then the user-defined capabilities after that,
+whose *names* live in the file while the standard ones are known only by their
+position — so the three lists of names, 44 booleans, 39 numbers and 414 strings,
+are part of the source. Capability strings are a stack language of their own
+(`%p1%d`, `%i`, `%?%t%e%;`, `%{2}%*`), so there is a small interpreter for it
+too. All 23,663 capabilities of every terminal on this machine come out byte for
+byte identical to `tput`'s.
+
+**`patch` has to guess where a hunk goes.** A patch says what line to change,
+but the file has usually moved on, so a hunk is looked for outwards from where
+it claims to be, and each hunk that lands somewhere else shifts the search for
+the next one. A hunk with less context at one end than the patch's own context
+width is the one that belongs at that end of the file, and is not looked for
+anywhere else — which is how an already-applied patch is recognised rather than
+applied twice.
+
+**`ps` lines its columns up the way `ps` does.** Each column sits at a fixed
+place on the line; a number too wide for its column pushes what follows to the
+right, and the next column with padding to spare takes the shift back. Nothing
+else reproduces the two-space gap in `SLl  process_api` and the one-space gap in
+`Sl claude` from the same listing.
+
 ## Testing
 
 ```console
@@ -148,7 +179,7 @@ $ ./test.sh
 ### fuzz
 ### id
 ...
-==== pass=6156 fail=0 ====
+==== pass=6643 fail=0 ====
 ```
 
 Every case runs twice — once through the bash function, once through the system
@@ -157,8 +188,14 @@ covers embedded NULs, unterminated lines, empty files, 300 KB of random binary,
 and every sign and magnitude of `-n`/`-c`. A fuzz pass repeats at block sizes
 from 1 byte to 64 KiB to exercise the block-boundary paths. `id` is checked in
 every option form against every user in `/etc/passwd`, and where `setpriv` is
-available, against processes whose real and effective IDs differ. A final case
-runs everything with an empty `PATH`.
+available, against processes whose real and effective IDs differ. `patch` is
+handed random pairs of files in both formats, forwards, backwards, already
+applied and shifted down the file. `tput` is asked for every capability of every
+terminal the machine has a terminfo entry for. `ps` gets a process of its own to
+sit and be inspected, and the system-wide listings are compared on the columns
+that cannot change between two runs. `uuencode` is checked against known
+encodings and round-tripped through `uudecode`. A final case runs everything
+with an empty `PATH`.
 
 ## Limitations, and why they exist
 
@@ -183,6 +220,7 @@ So these are permanently out of reach, not merely unfinished:
 | `mkdir` `rmdir` `rm` `unlink` `link` `ln` `mv` `chmod` `chgrp` `chown` `mkfifo` `touch` | no builtin mutates the filesystem |
 | `df` `du` `ls -l` `find -size/-perm/-mtime` `pax` | no numeric `stat()` of any kind — nothing in `/proc` carries free space either |
 | `stty` `vi` `ex` `more` `talk` | no termios: no raw mode |
+| `mesg` | reports and sets the group-write bit of a terminal: no `stat()` to read it, no `chmod()` to change it |
 | `nice` `renice` `newgrp` `ipcrm` `logger` | `setpriority()`, `setgid()`, SysV IPC, `AF_UNIX` — bash only speaks TCP/UDP |
 | `at` `batch` `crontab` `lp` `uucp` `uustat` `uux` | need a daemon or a mode-protected spool |
 | `c99` `fort77` `strip` | must produce an executable, which needs the exec bit |
@@ -198,20 +236,20 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 47 |
+| implemented here | 54 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
-| **unreachable from a builtin** | **40** |
-| reachable, not yet written | 51 |
+| **unreachable from a builtin** | **41** |
+| reachable, not yet written | 43 |
 
-**The ceiling is 98 of 160**, or about 61% of the standard. Getting past that
+**The ceiling is 97 of 160**, or about 61% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 51 that remain are wildly uneven, too. `true`, `false`, `logname` and
-`printf` are afternoons. `awk`, `sed`, `m4`, `bc`, `make`, `lex` and `yacc` are
-interpreters and compilers, each larger than everything here put together,
-written in a language with no arrays of structs and no way to turn a character
-into an integer except `printf '%d' "'$c"`.
+The 43 that remain are wildly uneven, too. `val`, `sact` and `unget` are
+afternoons. `awk`, `m4`, `bc`, `make`, `lex` and `yacc` are interpreters and
+compilers, each larger than everything here put together, written in a language
+with no arrays of structs and no way to turn a character into an integer except
+`printf '%d' "'$c"`.
 
 ### Smaller deviations, all deliberate
 
@@ -230,6 +268,21 @@ into an integer except `printf '%d' "'$c"`.
 * `fuser` compares each `/proc` entry with `-ef`, having no `stat()` to read
   a device and inode from. `ipcs` reads `/proc/sysvipc`; `ipcrm`, its other
   half, is not here, because removing an object is a syscall.
+* `patch` reads the normal and unified formats. A context diff (`-c`) is not
+  one it understands, and `-D`, `-r` and `-N` are accepted and ignored.
+* `uuencode` has to guess the mode it writes in the header: without `stat()`
+  the only thing a shell can tell about a file's permissions is whether this
+  user may execute it, so it writes 0755 for those and 0644 for the rest.
+  `uudecode` cannot honour a mode it is given either, for want of `chmod()`.
+* `tput init` and `tput reset` write the initialisation strings, which is the
+  part that is a terminal's business; the tab stops and terminal modes that
+  curses would also set need `ioctl()`.
+* `write` decides whether the recipient is accepting messages by trying to open
+  their terminal, since the group-write bit `mesg` toggles is exactly what makes
+  that open succeed or fail.
+* `ps` reads `/proc`, like `who`, `fuser` and `ipcs`, so it wants Linux. Being
+  a shell function, it has no process of its own: where the real `ps` lists
+  itself, this one lists the shell that called it.
 * `who` and `logname` parse the login records themselves, there being no
   `getutent()` to call: on Linux each record is 384 bytes at fixed offsets.
 * `id` and `logname` can't see users served only by NSS (LDAP, SSSD) — reading
