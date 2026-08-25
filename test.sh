@@ -26,7 +26,7 @@ for u in asa basename cat cksum cmp comm cut date dirname env expand expr \
          fold head id nl od paste pathchk sleep sort split strings tabs \
          tail tee tr tsort tty uname unexpand uniq wc join csplit grep xargs \
          nohup pr dd sed who logname diff cal fuser ipcs patch tput \
-         what uuencode uudecode write ps; do
+         what uuencode uudecode write ps ed m4 iconv ar locale; do
 	if [ "$( . "$BT"; type -t "$u" )" != function ]; then
 		echo "$u is not defined as a function after sourcing $BT" >&2
 		exit 1
@@ -1561,6 +1561,427 @@ if command -v ps > /dev/null 2>&1 && [ -r /proc/1/stat ]; then
 
 	kill "$victim" 2>/dev/null
 	wait "$victim" 2>/dev/null
+fi
+
+# --- ed ---------------------------------------------------------------------
+# Nothing here implements ed either, so the strongest check available is the one
+# ed was built for: diff -e writes an ed script, and running it has to turn one
+# file into the other.
+echo "### ed"
+edchk() {	# edchk description script expected
+	local a
+	a=$( printf '%s\n' "$2" | ( . "$BT"; ed -s ed1 ) 2>&1 )
+	if [ "$a" = "$3" ]; then pass=$((pass + 1))
+	else note_fail "ed $1: [$a] not [$3]"; fi
+}
+
+printf 'one\ntwo\nthree\nfour\nfive\n' > ed1
+printf 'a\tb\\c\n' > ed2
+
+edchk "print the lot"     ',p'            "$(printf 'one\ntwo\nthree\nfour\nfive')"
+edchk "print a range"     '2,4p'          "$(printf 'two\nthree\nfour')"
+edchk "number the lines"  '2,3n'          "$(printf '2\ttwo\n3\tthree')"
+edchk "a bare address"    '3'             'three'
+edchk "delete"            "$(printf '2d\n,p')" "$(printf 'one\nthree\nfour\nfive')"
+edchk "append"            "$(printf '2a\nX\n.\n,p')" "$(printf 'one\ntwo\nX\nthree\nfour\nfive')"
+edchk "insert"            "$(printf '2i\nX\n.\n,p')" "$(printf 'one\nX\ntwo\nthree\nfour\nfive')"
+edchk "append at zero"    "$(printf '0a\nX\n.\n,p')" "$(printf 'X\none\ntwo\nthree\nfour\nfive')"
+edchk "change"            "$(printf '2,3c\nX\n.\n,p')" "$(printf 'one\nX\nfour\nfive')"
+edchk "move"             "$(printf '1m$\n,p')" "$(printf 'two\nthree\nfour\nfive\none')"
+edchk "copy"             "$(printf '1t$\n,p')" "$(printf 'one\ntwo\nthree\nfour\nfive\none')"
+edchk "join"             "$(printf '1,2j\n,p')" "$(printf 'onetwo\nthree\nfour\nfive')"
+edchk "substitute"       "$(printf ',s/o/0/g\n,p')" "$(printf '0ne\ntw0\nthree\nf0ur\nfive')"
+edchk "substitute with &" "$(printf '2s/two/[&]/\n2p')" '[two]'
+edchk "a backreference"  "$(printf '3s/\\(th\\)\\(ree\\)/\\2\\1/\n3p')" 'reeth'
+edchk "the p flag"       '1s/one/1/p'    '1'
+edchk "global"           "$(printf 'g/e/s/e/E/\n,p')" "$(printf 'onE\ntwo\nthrEe\nfour\nfivE')"
+edchk "global inverted"  "$(printf 'v/o/s/^/X/\n,p')" "$(printf 'one\ntwo\nXthree\nfour\nXfive')"
+edchk "search forwards"  '/three/'       'three'
+edchk "search backwards" "$(printf '$\n?two?')" "$(printf 'five\ntwo')"
+edchk "relative address" "$(printf '2\n+2p')" "$(printf 'two\nfour')"
+edchk "semicolon range"  '2;4p'          "$(printf 'two\nthree\nfour')"
+edchk "a mark"           "$(printf '2ka\n'"'"'a')" 'two'
+edchk "undo"             "$(printf '1d\nu\n,p')" "$(printf 'one\ntwo\nthree\nfour\nfive')"
+edchk "the last line"    '$='            '5'
+edchk "an unknown command" 'Z'           '?'
+edchk "an address past the end" '99p'    '?'
+edchk "no match to substitute"  '1s/zzz/x/' '?'
+edchk "quitting with changes"   "$(printf '1d\nq')" '?'
+edchk "the H command"    "$(printf 'H\n99p')" "$(printf '?\nInvalid address')"
+
+a=$( printf ',l\n' | ( . "$BT"; ed -s ed2 ) 2>&1 )
+if [ "$a" = 'a\tb\\c$' ]; then pass=$((pass + 1)); else note_fail "ed -l: [$a]"; fi
+
+# without -s it reports byte counts, and w writes what was read
+a=$( printf 'w ed3\nq\n' | ( . "$BT"; ed ed1 ) 2>&1 )
+if [ "$a" = "$(printf '24\n24')" ] && cmp -s ed3 ed1; then pass=$((pass + 1))
+else note_fail "ed byte counts: [$a]"; fi
+( . "$BT"; ed -s ed1 ) < /dev/null > /dev/null 2>&1
+if [ "$?" -eq 0 ]; then pass=$((pass + 1)); else note_fail "ed on end of input should exit 0"; fi
+a=$( printf '99p\nq\n' | ( . "$BT"; ed -s ed1 ) > /dev/null 2>&1; echo $? )
+if [ "$a" = 1 ]; then pass=$((pass + 1)); else note_fail "ed should exit 1 after an error"; fi
+
+# the round trip: diff writes the script, ed has to reproduce the file
+for seed in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+	RANDOM=$seed
+	: > edx
+	n=$(( 3 + RANDOM % 25 ))
+	i=1
+	while [ "$i" -le "$n" ]; do
+		printf 'line%d  tail %d\n' "$((RANDOM % 9))" "$i" >> edx
+		i=$((i + 1))
+	done
+	: > edy
+	i=0
+	while IFS= read -r ln; do
+		i=$((i + 1))
+		[ $(( RANDOM % 5 )) = 0 ] && continue
+		[ $(( RANDOM % 5 )) = 0 ] && printf 'NEW-%d\n' "$i" >> edy
+		printf '%s\n' "$ln" >> edy
+	done < edx
+	[ $(( RANDOM % 2 )) = 0 ] && printf 'TAILLINE\n' >> edy
+	"$(real_of diff)" -e edx edy > edscript
+	printf 'w edout\nq\n' >> edscript
+	rm -f edout
+	cp edx edwork
+	( . "$BT"; ed -s edwork ) < edscript > /dev/null 2>&1
+	if cmp -s edout edy; then pass=$((pass + 1))
+	else note_fail "ed replaying diff -e (case $seed)"; fi
+done
+
+# --- m4 ---------------------------------------------------------------------
+# Compared against the real m4 on inputs that exercise quoting, the argument
+# rules, recursion, diversions and the arithmetic.
+echo "### m4"
+if command -v m4 > /dev/null 2>&1; then
+	RM4=$(real_of m4)
+	mkdir -p m4t
+	cd m4t || exit 1
+
+	cat > m1 <<'M4EOF'
+define(`greet', `Hello, $1!')dnl
+greet(`World')
+greet
+define(`count', `ifelse($1, 0, `', `$1 count(decr($1))')')dnl
+count(5)
+M4EOF
+	cat > m2 <<'M4EOF'
+changequote([,])dnl
+[literal ` and ']
+define([x],[y])x
+changequote`'dnl
+`back to normal' x
+M4EOF
+	cat > m3 <<'M4EOF'
+divert(1)dnl
+first diversion
+divert(2)dnl
+second diversion
+divert(0)dnl
+main text
+undivert(2)
+undivert(1)
+M4EOF
+	cat > m4f <<'M4EOF'
+define(`f', `$#:$*:$@')dnl
+f(a,b,c)
+f()
+f
+define(`g', `$1-$2-$9-')dnl
+g(1,2)
+shift(a,b,c)
+M4EOF
+	cat > m5 <<'M4EOF'
+eval(1+2*3) eval(2**10) eval(7/2) eval(7%3) eval(1<2) eval(1&&0) eval(!0)
+eval(255, 16) eval(255, 2, 16) eval(-5)
+incr(41) decr(0)
+len() len(`abc') index(`abcabc',`ca') index(`abc',`z')
+substr(`hello world', 6) substr(`hello', 1, 2) substr(`hello', 10)
+translit(`abcdef', `a-f') translit(`hello',`lo',`LO')
+M4EOF
+	cat > m6 <<'M4EOF'
+pushdef(`a', `one')a
+pushdef(`a', `two')a
+popdef(`a')a
+popdef(`a')a
+ifdef(`a', `still', `gone')
+m4wrap(`wrapped
+')dnl
+before wrap
+M4EOF
+	cat > m7 <<'M4EOF'
+# a comment with `quotes' and macros define(x,y)
+changecom(`/*', `*/')dnl
+/* another define(z,w) comment */
+after
+changecom()dnl
+# no longer a comment
+M4EOF
+	cat > m8 <<'M4EOF'
+define(`forloop', `pushdef(`$1', `$2')_forloop($@)popdef(`$1')')dnl
+define(`_forloop', `$4`'ifelse($1, `$3', `', `define(`$1', incr($1))_forloop($@)')')dnl
+forloop(`i', 1, 5, `i ')
+define(`fib', `ifelse(eval($1<2), 1, $1, `eval(fib(decr($1)) + fib(decr(decr($1))))')')dnl
+fib(10)
+M4EOF
+	cat > m9 <<'M4EOF'
+define(`quoted', `he said ``hello'' loudly')dnl
+quoted
+define(`parens', `a (b, c) d')dnl
+parens
+define(`withcomma', `x`,'y')dnl
+withcomma
+len(`a(b,c)')
+M4EOF
+	cat > m10 <<'M4EOF'
+defn(`len')
+define(`mylen', defn(`len'))dnl
+mylen(`abcd')
+undefine(`len')dnl
+len(`abcd')
+M4EOF
+	printf 'included content\n' > m4inc
+	cat > m11 <<'M4EOF'
+include(`m4inc')dnl
+sinclude(`nosuchfile')dnl
+after
+M4EOF
+	cat > m12 <<'M4EOF'
+one
+m4exit(3)
+never printed
+M4EOF
+	cat > m13 <<'M4EOF'
+errprint(`to stderr
+')dnl
+define(`a',`1')define(`b',`2')dnl
+a b
+changequote(`[[', `]]')dnl
+[[quoted with a and b]] a
+changequote(`', `')dnl
+a
+M4EOF
+	cat > m14 <<'M4EOF'
+define(`x', `line1
+line2')dnl
+x
+substr(`abcdef', 2, 100)
+eval(10/3) eval(-10/3)
+ifelse(a,b,c)
+ifelse(a,b,c,d,e,f)
+ifelse(a,b,c,d,e,f,g)
+M4EOF
+
+	for f in m1 m2 m3 m4f m5 m6 m7 m8 m9 m10 m11 m12 m13 m14; do
+		a=$( . "$BT"; m4 "$f" 2>/dev/null; echo "rc=$?" )
+		b=$( "$RM4" "$f" 2>/dev/null; echo "rc=$?" )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "m4 $f"; fi
+	done
+
+	a=$( . "$BT"; m4 m13 2>&1 > /dev/null )
+	b=$( "$RM4" m13 2>&1 > /dev/null )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "m4 errprint: [$a] vs [$b]"; fi
+
+	a=$( . "$BT"; m4 < m1 2>/dev/null )
+	b=$( "$RM4" < m1 2>/dev/null )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "m4 reading standard input"; fi
+	a=$( . "$BT"; m4 m4inc m4inc 2>/dev/null )
+	b=$( "$RM4" m4inc m4inc 2>/dev/null )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "m4 over two files"; fi
+	a=$( . "$BT"; m4 nosuchfile 2>/dev/null; echo "rc=$?" )
+	b=$( "$RM4" nosuchfile 2>/dev/null; echo "rc=$?" )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "m4 on a missing file"; fi
+	printf 'FOO BAR BAZ\n' > m15
+	a=$( . "$BT"; m4 -DFOO=1 -DBAR -UBAZ m15 2>/dev/null )
+	b=$( "$RM4" -DFOO=1 -DBAR -UBAZ m15 2>/dev/null )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "m4 -D and -U"; fi
+
+	cd .. || exit 1
+fi
+
+# --- iconv ------------------------------------------------------------------
+# Every character set against every other, in both directions, plus input that
+# is not valid in the set it claims to be.
+echo "### iconv"
+if command -v iconv > /dev/null 2>&1; then
+	RICONV=$(real_of iconv)
+	sets="UTF-8 ASCII ISO-8859-1 ISO-8859-15 CP1252 UTF-16 UTF-16LE UTF-16BE
+	      UTF-32 UTF-32LE UTF-32BE"
+	printf 'Hi \303\251\303\274\303\237 \342\202\254 \360\237\230\200 plain\n' > ic.utf8
+	for t in $sets; do
+		"$RICONV" -c -f UTF-8 -t "$t" < ic.utf8 > "ic.$t" 2>/dev/null
+	done
+	printf 'ok \377\376 bad \303\n' > ic.bad
+	printf 'a\342\202' > ic.trunc
+	for f in $sets; do
+		for t in $sets; do
+			for o in "" -c; do
+				# shellcheck disable=SC2086
+				a=$( . "$BT"; iconv $o -f "$f" -t "$t" < "ic.$f" 2>/dev/null | od -An -tx1; )
+				# shellcheck disable=SC2086
+				ra=$( . "$BT"; iconv $o -f "$f" -t "$t" < "ic.$f" > /dev/null 2>&1; echo $? )
+				# shellcheck disable=SC2086
+				b=$( "$RICONV" $o -f "$f" -t "$t" < "ic.$f" 2>/dev/null | od -An -tx1 )
+				# shellcheck disable=SC2086
+				rb=$( "$RICONV" $o -f "$f" -t "$t" < "ic.$f" > /dev/null 2>&1; echo $? )
+				if [ "$a" = "$b" ] && [ "$ra" = "$rb" ]; then pass=$((pass + 1))
+				else note_fail "iconv $f -> $t $o (rc $ra vs $rb)"; fi
+			done
+		done
+	done
+	for f in $sets; do
+		for src in ic.bad ic.trunc; do
+			for o in "" -c -s -cs; do
+				# shellcheck disable=SC2086
+				a=$( . "$BT"; iconv $o -f "$f" -t UTF-8 < "$src" 2>/dev/null | od -An -tx1 )
+				# shellcheck disable=SC2086
+				ra=$( . "$BT"; iconv $o -f "$f" -t UTF-8 < "$src" > /dev/null 2>&1; echo $? )
+				# shellcheck disable=SC2086
+				b=$( "$RICONV" $o -f "$f" -t UTF-8 < "$src" 2>/dev/null | od -An -tx1 )
+				# shellcheck disable=SC2086
+				rb=$( "$RICONV" $o -f "$f" -t UTF-8 < "$src" > /dev/null 2>&1; echo $? )
+				if [ "$a" = "$b" ] && [ "$ra" = "$rb" ]; then pass=$((pass + 1))
+				else note_fail "iconv $src as $f $o (rc $ra vs $rb)"; fi
+			done
+		done
+	done
+	a=$( . "$BT"; iconv -f UTF-8 -t ISO-8859-15 ic.utf8 2>/dev/null | od -An -tx1 )
+	b=$( "$RICONV" -f UTF-8 -t ISO-8859-15 ic.utf8 2>/dev/null | od -An -tx1 )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "iconv naming a file"; fi
+	( . "$BT"; iconv -f NOSUCHSET -t UTF-8 < ic.utf8 ) > /dev/null 2>&1; a=$?
+	"$RICONV" -f NOSUCHSET -t UTF-8 < ic.utf8 > /dev/null 2>&1; b=$?
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "iconv on an unknown set ($a vs $b)"; fi
+	a=$( . "$BT"; iconv -l 2>/dev/null | wc -l )
+	if [ "$a" -ge 10 ]; then pass=$((pass + 1)); else note_fail "iconv -l should list what it knows"; fi
+fi
+
+# --- ar ---------------------------------------------------------------------
+# Archives are compared byte for byte against the ones the real ar writes,
+# which is possible because ar now defaults to putting zeroes in the date and
+# owner fields -- the very fields a shell has no way to fill in.
+echo "### ar"
+if command -v ar > /dev/null 2>&1; then
+	RAR=$(real_of ar)
+	mkdir -p art
+	cd art || exit 1
+	printf 'hello file one\n' > a1
+	printf 'second\n' > a2
+	printf 'third file contents here\n' > a3
+	printf 'odd' > aodd
+	printf 'x\n' > a-very-long-member-name
+	head -c 300 /dev/urandom > abin
+
+	arboth() {	# arboth key args... with @ standing in for the archive
+		local key=$1 i
+		shift
+		local -a oa=() ra=()
+		for i in "$@"; do
+			case $i in
+			@)	oa+=(ours.a); ra+=(ref.a) ;;
+			*)	oa+=("$i"); ra+=("$i") ;;
+			esac
+		done
+		( . "$BT"; ar "$key" "${oa[@]}" ) > /dev/null 2>&1
+		"$RAR" "$key" "${ra[@]}" > /dev/null 2>&1
+		if cmp -s ours.a ref.a; then pass=$((pass + 1))
+		else note_fail "ar $key $*"; fi
+	}
+
+	rm -f ours.a ref.a; arboth rc @ a1 a2 a3
+	rm -f ours.a ref.a; arboth rc @ aodd a2
+	rm -f ours.a ref.a; arboth rc @ a-very-long-member-name a1
+	rm -f ours.a ref.a; arboth rc @ abin
+	rm -f ours.a ref.a; arboth rc @ a1 a2 a3 a-very-long-member-name aodd abin
+
+	"$RAR" rc base.a a1 a2 a3 a-very-long-member-name aodd abin 2>/dev/null
+	for spec in "t base.a" "tv base.a" "t base.a a1 a3"; do
+		# shellcheck disable=SC2086
+		a=$( . "$BT"; ar $spec 2>&1 )
+		# shellcheck disable=SC2086
+		b=$( "$RAR" $spec 2>&1 )
+		if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "ar $spec"; fi
+	done
+	a=$( . "$BT"; ar p base.a a2 2>&1 )
+	b=$( "$RAR" p base.a a2 2>&1 )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "ar p"; fi
+	a=$( . "$BT"; ar p base.a abin | od -An -tx1 )
+	b=$( "$RAR" p base.a abin | od -An -tx1 )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "ar p over binary"; fi
+
+	for spec in "d a2" "d abin" "q aodd" "r a1" "m a1" "m a3"; do
+		cp base.a ours.a; cp base.a ref.a
+		# shellcheck disable=SC2086
+		set -- $spec
+		key=$1; shift
+		( . "$BT"; ar "$key" ours.a "$@" ) > /dev/null 2>&1
+		"$RAR" "$key" ref.a "$@" > /dev/null 2>&1
+		if cmp -s ours.a ref.a; then pass=$((pass + 1)); else note_fail "ar $spec"; fi
+	done
+	for spec in "rb a2" "ra a2" "ri a3"; do
+		cp base.a ours.a; cp base.a ref.a
+		# shellcheck disable=SC2086
+		set -- $spec
+		key=$1; shift
+		( . "$BT"; ar "$key" "$1" ours.a a1 ) > /dev/null 2>&1
+		"$RAR" "$key" "$1" ref.a a1 > /dev/null 2>&1
+		if cmp -s ours.a ref.a; then pass=$((pass + 1)); else note_fail "ar $spec"; fi
+	done
+
+	rm -rf xo xr
+	mkdir -p xo xr
+	( cd xo && . "$BT"; ar x ../base.a ) > /dev/null 2>&1
+	( cd xr && "$RAR" x ../base.a ) > /dev/null 2>&1
+	n=0
+	for f in a1 a2 a3 a-very-long-member-name aodd abin; do
+		cmp -s "xo/$f" "xr/$f" || n=$((n + 1))
+	done
+	if [ "$n" = 0 ]; then pass=$((pass + 1)); else note_fail "ar x: $n members differ"; fi
+
+	# the diagnostics, once the program's own name is taken off the front
+	rm -f ours.a ref.a
+	a=$( . "$BT"; ar r ours.a a1 2>&1 | "$(real_of sed)" 's|^.*/ar:|ar:|;s|ours\.a|A|' )
+	b=$( "$RAR" r ref.a a1 2>&1 | "$(real_of sed)" 's|^.*/ar:|ar:|;s|ref\.a|A|' )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "ar creating an archive: [$a] vs [$b]"; fi
+	( . "$BT"; ar t nosuch.a ) > /dev/null 2>&1
+	if [ "$?" -ne 0 ]; then pass=$((pass + 1)); else note_fail "ar should fail on a missing archive"; fi
+
+	cd .. || exit 1
+fi
+
+# --- locale -----------------------------------------------------------------
+echo "### locale"
+if command -v locale > /dev/null 2>&1; then
+	RLOCALE=$(real_of locale)
+	a=$( . "$BT"; locale 2>/dev/null )
+	b=$( "$RLOCALE" 2>/dev/null )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "locale with no operand"; fi
+	a=$( LANG=C; export LANG; . "$BT"; locale 2>/dev/null )
+	b=$( LANG=C "$RLOCALE" 2>/dev/null )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "locale with LANG set"; fi
+	a=$( LC_CTYPE=C; export LC_CTYPE; . "$BT"; locale 2>/dev/null )
+	b=$( LC_CTYPE=C "$RLOCALE" 2>/dev/null )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "locale with a category set"; fi
+	a=$( . "$BT"; locale -a 2>/dev/null )
+	b=$( "$RLOCALE" -a 2>/dev/null )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "locale -a"; fi
+	a=$( . "$BT"; locale -m 2>/dev/null | wc -l )
+	if [ "$a" -gt 100 ]; then pass=$((pass + 1)); else note_fail "locale -m should list the charmaps"; fi
+	for k in decimal_point thousands_sep grouping int_curr_symbol currency_symbol \
+		 mon_decimal_point mon_grouping positive_sign int_frac_digits frac_digits \
+		 p_cs_precedes p_sign_posn abday day abmon mon d_t_fmt d_fmt t_fmt \
+		 am_pm t_fmt_ampm yesexpr noexpr yesstr nostr charmap; do
+		for o in "" -k -ck; do
+			# shellcheck disable=SC2086
+			a=$( . "$BT"; locale $o "$k" 2>&1 )
+			# shellcheck disable=SC2086
+			b=$( "$RLOCALE" $o "$k" 2>&1 )
+			if [ "$a" = "$b" ]; then pass=$((pass + 1))
+			else note_fail "locale $o $k: [$a] vs [$b]"; fi
+		done
+	done
+	a=$( . "$BT"; locale nosuchname 2>&1 | "$(real_of sed)" 's|^.*/locale:|locale:|'; echo "rc=$?" )
+	b=$( "$RLOCALE" nosuchname 2>&1 | "$(real_of sed)" 's|^.*/locale:|locale:|'; echo "rc=$?" )
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "locale on an unknown name"; fi
 fi
 
 # --- the pure-bash claim itself -------------------------------------------

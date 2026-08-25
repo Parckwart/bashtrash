@@ -52,6 +52,7 @@ Run the test suite with:
 
 | utility | synopsis |
 | --- | --- |
+| `ar` | `ar -d\|-m\|-p\|-q\|-r\|-t\|-x [-abcisuv] [posname] archive [file...]` |
 | `asa` | `asa [file...]` |
 | `basename` | `basename string [suffix]` |
 | `cal` | `cal [[month] year]` |
@@ -65,6 +66,7 @@ Run the test suite with:
 | `dd` | `dd [operand...]` (`if` `of` `bs` `ibs` `obs` `count` `skip` `conv`) |
 | `diff` | `diff [-bi] [-e] file1 file2` |
 | `dirname` | `dirname string` |
+| `ed` | `ed [-p string] [-s] [file]` |
 | `env` | `env [-i] [name=value]... [utility [argument...]]` |
 | `expand` | `expand [-t tablist] [file...]` |
 | `expr` | `expr operand...` |
@@ -72,10 +74,13 @@ Run the test suite with:
 | `fuser` | `fuser [-cfu] file...` |
 | `grep` | `grep [-E\|-F] [-c\|-l\|-q] [-insvx] [-e pattern] [-f file] [file...]` |
 | `head` | `head [-n number] [file...]` |
+| `iconv` | `iconv [-cs] [-f frommap] [-t tomap] [file...]` · `iconv -l` |
 | `id` | `id [user]` · `id -G [-n] [user]` · `id -g [-nr] [user]` · `id -u [-nr] [user]` |
 | `ipcs` | `ipcs [-qms]` |
 | `join` | `join [-a n] [-e s] [-o list] [-t c] [-v n] [-1 f] [-2 f] file1 file2` |
+| `locale` | `locale [-a\|-m]` · `locale [-ck] name...` |
 | `logname` | `logname` |
+| `m4` | `m4 [-s] [-D name[=value]]... [-U name]... [file...]` |
 | `nl` | `nl [-p] [-b type] [-d delim] [-f type] [-h type] [-i incr] [-l num] [-n format] [-s sep] [-v start] [-w width] [file]` |
 | `nohup` | `nohup utility [argument...]` |
 | `od` | `od [-v] [-A base] [-j skip] [-N count] [-t type]... [file...]` |
@@ -170,6 +175,21 @@ right, and the next column with padding to spare takes the shift back. Nothing
 else reproduces the two-space gap in `SLl  process_api` and the one-space gap in
 `Sl claude` from the same listing.
 
+**`m4` puts what a macro expanded to back in front of the cursor** and reads it
+again, which is m4's whole model and the reason a macro can call itself. The
+arguments of a call are collected with their quoting intact and expanded on
+their own before the call is made, so `` `foo' `` arrives as text and `foo`
+arrives as whatever `foo` is. `eval` hands its expression to the shell's
+arithmetic, but only after checking that every character in it belongs to an
+expression — otherwise `eval(PATH)` would quietly become something interesting.
+
+**`ed` is checked by the thing it exists for.** `diff -e` writes an ed script,
+so running that script has to turn one file into the other — which exercises
+every address form, `a`, `c`, `d`, `s` and `w` at once, against a diff nobody
+here wrote. Its regular expressions and its `s` command are `sed`'s: the same
+BRE-to-ERE translation, the same substitution loop with `&`, `\1` and the rule
+that an empty match where the last one ended is not a second match.
+
 ## Testing
 
 ```console
@@ -236,17 +256,17 @@ So the arithmetic looks like this:
 | | count |
 | --- | ---: |
 | POSIX.1-2017 utilities | 160 |
-| implemented here | 54 |
+| implemented here | 59 |
 | already bash builtins (`cd`, `echo`, `printf`, `read`, `test`, `kill`, `wait`, …) | 22 |
 | **unreachable from a builtin** | **41** |
-| reachable, not yet written | 43 |
+| reachable, not yet written | 38 |
 
 **The ceiling is 97 of 160**, or about 61% of the standard. Getting past that
 would need bash's loadable builtins — which are C, and would rather defeat the
 point.
 
-The 43 that remain are wildly uneven, too. `val`, `sact` and `unget` are
-afternoons. `awk`, `m4`, `bc`, `make`, `lex` and `yacc` are interpreters and
+The 38 that remain are wildly uneven, too. `val`, `sact` and `unget` are
+afternoons. `awk`, `bc`, `make`, `lex` and `yacc` are interpreters and
 compilers, each larger than everything here put together, written in a language
 with no arrays of structs and no way to turn a character into an integer except
 `printf '%d' "'$c"`.
@@ -283,6 +303,24 @@ with no arrays of structs and no way to turn a character into an integer except
 * `ps` reads `/proc`, like `who`, `fuser` and `ipcs`, so it wants Linux. Being
   a shell function, it has no process of its own: where the real `ps` lists
   itself, this one lists the shell that called it.
+* `ar` writes 0 for the date and the owner and 644 for the mode, which is what
+  `ar` itself writes in the deterministic mode it defaults to now — and just as
+  well, since `stat()` is unreachable. It does not build the symbol table that
+  `ar s` and `ranlib` maintain for archives of object files.
+* `locale` answers exactly what the environment asks for, and its keyword
+  values are the ones the standard fixes for the POSIX locale. Any other
+  locale's data lives in a compiled archive that nothing here can read, so
+  those are the values that come out whatever `LANG` says. `locale -m` lists
+  the character maps this machine has descriptions of, by their file names:
+  three of the 236 glibc reports are named differently inside the file, which
+  is gzipped and so out of reach.
+* `iconv` knows the character sets a shell can carry a table for: the Unicode
+  encodings, ASCII, Latin-1, Latin-9 and Windows-1252. Everything is converted
+  through code points, so any of them converts to any other; `iconv -l` lists
+  those eleven rather than the several hundred glibc has.
+* `ed` writes its `?` to standard output, as the standard describes, and the
+  message behind it only once `H` has asked for it. Its `!` command has nothing
+  to run a command with and says so.
 * `who` and `logname` parse the login records themselves, there being no
   `getutent()` to call: on Linux each record is 384 bytes at fixed offsets.
 * `id` and `logname` can't see users served only by NSS (LDAP, SSSD) — reading

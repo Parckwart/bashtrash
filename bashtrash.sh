@@ -8572,3 +8572,2147 @@ _bt_ps_right() {
 	esac
 	return 1
 }
+
+# ---------------------------------------------------------------------------
+# ed -- POSIX.1-2017: ed [-p string] [-s] [file]
+#
+# The buffer is one array of lines; a line number is its index plus one.  The
+# regular expressions and the s command borrow sed's machinery, which is the
+# same machinery ed's own description asks for.
+#
+# The ? that marks an error goes to standard output, as the standard says, and
+# the message behind it only when H has asked for it.
+# ---------------------------------------------------------------------------
+
+# Report an error: the caller decides what to do next.
+_bt_ed_oops() {
+	_bt_ed_msg=$1
+	_bt_ed_bad=1
+	printf '?\n'
+	[ "$_bt_ed_help" = 1 ] && printf '%s\n' "$_bt_ed_msg"
+	return 1
+}
+
+# Parse one address out of `cmd` at `ci` into _bt_ed_addr, -1 when there is
+# none.  Relies on its caller's locals.
+_bt_ed_addr1() {
+	local n c re dir sign i found
+	_bt_ed_addr=-1
+	while [ "${cmd:ci:1}" = ' ' ] || [ "${cmd:ci:1}" = $'\t' ]; do
+		ci=$(( ci + 1 ))
+	done
+	c=${cmd:ci:1}
+	case $c in
+	.)	_bt_ed_addr=$cur; ci=$(( ci + 1 )) ;;
+	'$')	_bt_ed_addr=${#buf[@]}; ci=$(( ci + 1 )) ;;
+	[0-9])	n=
+		while :; do
+			case ${cmd:ci:1} in
+			[0-9])	n=$n${cmd:ci:1}; ci=$(( ci + 1 )) ;;
+			*)	break ;;
+			esac
+		done
+		_bt_ed_addr=$(( 10#$n )) ;;
+	"'")	ci=$(( ci + 1 ))
+		c=${cmd:ci:1}
+		ci=$(( ci + 1 ))
+		_bt_ed_addr=${_bt_ed_mark[$c]--1}
+		[ "$_bt_ed_addr" -lt 0 ] && { _bt_ed_oops "Invalid mark"; return 1; } ;;
+	'/'|'?')
+		dir=$c
+		ci=$(( ci + 1 ))
+		re=
+		while [ "$ci" -lt "${#cmd}" ] && [ "${cmd:ci:1}" != "$dir" ]; do
+			if [ "${cmd:ci:1}" = '\' ]; then
+				re=$re${cmd:ci:1}
+				ci=$(( ci + 1 ))
+			fi
+			re=$re${cmd:ci:1}
+			ci=$(( ci + 1 ))
+		done
+		[ "${cmd:ci:1}" = "$dir" ] && ci=$(( ci + 1 ))
+		[ -n "$re" ] || re=$_bt_lastre
+		if [ -z "$re" ]; then _bt_ed_oops "No previous pattern"; return 1; fi
+		_bt_lastre=$re
+		_bt_sed_re "$re"
+		found=-1
+		if [ "$dir" = / ]; then
+			for (( i = 1; i <= ${#buf[@]}; i++ )); do
+				n=$(( (cur + i - 1) % ${#buf[@]} ))
+				if [[ ${buf[n]} =~ $_bt_re ]]; then found=$(( n + 1 )); break; fi
+			done
+		else
+			for (( i = 1; i <= ${#buf[@]}; i++ )); do
+				n=$(( (cur - i - 1 + 2 * ${#buf[@]}) % ${#buf[@]} ))
+				if [[ ${buf[n]} =~ $_bt_re ]]; then found=$(( n + 1 )); break; fi
+			done
+		fi
+		if [ "$found" -lt 0 ]; then _bt_ed_oops "No match"; return 1; fi
+		_bt_ed_addr=$found ;;
+	esac
+	while :; do
+		case ${cmd:ci:1} in
+		'+'|'-')
+			sign=${cmd:ci:1}
+			ci=$(( ci + 1 ))
+			n=
+			while :; do
+				case ${cmd:ci:1} in
+				[0-9])	n=$n${cmd:ci:1}; ci=$(( ci + 1 )) ;;
+				*)	break ;;
+				esac
+			done
+			[ -n "$n" ] || n=1
+			[ "$_bt_ed_addr" -lt 0 ] && _bt_ed_addr=$cur
+			if [ "$sign" = + ]; then _bt_ed_addr=$(( _bt_ed_addr + 10#$n ))
+			else _bt_ed_addr=$(( _bt_ed_addr - 10#$n )); fi ;;
+		*)	break ;;
+		esac
+	done
+	return 0
+}
+
+# Parse a whole address range into a1 and a2, and say in `nad` how many
+# addresses were actually given.  Relies on its caller's locals.
+_bt_ed_range() {
+	nad=0
+	if [ "${cmd:ci:1}" = '%' ]; then
+		ci=$(( ci + 1 ))
+		a1=1 a2=${#buf[@]} nad=2
+		return 0
+	fi
+	_bt_ed_addr1 || return 1
+	if [ "$_bt_ed_addr" -ge 0 ]; then a1=$_bt_ed_addr a2=$_bt_ed_addr nad=1; fi
+	while [ "${cmd:ci:1}" = ',' ] || [ "${cmd:ci:1}" = ';' ]; do
+		if [ "${cmd:ci:1}" = ';' ] && [ "$nad" -gt 0 ]; then cur=$a2; fi
+		ci=$(( ci + 1 ))
+		[ "$nad" = 0 ] && a1=1
+		_bt_ed_addr1 || return 1
+		if [ "$_bt_ed_addr" -ge 0 ]; then
+			a2=$_bt_ed_addr
+		else
+			a2=${#buf[@]}
+		fi
+		[ "$nad" = 0 ] && { a1=1; nad=1; }
+		nad=2
+	done
+	return 0
+}
+
+# Read lines from the input up to a lone dot into the `ins` array.
+_bt_ed_input() {
+	local line
+	ins=()
+	while IFS= read -r line <&"$infd"; do
+		[ "$line" = '.' ] && return 0
+		ins+=("$line")
+	done
+	return 0
+}
+
+# Print lines $1..$2 in style $3: p plain, n numbered, l unambiguous.
+_bt_ed_print() {
+	local i s c j out
+	for (( i = $1; i <= $2; i++ )); do
+		s=${buf[i-1]}
+		case $3 in
+		n)	printf '%d\t%s\n' "$i" "$s" ;;
+		l)	out=
+			for (( j = 0; j < ${#s}; j++ )); do
+				c=${s:j:1}
+				case $c in
+				'\')	out=$out'\\' ;;
+				$'\a')	out=$out'\a' ;;
+				$'\b')	out=$out'\b' ;;
+				$'\f')	out=$out'\f' ;;
+				$'\n')	out=$out'\n' ;;
+				$'\r')	out=$out'\r' ;;
+				$'\t')	out=$out'\t' ;;
+				$'\v')	out=$out'\v' ;;
+				*)	_bt_ord "$c"
+					if [ "$_bt_n" -lt 32 ] || [ "$_bt_n" -gt 126 ]; then
+						printf -v c '\\%03o' "$_bt_n"
+					fi
+					out=$out$c ;;
+				esac
+			done
+			printf '%s$\n' "$out" ;;
+		*)	printf '%s\n' "$s" ;;
+		esac
+	done
+	cur=$2
+	return 0
+}
+
+ed () {
+	local LC_ALL=C
+	local prompt= silent=0 fname= cmd ci a1 a2 nad c line i j n rest
+	local cur=0 modified=0 infd=0 fd bytes tmp suffix style
+	local _bt_ed_msg= _bt_ed_help=0 _bt_ed_bad=0 _bt_ed_addr
+	local _bt_lastre= _bt_lastrep= _bt_re status=0
+	local -a buf=() ins=() undo=() _bt_ed_gl=()
+	local -A _bt_ed_mark=()
+	local undocur=0 haveundo=0 quit=0
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-s|-)	silent=1; shift ;;
+		-p)	shift
+			if [ "$#" = 0 ]; then
+				_bt_err "ed: option requires an argument -- p"
+				return 1
+			fi
+			prompt=$1; shift ;;
+		-p*)	prompt=${1#-p}; shift ;;
+		-*)	_bt_err "ed: illegal option -- ${1#-}"
+			_bt_err "usage: ed [-p string] [-s] [file]"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -gt 1 ]; then
+		_bt_err "usage: ed [-p string] [-s] [file]"
+		return 1
+	fi
+	[ "$#" = 1 ] && fname=$1
+
+	if [ -n "$fname" ]; then
+		bytes=0
+		if { exec {fd}<"$fname"; } 2>/dev/null; then
+			line=
+			while IFS= read -r line <&"$fd"; do
+				buf+=("$line")
+				bytes=$(( bytes + ${#line} + 1 ))
+				line=
+			done
+			if [ -n "$line" ]; then
+				buf+=("$line")
+				bytes=$(( bytes + ${#line} ))
+			fi
+			exec {fd}<&-
+			cur=${#buf[@]}
+			[ "$silent" = 1 ] || printf '%d\n' "$bytes"
+		else
+			[ "$silent" = 1 ] || printf '%s: No such file or directory\n' "$fname" >&2
+			_bt_ed_msg="Cannot open input file"
+		fi
+	fi
+
+	while :; do
+		[ -n "$prompt" ] && printf '%s' "$prompt"
+		IFS= read -r cmd <&"$infd" || break
+		_bt_ed_one
+		[ "$quit" = 1 ] && break
+	done
+
+	[ "$_bt_ed_bad" = 1 ] && return 1
+	return 0
+}
+
+# Run the command sitting in `cmd`.  Relies on ed's locals, which is what lets
+# the global commands hand it a command of their own.
+_bt_ed_one() {
+	local ci a1 a2 nad c rest i j n line bytes fd
+	local -a ins=()
+	ci=0
+	a1=$cur a2=$cur
+	_bt_ed_range || return 1
+	while [ "${cmd:ci:1}" = ' ' ]; do ci=$(( ci + 1 )); done
+	c=${cmd:ci:1}
+	ci=$(( ci + 1 ))
+	rest=${cmd:ci}
+
+	case $c in
+	'')	# a bare address prints that line
+		if [ "$nad" = 0 ]; then a1=$(( cur + 1 )) a2=$a1; fi
+		if [ "$a1" -lt 1 ] || [ "$a2" -gt "${#buf[@]}" ] || [ "$a1" -gt "$a2" ]; then
+			_bt_ed_oops "Invalid address"; return 1
+		fi
+		_bt_ed_print "$a1" "$a2" p ;;
+	a|i)	if [ "$nad" = 0 ]; then a1=$cur a2=$cur; fi
+		if [ "$c" = i ] && [ "$a1" -gt 0 ]; then a1=$(( a1 - 1 )); fi
+		if [ "$a1" -lt 0 ] || [ "$a1" -gt "${#buf[@]}" ]; then
+			_bt_ed_oops "Invalid address"; return 1
+		fi
+		_bt_ed_save
+		_bt_ed_input
+		if [ "${#ins[@]}" -gt 0 ]; then
+			buf=( ${buf[@]+"${buf[@]:0:a1}"} "${ins[@]}" \
+			      ${buf[@]+"${buf[@]:a1}"} )
+			cur=$(( a1 + ${#ins[@]} ))
+			modified=1
+		fi ;;
+	c)	if [ "$nad" = 0 ]; then a1=$cur a2=$cur; fi
+		if [ "$a1" -lt 1 ] || [ "$a2" -gt "${#buf[@]}" ] || [ "$a1" -gt "$a2" ]; then
+			_bt_ed_oops "Invalid address"; return 1
+		fi
+		_bt_ed_save
+		_bt_ed_input
+		buf=( ${buf[@]+"${buf[@]:0:a1-1}"} ${ins[@]+"${ins[@]}"} \
+		      ${buf[@]+"${buf[@]:a2}"} )
+		cur=$(( a1 - 1 + ${#ins[@]} ))
+		modified=1 ;;
+	d)	if [ "$nad" = 0 ]; then a1=$cur a2=$cur; fi
+		if [ "$a1" -lt 1 ] || [ "$a2" -gt "${#buf[@]}" ] || [ "$a1" -gt "$a2" ]; then
+			_bt_ed_oops "Invalid address"; return 1
+		fi
+		_bt_ed_save
+		buf=( ${buf[@]+"${buf[@]:0:a1-1}"} ${buf[@]+"${buf[@]:a2}"} )
+		cur=$(( a1 - 1 ))
+		[ "$cur" -lt 1 ] && [ "${#buf[@]}" -gt 0 ] && cur=1
+		modified=1 ;;
+	'=')	if [ "$nad" = 0 ]; then printf '%d\n' "${#buf[@]}"
+		else printf '%d\n' "$a2"; fi ;;
+	p|n|l)	if [ "$nad" = 0 ]; then a1=$cur a2=$cur; fi
+		if [ "$a1" -lt 1 ] || [ "$a2" -gt "${#buf[@]}" ] || [ "$a1" -gt "$a2" ]; then
+			_bt_ed_oops "Invalid address"; return 1
+		fi
+		_bt_ed_print "$a1" "$a2" "$c" ;;
+	f)	rest=${rest# }
+		if [ -n "$rest" ]; then fname=$rest; fi
+		printf '%s\n' "$fname" ;;
+	h)	[ -n "$_bt_ed_msg" ] && printf '%s\n' "$_bt_ed_msg" ;;
+	H)	if [ "$_bt_ed_help" = 1 ]; then _bt_ed_help=0
+		else
+			_bt_ed_help=1
+			[ -n "$_bt_ed_msg" ] && printf '%s\n' "$_bt_ed_msg"
+		fi ;;
+	P)	if [ -n "$prompt" ]; then prompt=; else prompt='*'; fi ;;
+	j)	if [ "$nad" = 0 ]; then a1=$cur a2=$(( cur + 1 )); fi
+		[ "$nad" = 1 ] && a2=$(( a1 + 1 ))
+		if [ "$a1" -lt 1 ] || [ "$a2" -gt "${#buf[@]}" ] || [ "$a1" -ge "$a2" ]; then
+			_bt_ed_oops "Invalid address"; return 1
+		fi
+		_bt_ed_save
+		line=
+		for (( i = a1; i <= a2; i++ )); do line=$line${buf[i-1]}; done
+		buf=( ${buf[@]+"${buf[@]:0:a1-1}"} "$line" ${buf[@]+"${buf[@]:a2}"} )
+		cur=$a1
+		modified=1 ;;
+	k)	if [ "$nad" = 0 ]; then a2=$cur; fi
+		c=${cmd:ci:1}
+		if [ -z "$c" ] || [ "$a2" -lt 1 ] || [ "$a2" -gt "${#buf[@]}" ]; then
+			_bt_ed_oops "Invalid mark"; return 1
+		fi
+		_bt_ed_mark[$c]=$a2 ;;
+	m|t)	if [ "$nad" = 0 ]; then a1=$cur a2=$cur; fi
+		if [ "$a1" -lt 1 ] || [ "$a2" -gt "${#buf[@]}" ] || [ "$a1" -gt "$a2" ]; then
+			_bt_ed_oops "Invalid address"; return 1
+		fi
+		_bt_ed_addr1 || return 1
+		n=$_bt_ed_addr
+		if [ "$n" -lt 0 ] || [ "$n" -gt "${#buf[@]}" ]; then
+			_bt_ed_oops "Invalid address"; return 1
+		fi
+		if [ "$c" = m ] && [ "$n" -ge "$a1" ] && [ "$n" -lt "$a2" ]; then
+			_bt_ed_oops "Invalid destination"; return 1
+		fi
+		_bt_ed_save
+		ins=( "${buf[@]:a1-1:a2-a1+1}" )
+		if [ "$c" = m ]; then
+			buf=( ${buf[@]+"${buf[@]:0:a1-1}"} ${buf[@]+"${buf[@]:a2}"} )
+			[ "$n" -gt "$a2" ] && n=$(( n - (a2 - a1 + 1) ))
+		fi
+		buf=( ${buf[@]+"${buf[@]:0:n}"} "${ins[@]}" ${buf[@]+"${buf[@]:n}"} )
+		cur=$(( n + ${#ins[@]} ))
+		modified=1 ;;
+	s)	if [ "$nad" = 0 ]; then a1=$cur a2=$cur; fi
+		if [ "$a1" -lt 1 ] || [ "$a2" -gt "${#buf[@]}" ] || [ "$a1" -gt "$a2" ]; then
+			_bt_ed_oops "Invalid address"; return 1
+		fi
+		_bt_ed_dosub || return 1 ;;
+	g|v|G|V)
+		if [ "$nad" = 0 ]; then a1=1 a2=${#buf[@]}; fi
+		_bt_ed_global || return 1 ;;
+	r)	rest=${rest# }
+		[ -n "$rest" ] || rest=$fname
+		if [ -z "$rest" ]; then _bt_ed_oops "No current filename"; return 1; fi
+		if [ "$nad" = 0 ]; then a2=${#buf[@]}; fi
+		if ! { exec {fd}<"$rest"; } 2>/dev/null; then
+			_bt_ed_oops "Cannot open input file"; return 1
+		fi
+		_bt_ed_save
+		ins=() bytes=0
+		line=
+		while IFS= read -r line <&"$fd"; do
+			ins+=("$line")
+			bytes=$(( bytes + ${#line} + 1 ))
+			line=
+		done
+		if [ -n "$line" ]; then ins+=("$line"); bytes=$(( bytes + ${#line} )); fi
+		exec {fd}<&-
+		[ -n "$fname" ] || fname=$rest
+		if [ "${#ins[@]}" -gt 0 ]; then
+			buf=( ${buf[@]+"${buf[@]:0:a2}"} "${ins[@]}" \
+			      ${buf[@]+"${buf[@]:a2}"} )
+			cur=$(( a2 + ${#ins[@]} ))
+			modified=1
+		fi
+		[ "$silent" = 1 ] || printf '%d\n' "$bytes" ;;
+	e|E)	rest=${rest# }
+		if [ "$c" = e ] && [ "$modified" = 1 ]; then
+			modified=0
+			_bt_ed_oops "Warning: buffer modified"
+			return 1
+		fi
+		[ -n "$rest" ] || rest=$fname
+		if [ -z "$rest" ]; then _bt_ed_oops "No current filename"; return 1; fi
+		if ! { exec {fd}<"$rest"; } 2>/dev/null; then
+			_bt_ed_oops "Cannot open input file"; return 1
+		fi
+		_bt_ed_save
+		buf=() bytes=0
+		line=
+		while IFS= read -r line <&"$fd"; do
+			buf+=("$line")
+			bytes=$(( bytes + ${#line} + 1 ))
+			line=
+		done
+		if [ -n "$line" ]; then buf+=("$line"); bytes=$(( bytes + ${#line} )); fi
+		exec {fd}<&-
+		fname=$rest
+		cur=${#buf[@]}
+		modified=0
+		[ "$silent" = 1 ] || printf '%d\n' "$bytes" ;;
+	w|W)	rest=${rest# }
+		[ -n "$rest" ] || rest=$fname
+		if [ -z "$rest" ]; then _bt_ed_oops "No current filename"; return 1; fi
+		if [ "$nad" = 0 ]; then a1=1 a2=${#buf[@]}; fi
+		if [ "$c" = W ]; then
+			exec {fd}>>"$rest" 2>/dev/null
+		else
+			exec {fd}>"$rest" 2>/dev/null
+		fi
+		if [ -z "${fd:-}" ]; then _bt_ed_oops "Cannot open output file"; return 1; fi
+		bytes=0
+		for (( i = a1; i <= a2; i++ )); do
+			printf '%s\n' "${buf[i-1]}" >&"$fd"
+			bytes=$(( bytes + ${#buf[i-1]} + 1 ))
+		done
+		exec {fd}>&-
+		[ -n "$fname" ] || fname=$rest
+		modified=0
+		[ "$silent" = 1 ] || printf '%d\n' "$bytes" ;;
+	u)	if [ "$haveundo" = 0 ]; then _bt_ed_oops "Nothing to undo"; return 1; fi
+		ins=( ${buf[@]+"${buf[@]}"} )
+		n=$cur
+		buf=( ${undo[@]+"${undo[@]}"} )
+		cur=$undocur
+		undo=( ${ins[@]+"${ins[@]}"} )
+		undocur=$n
+		modified=1 ;;
+	q|Q)	if [ "$c" = q ] && [ "$modified" = 1 ]; then
+			modified=0
+			_bt_ed_oops "Warning: buffer modified"
+			return 1
+		fi
+		quit=1
+		return 0 ;;
+	'!')	_bt_ed_oops "Cannot run a command: there is nothing to run it with"
+		return 1 ;;
+	*)	_bt_ed_oops "Unknown command"
+		return 1 ;;
+	esac
+	return 0
+}
+
+# Remember the buffer so u can put it back.  Relies on its caller's locals.
+_bt_ed_save() {
+	undo=( ${buf[@]+"${buf[@]}"} )
+	undocur=$cur
+	haveundo=1
+	return 0
+}
+
+# The s command, over lines a1..a2.  Relies on its caller's locals.
+_bt_ed_dosub() {
+	local delim re rep flags i any=0 subflag pat
+	delim=${cmd:ci:1}
+	if [ -z "$delim" ]; then _bt_ed_oops "Invalid pattern delimiter"; return 1; fi
+	ci=$(( ci + 1 ))
+	re=
+	while [ "$ci" -lt "${#cmd}" ] && [ "${cmd:ci:1}" != "$delim" ]; do
+		if [ "${cmd:ci:1}" = '\' ]; then
+			re=$re${cmd:ci:1}
+			ci=$(( ci + 1 ))
+		fi
+		re=$re${cmd:ci:1}
+		ci=$(( ci + 1 ))
+	done
+	[ "${cmd:ci:1}" = "$delim" ] && ci=$(( ci + 1 ))
+	rep=
+	while [ "$ci" -lt "${#cmd}" ] && [ "${cmd:ci:1}" != "$delim" ]; do
+		if [ "${cmd:ci:1}" = '\' ]; then
+			rep=$rep${cmd:ci:1}
+			ci=$(( ci + 1 ))
+		fi
+		rep=$rep${cmd:ci:1}
+		ci=$(( ci + 1 ))
+	done
+	[ "${cmd:ci:1}" = "$delim" ] && ci=$(( ci + 1 ))
+	flags=${cmd:ci}
+	[ -n "$re" ] || re=$_bt_lastre
+	if [ -z "$re" ]; then _bt_ed_oops "No previous pattern"; return 1; fi
+	if [ "$rep" = '%' ]; then rep=$_bt_lastrep; fi
+	_bt_lastrep=$rep
+	_bt_ed_save
+	for (( i = a1; i <= a2; i++ )); do
+		pat=${buf[i-1]}
+		subflag=0
+		_bt_sed_sub "$re" "$rep" "${flags//[pnl]/}"
+		if [ "$subflag" = 1 ]; then
+			buf[i-1]=$pat
+			cur=$i
+			any=1
+			modified=1
+		fi
+	done
+	if [ "$any" = 0 ]; then _bt_ed_oops "No match"; return 1; fi
+	case $flags in
+	*p*)	_bt_ed_print "$cur" "$cur" p ;;
+	*n*)	_bt_ed_print "$cur" "$cur" n ;;
+	*l*)	_bt_ed_print "$cur" "$cur" l ;;
+	esac
+	return 0
+}
+
+# The g, v, G and V commands.  Relies on its caller's locals.
+_bt_ed_global() {
+	local delim re i n inverse=0 interactive=0 sub line
+	local -a marked=()
+	case $c in
+	v|V)	inverse=1 ;;
+	esac
+	case $c in
+	G|V)	interactive=1 ;;
+	esac
+	delim=${cmd:ci:1}
+	if [ -z "$delim" ]; then _bt_ed_oops "Invalid pattern delimiter"; return 1; fi
+	ci=$(( ci + 1 ))
+	re=
+	while [ "$ci" -lt "${#cmd}" ] && [ "${cmd:ci:1}" != "$delim" ]; do
+		if [ "${cmd:ci:1}" = '\' ]; then
+			re=$re${cmd:ci:1}
+			ci=$(( ci + 1 ))
+		fi
+		re=$re${cmd:ci:1}
+		ci=$(( ci + 1 ))
+	done
+	[ "${cmd:ci:1}" = "$delim" ] && ci=$(( ci + 1 ))
+	[ -n "$re" ] || re=$_bt_lastre
+	if [ -z "$re" ]; then _bt_ed_oops "No previous pattern"; return 1; fi
+	_bt_lastre=$re
+	_bt_sed_re "$re"
+	sub=${cmd:ci}
+	[ -n "$sub" ] || sub=p
+	for (( i = a1; i <= a2; i++ )); do
+		if [[ ${buf[i-1]} =~ $_bt_re ]]; then
+			[ "$inverse" = 0 ] && marked+=("${buf[i-1]}")
+		else
+			[ "$inverse" = 1 ] && marked+=("${buf[i-1]}")
+		fi
+	done
+	# The marked lines are remembered by content, since the commands run over
+	# them may move everything around underneath.
+	for line in ${marked[@]+"${marked[@]}"}; do
+		n=-1
+		for (( i = 1; i <= ${#buf[@]}; i++ )); do
+			if [ "${buf[i-1]}" = "$line" ]; then n=$i; break; fi
+		done
+		[ "$n" -lt 0 ] && continue
+		cur=$n
+		if [ "$interactive" = 1 ]; then
+			_bt_ed_print "$n" "$n" p
+			IFS= read -r cmd <&"$infd" || break
+			[ -z "$cmd" ] && continue
+		else
+			cmd=$sub
+		fi
+		_bt_ed_one
+	done
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# m4 -- POSIX.1-2017: m4 [-s] [-D name[=val]]... [-U name]... [file...]
+#
+# The input is a string with a cursor in it.  What a macro expands to is put
+# back in front of the cursor and read again, which is m4's whole model; the
+# arguments of a call are collected with the quoting intact and expanded on
+# their own before the call is made.
+# ---------------------------------------------------------------------------
+
+# The names of the built-in macros, so that they can be told from a definition.
+_BT_M4_BUILTINS='define undefine defn pushdef popdef ifdef ifelse shift dnl
+	dumpdef errprint eval include sinclude incr decr index len substr
+	translit changequote changecom divert divnum undivert m4exit m4wrap
+	maketemp mkstemp syscmd sysval traceon traceoff'
+
+# Move the text gathered so far into the diversion it belongs to.  Relies on
+# its caller's locals.
+_bt_m4_flush() {
+	local pre rest
+	# a built-in that found its way into the text prints as nothing
+	while [ "${out#*$'\001'}" != "$out" ]; do
+		pre=${out%%$'\001'*}
+		rest=${out#*$'\001'}
+		while :; do
+			case $rest in
+			[a-z]*)	rest=${rest#?} ;;
+			*)	break ;;
+			esac
+		done
+		out=$pre$rest
+	done
+	if [ "$divnum" = 0 ]; then
+		printf '%s' "$out"
+	elif [ "$divnum" -gt 0 ]; then
+		divs[divnum]=${divs[divnum]-}$out
+	fi
+	out=
+	return 0
+}
+
+# Read the quoted string at `p` into _bt_m4_str, quotes stripped, nesting
+# honoured.  Relies on its caller's locals.
+_bt_m4_quoted() {
+	local depth=1 s=
+	p=$(( p + ${#lq} ))
+	while [ "$p" -lt "${#in}" ]; do
+		if [ "${in:p:${#lq}}" = "$lq" ]; then
+			depth=$(( depth + 1 ))
+			s=$s$lq
+			p=$(( p + ${#lq} ))
+		elif [ "${in:p:${#rq}}" = "$rq" ]; then
+			depth=$(( depth - 1 ))
+			p=$(( p + ${#rq} ))
+			[ "$depth" = 0 ] && break
+			s=$s$rq
+		else
+			s=$s${in:p:1}
+			p=$(( p + 1 ))
+		fi
+	done
+	_bt_m4_str=$s
+	return 0
+}
+
+# Collect the arguments of a call, cursor just past the opening parenthesis,
+# into the `args` array, still quoted.  Relies on its caller's locals.
+_bt_m4_rawargs() {
+	local depth=1 cur= c seen=0
+	args=()
+	# leading blanks before an argument are not part of it
+	while :; do
+		case ${in:p:1} in
+		' '|$'\t'|$'\n')	p=$(( p + 1 )) ;;
+		*)			break ;;
+		esac
+	done
+	while [ "$p" -lt "${#in}" ]; do
+		if [ "${in:p:${#lq}}" = "$lq" ]; then
+			local q=$p
+			_bt_m4_skipquoted
+			cur=$cur${in:q:p-q}
+			seen=1
+			continue
+		fi
+		c=${in:p:1}
+		case $c in
+		'(')	depth=$(( depth + 1 )); cur=$cur$c; p=$(( p + 1 )); seen=1 ;;
+		')')	depth=$(( depth - 1 ))
+			p=$(( p + 1 ))
+			if [ "$depth" = 0 ]; then
+				args+=("$cur")
+				return 0
+			fi
+			cur=$cur$c
+			seen=1 ;;
+		',')	if [ "$depth" = 1 ]; then
+				args+=("$cur")
+				cur=
+				seen=0
+				p=$(( p + 1 ))
+				while :; do
+					case ${in:p:1} in
+					' '|$'\t'|$'\n')	p=$(( p + 1 )) ;;
+					*)			break ;;
+					esac
+				done
+			else
+				cur=$cur$c
+				p=$(( p + 1 ))
+			fi ;;
+		*)	cur=$cur$c; p=$(( p + 1 )); seen=1 ;;
+		esac
+	done
+	args+=("$cur")
+	return 0
+}
+
+# Step the cursor over a quoted string without keeping it.  Relies on its
+# caller's locals.
+_bt_m4_skipquoted() {
+	local depth=1
+	p=$(( p + ${#lq} ))
+	while [ "$p" -lt "${#in}" ]; do
+		if [ "${in:p:${#lq}}" = "$lq" ]; then
+			depth=$(( depth + 1 ))
+			p=$(( p + ${#lq} ))
+		elif [ "${in:p:${#rq}}" = "$rq" ]; then
+			depth=$(( depth - 1 ))
+			p=$(( p + ${#rq} ))
+			[ "$depth" = 0 ] && return 0
+		else
+			p=$(( p + 1 ))
+		fi
+	done
+	return 0
+}
+
+# Expand $1 on its own and leave the result in _bt_m4_str.
+_bt_m4_expand() {
+	local _bt_m4_str
+	_bt_m4_process "$1"
+	_bt_m4_str=$_bt_m4_res
+	_bt_m4_res=$_bt_m4_str
+	return 0
+}
+
+# Expand the a-z ranges in a translit set into _bt_m4_str.
+_bt_m4_set() {
+	local s=$1 out= i c lo hi j
+	for (( i = 0; i < ${#s}; i++ )); do
+		c=${s:i:1}
+		if [ "$c" = '-' ] && [ -n "$out" ] && [ $(( i + 1 )) -lt "${#s}" ]; then
+			_bt_ord "${out: -1}"; lo=$_bt_n
+			_bt_ord "${s:i+1:1}"; hi=$_bt_n
+			i=$(( i + 1 ))
+			if [ "$lo" -le "$hi" ]; then
+				for (( j = lo + 1; j <= hi; j++ )); do
+					_bt_chr "$j"; out=$out$_bt_c
+				done
+			else
+				for (( j = lo - 1; j >= hi; j-- )); do
+					_bt_chr "$j"; out=$out$_bt_c
+				done
+			fi
+			continue
+		fi
+		out=$out$c
+	done
+	_bt_m4_str=$out
+	return 0
+}
+
+# Evaluate an m4 arithmetic expression.  Only the characters an expression can
+# be made of are allowed through, so that the shell cannot be handed a name to
+# look up.
+_bt_m4_eval() {
+	local e=$1 v
+	case $e in
+	*[!0-9+\ \	*/%\(\)\<\>=\!\&\|^~-]*)
+		_bt_err "m4: bad expression in eval: $1"
+		_bt_m4_str=
+		return 1 ;;
+	esac
+	[ -n "${e//[ 	]/}" ] || { _bt_m4_str=0; return 0; }
+	v=$(( e ))
+	_bt_m4_str=$v
+	return 0
+}
+
+# Write $1 in base $2, padded to at least $3 digits, into _bt_m4_str.
+_bt_m4_radix() {
+	local v=$1 base=$2 width=${3:-1} neg= d s=
+	local digits=0123456789abcdefghijklmnopqrstuvwxyz
+	if [ "$base" -lt 2 ] || [ "$base" -gt 36 ]; then
+		_bt_err "m4: radix out of range in eval: $base"
+		_bt_m4_str=
+		return 1
+	fi
+	if [ "$v" -lt 0 ]; then neg=-; v=$(( -v )); fi
+	if [ "$v" = 0 ]; then s=0; fi
+	while [ "$v" -gt 0 ]; do
+		d=$(( v % base ))
+		s=${digits:d:1}$s
+		v=$(( v / base ))
+	done
+	while [ "${#s}" -lt "$width" ]; do s=0$s; done
+	_bt_m4_str=$neg$s
+	return 0
+}
+
+# Call macro $1 with the collected `args`; the expansion goes in _bt_m4_str.
+# Relies on its caller's locals.
+_bt_m4_call() {
+	local name=$1 body i j n c s t from to nargs _bt_n _bt_c
+	local a1=${args[0]-} a2=${args[1]-} a3=${args[2]-} a4=${args[3]-}
+	nargs=${#args[@]}
+	body=${def[$name]}
+	_bt_m4_str=
+
+	case $body in
+	$'\001'*)	;;
+	*)	# a macro of one's own: the arguments go where the $s are
+		s=
+		for (( i = 0; i < ${#body}; i++ )); do
+			c=${body:i:1}
+			if [ "$c" != '$' ] || [ $(( i + 1 )) -ge "${#body}" ]; then
+				s=$s$c
+				continue
+			fi
+			i=$(( i + 1 ))
+			case ${body:i:1} in
+			[0-9])	n=${body:i:1}
+				if [ "$n" = 0 ]; then s=$s$name
+				else s=$s${args[n-1]-}; fi ;;
+			'#')	s=$s$nargs ;;
+			'*')	t=
+				for (( j = 0; j < nargs; j++ )); do
+					[ "$j" -gt 0 ] && t=$t,
+					t=$t${args[j]}
+				done
+				s=$s$t ;;
+			'@')	t=
+				for (( j = 0; j < nargs; j++ )); do
+					[ "$j" -gt 0 ] && t=$t,
+					t=$t$lq${args[j]}$rq
+				done
+				s=$s$t ;;
+			*)	s=$s'$'${body:i:1} ;;
+			esac
+		done
+		_bt_m4_str=$s
+		return 0 ;;
+	esac
+
+	case ${body#$'\001'} in
+	define)		[ -n "$a1" ] && def[$a1]=$a2 ;;
+	undefine)	[ -n "$a1" ] && unset "def[$a1]" ;;
+	defn)		if [ -n "${def[$a1]+x}" ]; then
+				case ${def[$a1]} in
+				$'\001'*)	_bt_m4_str=${def[$a1]} ;;
+				*)		_bt_m4_str=$lq${def[$a1]}$rq ;;
+				esac
+			fi ;;
+	pushdef)	if [ -n "$a1" ]; then
+				n=${depth[$a1]-0}
+				if [ -n "${def[$a1]+x}" ]; then
+					stackv[$a1.$n]=${def[$a1]}
+					stackd[$a1.$n]=1
+				else
+					stackd[$a1.$n]=0
+				fi
+				depth[$a1]=$(( n + 1 ))
+				def[$a1]=$a2
+			fi ;;
+	popdef)		if [ -n "$a1" ] && [ "${depth[$a1]-0}" -gt 0 ]; then
+				n=$(( depth[$a1] - 1 ))
+				depth[$a1]=$n
+				if [ "${stackd[$a1.$n]}" = 1 ]; then
+					def[$a1]=${stackv[$a1.$n]}
+				else
+					unset "def[$a1]"
+				fi
+			elif [ -n "$a1" ]; then
+				unset "def[$a1]"
+			fi ;;
+	ifdef)		if [ -n "${def[$a1]+x}" ]; then _bt_m4_str=$a2
+			else _bt_m4_str=$a3; fi ;;
+	ifelse)		if [ "$nargs" -le 1 ]; then
+				_bt_m4_str=
+			else
+				i=0
+				while [ $(( i + 1 )) -lt "$nargs" ]; do
+					if [ "${args[i]}" = "${args[i+1]}" ]; then
+						_bt_m4_str=${args[i+2]-}
+						break
+					fi
+					if [ $(( i + 4 )) -ge "$nargs" ]; then
+						[ $(( i + 3 )) -lt "$nargs" ] &&
+							_bt_m4_str=${args[i+3]}
+						break
+					fi
+					i=$(( i + 3 ))
+				done
+			fi ;;
+	shift)		t=
+			for (( j = 1; j < nargs; j++ )); do
+				[ "$j" -gt 1 ] && t=$t,
+				t=$t$lq${args[j]}$rq
+			done
+			_bt_m4_str=$t ;;
+	dnl)		while [ "$p" -lt "${#in}" ] && [ "${in:p:1}" != $'\n' ]; do
+				p=$(( p + 1 ))
+			done
+			[ "$p" -lt "${#in}" ] && p=$(( p + 1 )) ;;
+	dumpdef)	if [ "$nargs" -le 1 ] && [ -z "$a1" ]; then
+				for i in "${!def[@]}"; do
+					printf '%s:\t%s\n' "$i" "${def[$i]}" >&2
+				done
+			else
+				for i in "${args[@]}"; do
+					printf '%s:\t%s\n' "$i" "${def[$i]-}" >&2
+				done
+			fi ;;
+	errprint)	t=
+			for (( j = 0; j < nargs; j++ )); do
+				[ "$j" -gt 0 ] && t=$t' '
+				t=$t${args[j]}
+			done
+			printf '%s' "$t" >&2 ;;
+	eval)		if _bt_m4_eval "$a1"; then
+				if [ -n "$a2" ]; then
+					_bt_m4_radix "$_bt_m4_str" "$a2" "${a3:-1}"
+				fi
+			fi ;;
+	incr)		_bt_m4_eval "${a1:-0}" && _bt_m4_str=$(( _bt_m4_str + 1 )) ;;
+	decr)		_bt_m4_eval "${a1:-0}" && _bt_m4_str=$(( _bt_m4_str - 1 )) ;;
+	len)		_bt_m4_str=${#a1} ;;
+	index)		_bt_m4_str=-1
+			n=${#a1}
+			for (( j = 0; j <= n - ${#a2}; j++ )); do
+				if [ "${a1:j:${#a2}}" = "$a2" ]; then
+					_bt_m4_str=$j
+					break
+				fi
+			done ;;
+	substr)		n=${#a1}
+			i=${a2:-0}
+			[ "$i" -lt 0 ] && i=0
+			if [ "$nargs" -ge 3 ] && [ -n "$a3" ]; then j=$a3
+			else j=$(( n - i )); fi
+			[ "$j" -lt 0 ] && j=0
+			_bt_m4_str=${a1:i:j} ;;
+	translit)	_bt_m4_set "$a2"; from=$_bt_m4_str
+			_bt_m4_set "$a3"; to=$_bt_m4_str
+			s=
+			for (( j = 0; j < ${#a1}; j++ )); do
+				c=${a1:j:1}
+				t=${from%%"$c"*}
+				if [ "${#t}" -lt "${#from}" ]; then
+					if [ "${#t}" -lt "${#to}" ]; then
+						s=$s${to:${#t}:1}
+					fi
+				else
+					s=$s$c
+				fi
+			done
+			_bt_m4_str=$s ;;
+	changequote)	if [ "$nargs" -le 1 ] && [ -z "$a1" ]; then lq='`' rq="'"
+			else lq=${a1:-'`'} rq=${a2:-"'"}; fi ;;
+	changecom)	if [ "$nargs" -le 1 ] && [ -z "$a1" ]; then com= ecom=
+			else com=$a1 ecom=${a2:-$'\n'}; fi ;;
+	divert)		_bt_m4_flush
+			divnum=${a1:-0}
+			case $divnum in
+			''|*[!0-9-]*)	divnum=0 ;;
+			esac ;;
+	divnum)		_bt_m4_str=$divnum ;;
+	undivert)	_bt_m4_flush
+			if [ "$nargs" -le 1 ] && [ -z "$a1" ]; then
+				for (( j = 1; j < 10; j++ )); do
+					if [ -n "${divs[j]-}" ]; then
+						out=$out${divs[j]}
+						divs[j]=
+					fi
+				done
+			else
+				for i in "${args[@]}"; do
+					case $i in
+					''|*[!0-9]*)	continue ;;
+					esac
+					[ "$i" = 0 ] && continue
+					out=$out${divs[i]-}
+					divs[i]=
+				done
+			fi ;;
+	m4exit)		_bt_m4_flush
+			status=${a1:-0}
+			case $status in
+			''|*[!0-9]*)	status=0 ;;
+			esac
+			quit=1 ;;
+	m4wrap)		wrap+=("$a1") ;;
+	maketemp|mkstemp)
+			s=$a1
+			t=${s%%XXXXXX*}
+			if [ "${#t}" -lt "${#s}" ]; then
+				printf -v c '%06d' $(( (BASHPID + RANDOM) % 1000000 ))
+				_bt_m4_str=$t$c${s:${#t}+6}
+				: > "$_bt_m4_str" 2>/dev/null
+			else
+				_bt_m4_str=$s
+			fi ;;
+	syscmd|sysval)
+			if [ "${body#$'\001'}" = syscmd ]; then
+				_bt_err "m4: syscmd: no way to run a command here"
+				sysval=127
+			else
+				_bt_m4_str=$sysval
+			fi ;;
+	include|sinclude)
+			if [ -r "$a1" ]; then
+				s=
+				t=
+				while IFS= read -r c; do s=$s$t$c; t=$'\n'; done < "$a1"
+				# a file that ends in a newline keeps it
+				[ -n "$s" ] && s=$s$'\n'
+				_bt_m4_str=$s
+			elif [ "${body#$'\001'}" = include ]; then
+				_bt_err "m4: cannot open $a1"
+				status=1
+			fi ;;
+	traceon|traceoff)	;;
+	esac
+	return 0
+}
+
+# Expand $1; the result lands in _bt_m4_res.
+_bt_m4_process() {
+	local in=$1 p=0 out= name c fast
+	local -a args=()
+	local _bt_m4_str
+	while [ "$p" -lt "${#in}" ]; do
+		if [ "${in:p:${#lq}}" = "$lq" ]; then
+			_bt_m4_quoted
+			out=$out$_bt_m4_str
+			continue
+		fi
+		if [ -n "$com" ] && [ "${in:p:${#com}}" = "$com" ]; then
+			out=$out$com
+			p=$(( p + ${#com} ))
+			while [ "$p" -lt "${#in}" ]; do
+				if [ "${in:p:${#ecom}}" = "$ecom" ]; then
+					out=$out$ecom
+					p=$(( p + ${#ecom} ))
+					break
+				fi
+				out=$out${in:p:1}
+				p=$(( p + 1 ))
+			done
+			continue
+		fi
+		c=${in:p:1}
+		case $c in
+		[A-Za-z_])
+			name=
+			while :; do
+				case ${in:p:1} in
+				[A-Za-z0-9_])	name=$name${in:p:1}; p=$(( p + 1 )) ;;
+				*)		break ;;
+				esac
+			done
+			if [ -n "${def[$name]+x}" ]; then
+				args=()
+				if [ "${in:p:1}" = '(' ]; then
+					p=$(( p + 1 ))
+					_bt_m4_rawargs
+					for (( c = 0; c < ${#args[@]}; c++ )); do
+						_bt_m4_process "${args[c]}"
+						args[c]=$_bt_m4_res
+					done
+				fi
+				_bt_m4_call "$name"
+				[ "$quit" = 1 ] && break
+				case $_bt_m4_str in
+				$'\001'*)
+					# what defn hands back is a built-in
+					# itself, not text to be read again
+					out=$out$_bt_m4_str ;;
+				*)	in=$_bt_m4_str${in:p}
+					p=0 ;;
+				esac
+			else
+				out=$out$name
+			fi ;;
+		*)	# a run of ordinary text can go over in one piece
+			if [[ ${in:p} =~ ^([^A-Za-z_$'\001'${lq:0:1}${com:0:1}]+) ]]; then
+				out=$out${BASH_REMATCH[1]}
+				p=$(( p + ${#BASH_REMATCH[1]} ))
+			else
+				out=$out$c
+				p=$(( p + 1 ))
+			fi ;;
+		esac
+	done
+	_bt_m4_res=$out
+	return 0
+}
+
+m4 () {
+	local LC_ALL=C
+	local arg opt val name text file line t i status=0 quit=0 sysval=0
+	local lq='`' rq="'" com='#' ecom=$'\n' divnum=0 out= sync=0
+	local _bt_m4_res _bt_m4_str
+	local -A def=() stackv=() stackd=() depth=()
+	local -a divs=() wrap=() args=()
+
+	for name in $_BT_M4_BUILTINS; do
+		def[$name]=$'\001'$name
+	done
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-s)	sync=1; shift ;;
+		-D|-U)	opt=${1#-}
+			shift
+			if [ "$#" = 0 ]; then
+				_bt_err "m4: option requires an argument -- $opt"
+				return 1
+			fi
+			val=$1; shift
+			if [ "$opt" = D ]; then
+				case $val in
+				*=*)	def[${val%%=*}]=${val#*=} ;;
+				*)	def[$val]= ;;
+				esac
+			else
+				unset "def[$val]"
+			fi ;;
+		-D*)	val=${1#-D}; shift
+			case $val in
+			*=*)	def[${val%%=*}]=${val#*=} ;;
+			*)	def[$val]= ;;
+			esac ;;
+		-U*)	val=${1#-U}; shift; unset "def[$val]" ;;
+		-*)	[ "$1" = - ] && break
+			_bt_err "m4: illegal option -- ${1#-}"
+			_bt_err "usage: m4 [-s] [-D name[=value]]... [-U name]... [file...]"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+
+	text=
+	if [ "$#" = 0 ]; then set -- -; fi
+	for file in "$@"; do
+		t=
+		if [ "$file" = - ]; then
+			line=
+			while IFS= read -r line; do t=$t$line$'\n'; line=; done
+			[ -n "$line" ] && t=$t$line
+		elif [ -r "$file" ]; then
+			line=
+			while IFS= read -r line; do t=$t$line$'\n'; line=; done < "$file"
+			[ -n "$line" ] && t=$t$line
+		else
+			_bt_err "m4: cannot open $file"
+			status=1
+			continue
+		fi
+		text=$text$t
+	done
+
+	_bt_m4_process "$text"
+	out=$out$_bt_m4_res
+	for (( i = 0; i < ${#wrap[@]} && quit == 0; i++ )); do
+		_bt_m4_process "${wrap[i]}"
+		out=$out$_bt_m4_res
+	done
+	_bt_m4_flush
+	divnum=0
+	for (( i = 1; i < 10; i++ )); do
+		[ -n "${divs[i]-}" ] && printf '%s' "${divs[i]}"
+	done
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# iconv -- POSIX.1-2017:
+#	iconv [-cs] -f frommap -t tomap [file...]
+#	iconv -f fromcode [-cs] [-t tocode] [file...]
+#	iconv -l
+#
+# Input is decoded to code points and the code points are encoded again, so any
+# pair of the character sets below can be converted to any other.  The sets are
+# the ones a shell can carry a table for: the Unicode encodings, ASCII, the two
+# Latin ones and the Windows page that is so often mistaken for them.
+# ---------------------------------------------------------------------------
+
+# byte:code point, for the places where a set differs from Latin-1
+_BT_ICONV_8859_15='164:8364 166:352 168:353 180:381 184:382 188:338 189:339 190:376'
+_BT_ICONV_1252='128:8364 130:8218 131:402 132:8222 133:8230 134:8224 135:8225
+	136:710 137:8240 138:352 139:8249 140:338 142:381 145:8216 146:8217
+	147:8220 148:8221 149:8226 150:8211 151:8212 152:732 153:8482 154:353
+	155:8250 156:339 158:382 159:376'
+
+# The canonical name of character set $1, in _bt_str; empty when it is not one
+# of the sets here.
+_bt_iconv_norm() {
+	local n=${1^^}
+	n=${n%//TRANSLIT}
+	n=${n%//IGNORE}
+	case $n in
+	UTF-8|UTF8)			_bt_str=UTF-8 ;;
+	ASCII|US-ASCII|ANSI_X3.4-1968|ISO-IR-6|646|IBM367|CP367)
+					_bt_str=ASCII ;;
+	ISO-8859-1|ISO8859-1|ISO_8859-1|LATIN1|L1|IBM819|CP819)
+					_bt_str=8859-1 ;;
+	ISO-8859-15|ISO8859-15|ISO_8859-15|LATIN9|L9)
+					_bt_str=8859-15 ;;
+	CP1252|WINDOWS-1252|MS-ANSI)	_bt_str=1252 ;;
+	UTF-16|UTF16)			_bt_str=UTF-16 ;;
+	UTF-16LE|UTF16LE|UCS-2LE)	_bt_str=UTF-16LE ;;
+	UTF-16BE|UTF16BE|UCS-2BE)	_bt_str=UTF-16BE ;;
+	UTF-32|UTF32|UCS-4)		_bt_str=UTF-32 ;;
+	UTF-32LE|UTF32LE|UCS-4LE)	_bt_str=UTF-32LE ;;
+	UTF-32BE|UTF32BE|UCS-4BE)	_bt_str=UTF-32BE ;;
+	*)				_bt_str= ; return 1 ;;
+	esac
+	return 0
+}
+
+# Decode the bytes in _bt_b as character set $1 into the `cps` array.  Relies
+# on its caller's locals for `drop` and `status`.
+_bt_iconv_decode() {
+	local set=$1 n=${#_bt_b[@]} i=0 b c j need cp pair lo hi
+	local -A tbl=()
+	cps=()
+	case $set in
+	8859-15)	for pair in $_BT_ICONV_8859_15; do tbl[${pair%%:*}]=${pair#*:}; done ;;
+	1252)		for pair in $_BT_ICONV_1252; do tbl[${pair%%:*}]=${pair#*:}; done ;;
+	esac
+	case $set in
+	UTF-8)
+		while [ "$i" -lt "$n" ]; do
+			b=${_bt_b[i]}
+			if [ "$b" -lt 128 ]; then
+				cps+=("$b"); i=$(( i + 1 )); continue
+			fi
+			if [ "$b" -ge 240 ] && [ "$b" -le 247 ]; then need=3 cp=$(( b & 7 ))
+			elif [ "$b" -ge 224 ]; then need=2 cp=$(( b & 15 ))
+			elif [ "$b" -ge 192 ]; then need=1 cp=$(( b & 31 ))
+			else
+				_bt_iconv_bad "$i" || return 1
+				i=$(( i + 1 )); continue
+			fi
+			if [ $(( i + need )) -ge "$n" ]; then
+				# a sequence cut off by the end of the input is
+				# not something -c can paper over
+				_bt_iconv_short
+				return 1
+			fi
+			c=1
+			for (( j = 1; j <= need; j++ )); do
+				b=${_bt_b[i+j]}
+				if [ "$b" -lt 128 ] || [ "$b" -gt 191 ]; then c=0; break; fi
+				cp=$(( cp << 6 | (b & 63) ))
+			done
+			if [ "$c" = 0 ] || ! _bt_iconv_ok "$cp" ||
+			   { [ "$need" = 1 ] && [ "$cp" -lt 128 ]; } ||
+			   { [ "$need" = 2 ] && [ "$cp" -lt 2048 ]; } ||
+			   { [ "$need" = 3 ] && [ "$cp" -lt 65536 ]; }; then
+				_bt_iconv_bad "$i" || return 1
+				i=$(( i + 1 )); continue
+			fi
+			cps+=("$cp")
+			i=$(( i + need + 1 ))
+		done ;;
+	ASCII)
+		while [ "$i" -lt "$n" ]; do
+			b=${_bt_b[i]}
+			if [ "$b" -gt 127 ]; then
+				_bt_iconv_bad "$i" || return 1
+			else
+				cps+=("$b")
+			fi
+			i=$(( i + 1 ))
+		done ;;
+	8859-1|8859-15|1252)
+		while [ "$i" -lt "$n" ]; do
+			b=${_bt_b[i]}
+			cp=${tbl[$b]-$b}
+			if [ "$set" = 1252 ] && [ "$b" -ge 128 ] && [ "$b" -le 159 ] &&
+			   [ -z "${tbl[$b]-}" ]; then
+				_bt_iconv_bad "$i" || return 1
+			else
+				cps+=("$cp")
+			fi
+			i=$(( i + 1 ))
+		done ;;
+	UTF-16|UTF-16LE|UTF-16BE)
+		local big=0
+		[ "$set" = UTF-16BE ] && big=1
+		if [ "$set" = UTF-16 ]; then
+			big=0
+			if [ "$n" -ge 2 ]; then
+				if [ "${_bt_b[0]}" = 255 ] && [ "${_bt_b[1]}" = 254 ]; then
+					big=0; i=2
+				elif [ "${_bt_b[0]}" = 254 ] && [ "${_bt_b[1]}" = 255 ]; then
+					big=1; i=2
+				fi
+			fi
+		fi
+		while [ $(( i + 1 )) -lt "$n" ]; do
+			if [ "$big" = 1 ]; then cp=$(( _bt_b[i] << 8 | _bt_b[i+1] ))
+			else cp=$(( _bt_b[i+1] << 8 | _bt_b[i] )); fi
+			i=$(( i + 2 ))
+			if [ "$cp" -ge 55296 ] && [ "$cp" -le 56319 ]; then
+				if [ $(( i + 1 )) -ge "$n" ]; then
+					_bt_iconv_short
+					return 1
+				fi
+				if [ "$big" = 1 ]; then lo=$(( _bt_b[i] << 8 | _bt_b[i+1] ))
+				else lo=$(( _bt_b[i+1] << 8 | _bt_b[i] )); fi
+				if [ "$lo" -lt 56320 ] || [ "$lo" -gt 57343 ]; then
+					_bt_iconv_bad $(( i - 2 )) || return 1
+					continue
+				fi
+				cp=$(( 65536 + ((cp - 55296) << 10) + (lo - 56320) ))
+				i=$(( i + 2 ))
+			elif [ "$cp" -ge 56320 ] && [ "$cp" -le 57343 ]; then
+				_bt_iconv_bad $(( i - 2 )) || return 1
+				continue
+			fi
+			cps+=("$cp")
+		done
+		if [ "$i" -lt "$n" ]; then _bt_iconv_short; return 1; fi ;;
+	UTF-32|UTF-32LE|UTF-32BE)
+		local big=0
+		[ "$set" = UTF-32BE ] && big=1
+		if [ "$set" = UTF-32 ]; then
+			big=0
+			if [ "$n" -ge 4 ]; then
+				if [ "${_bt_b[0]}" = 255 ] && [ "${_bt_b[1]}" = 254 ] &&
+				   [ "${_bt_b[2]}" = 0 ] && [ "${_bt_b[3]}" = 0 ]; then
+					big=0; i=4
+				elif [ "${_bt_b[0]}" = 0 ] && [ "${_bt_b[1]}" = 0 ] &&
+				     [ "${_bt_b[2]}" = 254 ] && [ "${_bt_b[3]}" = 255 ]; then
+					big=1; i=4
+				fi
+			fi
+		fi
+		while [ $(( i + 3 )) -lt "$n" ]; do
+			if [ "$big" = 1 ]; then
+				cp=$(( _bt_b[i] << 24 | _bt_b[i+1] << 16 | _bt_b[i+2] << 8 | _bt_b[i+3] ))
+			else
+				cp=$(( _bt_b[i+3] << 24 | _bt_b[i+2] << 16 | _bt_b[i+1] << 8 | _bt_b[i] ))
+			fi
+			if ! _bt_iconv_ok "$cp"; then
+				# a 32-bit word that is not a character at all
+				# stops the conversion, -c or no -c, which is
+				# what iconv does with it
+				[ "$quiet" = 1 ] ||
+					_bt_err "iconv: illegal input sequence at position $i"
+				status=1
+				return 1
+			fi
+			cps+=("$cp")
+			i=$(( i + 4 ))
+		done
+		if [ "$i" -lt "$n" ]; then _bt_iconv_short; return 1; fi ;;
+	esac
+	return 0
+}
+
+# Is $1 a code point at all?
+_bt_iconv_ok() {
+	[ "$1" -gt 1114111 ] && return 1
+	[ "$1" -ge 55296 ] && [ "$1" -le 57343 ] && return 1
+	return 0
+}
+
+# The input stopped in the middle of a character, which -c does not excuse.
+_bt_iconv_short() {
+	[ "$quiet" = 1 ] ||
+		_bt_err "iconv: incomplete character or shift sequence at end of buffer"
+	status=1
+	return 1
+}
+
+# Complain about the byte at $1, or say nothing if -c asked for silence.
+# Returns non-zero when the conversion should stop.  Relies on its caller.
+_bt_iconv_bad() {
+	if [ "$drop" = 1 ]; then return 0; fi
+	[ "$quiet" = 1 ] || _bt_err "iconv: illegal input sequence at position $1"
+	status=1
+	return 1
+}
+
+# Encode the `cps` array as character set $1, writing as it goes.
+_bt_iconv_encode() {
+	local set=$1 i cp esc= out= pair b hi lo
+	local -A rev=()
+	case $set in
+	8859-15)	for pair in $_BT_ICONV_8859_15; do rev[${pair#*:}]=${pair%%:*}; done ;;
+	1252)		for pair in $_BT_ICONV_1252; do rev[${pair#*:}]=${pair%%:*}; done ;;
+	esac
+	case $set in
+	UTF-16)		esc='\0377\0376' ;;
+	UTF-32)		esc='\0377\0376\0000\0000' ;;
+	esac
+	for cp in ${cps[@]+"${cps[@]}"}; do
+		case $set in
+		UTF-8)
+			if [ "$cp" -lt 128 ]; then
+				_bt_iconv_put "$cp"
+			elif [ "$cp" -lt 2048 ]; then
+				_bt_iconv_put $(( 192 | cp >> 6 )) $(( 128 | cp & 63 ))
+			elif [ "$cp" -lt 65536 ]; then
+				_bt_iconv_put $(( 224 | cp >> 12 )) \
+					$(( 128 | (cp >> 6) & 63 )) $(( 128 | cp & 63 ))
+			else
+				_bt_iconv_put $(( 240 | cp >> 18 )) \
+					$(( 128 | (cp >> 12) & 63 )) \
+					$(( 128 | (cp >> 6) & 63 )) $(( 128 | cp & 63 ))
+			fi ;;
+		ASCII)
+			if [ "$cp" -lt 128 ]; then _bt_iconv_put "$cp"
+			else _bt_iconv_cannot || return 1; fi ;;
+		8859-1)
+			if [ "$cp" -lt 256 ]; then _bt_iconv_put "$cp"
+			else _bt_iconv_cannot || return 1; fi ;;
+		8859-15|1252)
+			b=${rev[$cp]-}
+			if [ -n "$b" ]; then
+				_bt_iconv_put "$b"
+			elif [ "$cp" -lt 256 ] && [ -z "${rev2[$cp]-}" ]; then
+				_bt_iconv_put "$cp"
+			else
+				_bt_iconv_cannot || return 1
+			fi ;;
+		UTF-16*)
+			if [ "$cp" -ge 65536 ]; then
+				hi=$(( 55296 + ((cp - 65536) >> 10) ))
+				lo=$(( 56320 + ((cp - 65536) & 1023) ))
+				_bt_iconv_put16 "$hi"
+				_bt_iconv_put16 "$lo"
+			else
+				_bt_iconv_put16 "$cp"
+			fi ;;
+		UTF-32*)
+			_bt_iconv_put32 "$cp" ;;
+		esac
+	done
+	_bt_iconv_out
+	return 0
+}
+
+# Add bytes to the pending output.  Relies on its caller's `esc`.
+_bt_iconv_put() {
+	local b
+	for b in "$@"; do
+		printf -v out '\\0%03o' "$b"
+		esc=$esc$out
+	done
+	[ "${#esc}" -gt 8000 ] && _bt_iconv_out
+	return 0
+}
+
+_bt_iconv_put16() {
+	if [ "$big" = 1 ]; then _bt_iconv_put $(( $1 >> 8 )) $(( $1 & 255 ))
+	else _bt_iconv_put $(( $1 & 255 )) $(( $1 >> 8 )); fi
+	return 0
+}
+
+_bt_iconv_put32() {
+	if [ "$big" = 1 ]; then
+		_bt_iconv_put $(( ($1 >> 24) & 255 )) $(( ($1 >> 16) & 255 )) \
+			$(( ($1 >> 8) & 255 )) $(( $1 & 255 ))
+	else
+		_bt_iconv_put $(( $1 & 255 )) $(( ($1 >> 8) & 255 )) \
+			$(( ($1 >> 16) & 255 )) $(( ($1 >> 24) & 255 ))
+	fi
+	return 0
+}
+
+_bt_iconv_out() {
+	[ -n "$esc" ] && printf '%b' "$esc"
+	esc=
+	return 0
+}
+
+# A code point that will not fit the target set.  Relies on its caller.
+_bt_iconv_cannot() {
+	[ "$drop" = 1 ] && return 0
+	_bt_iconv_out
+	[ "$quiet" = 1 ] || _bt_err "iconv: cannot convert"
+	status=1
+	return 1
+}
+
+iconv () {
+	local LC_ALL=C
+	local arg opt from= to= drop=0 quiet=0 list=0 status=0 file fd
+	local _bt_str _bt_reason big=0
+	local -a _bt_b=() cps=()
+	local -A rev2=()
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-f)	shift; [ "$#" = 0 ] && { _bt_err "iconv: option requires an argument -- f"; return 1; }
+			from=$1; shift ;;
+		-f*)	from=${1#-f}; shift ;;
+		-t)	shift; [ "$#" = 0 ] && { _bt_err "iconv: option requires an argument -- t"; return 1; }
+			to=$1; shift ;;
+		-t*)	to=${1#-t}; shift ;;
+		-l)	list=1; shift ;;
+		-c)	drop=1; shift ;;
+		-s)	quiet=1; shift ;;
+		-cs|-sc)	drop=1 quiet=1; shift ;;
+		-*)	[ "$1" = - ] && break
+			_bt_err "iconv: illegal option -- ${1#-}"
+			_bt_err "usage: iconv [-cs] [-f frommap] [-t tomap] [file...]"
+			_bt_err "       iconv -l"
+			return 1 ;;
+		*)	break ;;
+		esac
+	done
+
+	if [ "$list" = 1 ]; then
+		printf '%s\n' UTF-8 ASCII ISO-8859-1 ISO-8859-15 CP1252 \
+			UTF-16 UTF-16LE UTF-16BE UTF-32 UTF-32LE UTF-32BE
+		return 0
+	fi
+
+	[ -n "$from" ] || from=UTF-8
+	[ -n "$to" ] || to=UTF-8
+	if ! _bt_iconv_norm "$from"; then
+		_bt_err "iconv: conversion from $from unsupported"
+		return 1
+	fi
+	from=$_bt_str
+	if ! _bt_iconv_norm "$to"; then
+		_bt_err "iconv: conversion to $to unsupported"
+		return 1
+	fi
+	to=$_bt_str
+
+	# which of the two Latin sets a byte belongs to is decided by the table,
+	# so the code points a set spells differently must not fall through
+	case $to in
+	8859-15)	for arg in $_BT_ICONV_8859_15; do rev2[${arg%%:*}]=1; done ;;
+	1252)		for arg in $_BT_ICONV_1252; do rev2[${arg%%:*}]=1; done ;;
+	esac
+	case $to in
+	UTF-16BE|UTF-32BE)	big=1 ;;
+	*)			big=0 ;;
+	esac
+
+	[ "$#" = 0 ] && set -- -
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			_bt_fd_bytes 0
+		elif { exec {fd}<"$file"; } 2>/dev/null; then
+			_bt_fd_bytes "$fd"
+			exec {fd}<&-
+		else
+			_bt_why "$file"
+			_bt_err "iconv: $file: $_bt_reason"
+			status=1
+			continue
+		fi
+		_bt_iconv_decode "$from" || { _bt_iconv_encode "$to"; return 1; }
+		_bt_iconv_encode "$to" || return 1
+	done
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# ar -- POSIX.1-2017:
+#	ar -d [-v] archive file...
+#	ar -m [-abiv] [posname] archive file...
+#	ar -p [-v] archive [file...]
+#	ar -q [-cv] archive file...
+#	ar -r [-abciuv] [posname] archive file...
+#	ar -t [-v] archive [file...]
+#	ar -x [-v] archive [file...]
+#
+# The format is the common one: the magic "!<arch>\n", then a 60-byte header
+# per member and its bytes padded to an even length.  Names too long for the
+# header live in a member called // and are referred to by their offset in it.
+#
+# What goes in the date, owner and mode fields is 0, 0, 0 and 644, which is
+# what ar itself writes in the deterministic mode it now defaults to -- and
+# just as well, because there is no stat() here to write anything else.
+# ---------------------------------------------------------------------------
+
+# Pending output, flushed a few thousand escapes at a time.
+_bt_ar_put() {
+	local b s
+	for b in "$@"; do
+		printf -v s '\\0%03o' "$b"
+		esc=$esc$s
+	done
+	[ "${#esc}" -gt 8000 ] && { printf '%b' "$esc" >&"$ofd"; esc=; }
+	return 0
+}
+
+_bt_ar_flush() {
+	[ -n "$esc" ] && printf '%b' "$esc" >&"$ofd"
+	esc=
+	return 0
+}
+
+# Read the archive $1 into _bt_b and fill mname/moff/msize.  An archive that is
+# not there leaves the arrays empty and returns 1.
+_bt_ar_read() {
+	local i n name size off longoff longsize=0 j c
+	mname=() moff=() msize=()
+	_bt_file_bytes "$1" || return 1
+	n=${#_bt_b[@]}
+	if [ "$n" -lt 8 ]; then return 0; fi
+	_bt_b_str 0 7
+	if [ "$_bt_str" != '!<arch>' ]; then
+		_bt_err "ar: $1: file format not recognized"
+		return 2
+	fi
+	i=8
+	longoff=-1
+	while [ $(( i + 60 )) -le "$n" ]; do
+		_bt_b_str "$i" 16
+		name=$_bt_str
+		name=${name%"${name##*[! ]}"}
+		_bt_b_str $(( i + 48 )) 10
+		size=${_bt_str%"${_bt_str##*[! ]}"}
+		case $size in
+		''|*[!0-9]*)	break ;;
+		esac
+		off=$(( i + 60 ))
+		if [ "$name" = '//' ]; then
+			longoff=$off longsize=$size
+		elif [ "$name" != '/' ] && [ "$name" != '/SYM64/' ]; then
+			case $name in
+			/*)	j=${name#/}
+				name=
+				if [ "$longoff" -ge 0 ] && [ -n "$j" ]; then
+					for (( c = longoff + j; c < longoff + longsize; c++ )); do
+						[ "${_bt_b[c]}" = 47 ] && break
+						[ "${_bt_b[c]}" = 10 ] && break
+						_bt_chr "${_bt_b[c]}"
+						name=$name$_bt_c
+					done
+				fi ;;
+			*/)	name=${name%/} ;;
+			esac
+			mname+=("$name")
+			moff+=("$off")
+			msize+=("$size")
+		fi
+		i=$(( off + size + (size % 2) ))
+	done
+	return 0
+}
+
+# Write the working member list to the archive named $1.
+_bt_ar_write() {
+	local out=$1 i j n name size esc= ofd longs= tmp
+	local -a fb=()
+
+	for (( i = 0; i < ${#wname[@]}; i++ )); do
+		if [ $(( ${#wname[i]} + 1 )) -gt 16 ]; then
+			longs=$longs${wname[i]}/$'\n'
+		fi
+	done
+
+	if ! { exec {ofd}>"$out"; } 2>/dev/null; then
+		_bt_err "ar: cannot write $out"
+		return 1
+	fi
+	printf '!<arch>\n' >&"$ofd"
+	if [ -n "$longs" ]; then
+		# the padding that keeps the table even is counted in its size
+		[ $(( ${#longs} % 2 )) = 1 ] && longs=$longs$'\n'
+		size=${#longs}
+		printf '%-16s%-12s%-6s%-6s%-8s%-10s`\n' '//' '' '' '' '' "$size" >&"$ofd"
+		printf '%s' "$longs" >&"$ofd"
+	fi
+
+	tmp=0
+	for (( i = 0; i < ${#wname[@]}; i++ )); do
+		name=${wname[i]}
+		if [ $(( ${#name} + 1 )) -gt 16 ]; then
+			printf -v name '/%d' "$tmp"
+			tmp=$(( tmp + ${#wname[i]} + 2 ))
+		else
+			name=$name/
+		fi
+		if [ -n "${wfile[i]}" ]; then
+			fb=()
+			_bt_ar_slurp "${wfile[i]}" || { exec {ofd}>&-; return 1; }
+			size=${#fb[@]}
+		else
+			size=${wsize[i]}
+		fi
+		printf '%-16s%-12s%-6s%-6s%-8s%-10s`\n' "$name" 0 0 0 644 "$size" >&"$ofd"
+		esc=
+		if [ -n "${wfile[i]}" ]; then
+			for (( j = 0; j < size; j++ )); do _bt_ar_put "${fb[j]}"; done
+		else
+			n=$(( woff[i] + size ))
+			for (( j = woff[i]; j < n; j++ )); do _bt_ar_put "${_bt_b[j]}"; done
+		fi
+		[ $(( size % 2 )) = 1 ] && _bt_ar_put 10
+		_bt_ar_flush
+	done
+	exec {ofd}>&-
+	return 0
+}
+
+# Read file $1 into the `fb` array.
+_bt_ar_slurp() {
+	local fd i len rc
+	local _bt_buf _bt_nul v
+	fb=()
+	if ! { exec {fd}<"$1"; } 2>/dev/null; then
+		_bt_err "ar: $1: No such file or directory"
+		return 1
+	fi
+	while :; do
+		if _bt_read "$fd"; then rc=0; else rc=1; fi
+		len=${#_bt_buf}
+		for (( i = 0; i < len; i++ )); do
+			printf -v v '%d' "'${_bt_buf:i:1}"
+			fb+=("$v")
+		done
+		[ "$rc" = 0 ] && [ "$_bt_nul" = 1 ] && fb+=(0)
+		[ "$rc" = 1 ] && break
+	done
+	exec {fd}<&-
+	return 0
+}
+
+ar () {
+	local LC_ALL=C
+	local arg opt key= pos= posname= verbose=0 quiet=0 archive= i j k n
+	local status=0 name found esc ofd
+	local -a mname=() moff=() msize=() wname=() wfile=() wsize=() woff=()
+	local -a _bt_b=() fb=() ops=()
+	local _bt_str _bt_c _bt_reason
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				d|m|p|q|r|t|x)	key=$opt ;;
+				a|b|i)		pos=$opt ;;
+				c)		quiet=1 ;;
+				v)		verbose=1 ;;
+				s|u|C|T|D|U)	;;
+				*)	_bt_err "ar: illegal option -- $opt"
+					_bt_err "usage: ar -d|-m|-p|-q|-r|-t|-x [-abcisuv] [posname] archive [file...]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ -z "$key" ] && [ "$#" -gt 0 ]; then
+		# the key may come without its dash, as it always could
+		case $1 in
+		*[dmpqrtx]*)
+			arg=$1
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				d|m|p|q|r|t|x)	key=$opt ;;
+				a|b|i)		pos=$opt ;;
+				c)		quiet=1 ;;
+				v)		verbose=1 ;;
+				s|u|C|T|D|U)	;;
+				esac
+			done ;;
+		esac
+	fi
+	if [ -z "$key" ]; then
+		_bt_err "usage: ar -d|-m|-p|-q|-r|-t|-x [-abcisuv] [posname] archive [file...]"
+		return 1
+	fi
+	if [ -n "$pos" ]; then
+		if [ "$#" = 0 ]; then
+			_bt_err "ar: an option that positions a member needs a member to position it by"
+			return 1
+		fi
+		posname=$1; shift
+	fi
+	if [ "$#" = 0 ]; then
+		_bt_err "ar: no archive named"
+		return 1
+	fi
+	archive=$1; shift
+	ops=("$@")
+
+	if [ -e "$archive" ]; then
+		_bt_ar_read "$archive" || return 1
+	elif [ "$key" = r ] || [ "$key" = q ]; then
+		[ "$quiet" = 1 ] || _bt_err "ar: creating $archive"
+	else
+		_bt_err "ar: $archive: No such file or directory"
+		return 1
+	fi
+
+	case $key in
+	t)	for (( i = 0; i < ${#mname[@]}; i++ )); do
+			if [ "${#ops[@]}" -gt 0 ]; then
+				found=0
+				for name in "${ops[@]}"; do
+					[ "${name##*/}" = "${mname[i]}" ] && found=1
+				done
+				[ "$found" = 1 ] || continue
+			fi
+			if [ "$verbose" = 1 ]; then
+				printf 'rw-r--r-- 0/0 %6d Jan  1 00:00 1970 %s\n' \
+					"${msize[i]}" "${mname[i]}"
+			else
+				printf '%s\n' "${mname[i]}"
+			fi
+		done ;;
+	p)	esc=
+		ofd=1
+		for (( i = 0; i < ${#mname[@]}; i++ )); do
+			if [ "${#ops[@]}" -gt 0 ]; then
+				found=0
+				for name in "${ops[@]}"; do
+					[ "${name##*/}" = "${mname[i]}" ] && found=1
+				done
+				[ "$found" = 1 ] || continue
+			fi
+			[ "$verbose" = 1 ] && printf '\n<%s>\n\n' "${mname[i]}"
+			n=$(( moff[i] + msize[i] ))
+			for (( j = moff[i]; j < n; j++ )); do _bt_ar_put "${_bt_b[j]}"; done
+			_bt_ar_flush
+		done ;;
+	x)	for (( i = 0; i < ${#mname[@]}; i++ )); do
+			if [ "${#ops[@]}" -gt 0 ]; then
+				found=0
+				for name in "${ops[@]}"; do
+					[ "${name##*/}" = "${mname[i]}" ] && found=1
+				done
+				[ "$found" = 1 ] || continue
+			fi
+			esc=
+			if ! { exec {ofd}>"${mname[i]}"; } 2>/dev/null; then
+				_bt_err "ar: cannot write ${mname[i]}"
+				status=1
+				continue
+			fi
+			n=$(( moff[i] + msize[i] ))
+			for (( j = moff[i]; j < n; j++ )); do _bt_ar_put "${_bt_b[j]}"; done
+			_bt_ar_flush
+			exec {ofd}>&-
+			[ "$verbose" = 1 ] && printf 'x - %s\n' "${mname[i]}"
+		done ;;
+	d)	for (( i = 0; i < ${#mname[@]}; i++ )); do
+			found=0
+			for name in "${ops[@]}"; do
+				[ "${name##*/}" = "${mname[i]}" ] && found=1
+			done
+			if [ "$found" = 1 ]; then
+				[ "$verbose" = 1 ] && printf 'd - %s\n' "${mname[i]}"
+				continue
+			fi
+			wname+=("${mname[i]}") wfile+=('') woff+=("${moff[i]}") wsize+=("${msize[i]}")
+		done
+		_bt_ar_write "$archive" || return 1 ;;
+	q)	for (( i = 0; i < ${#mname[@]}; i++ )); do
+			wname+=("${mname[i]}") wfile+=('') woff+=("${moff[i]}") wsize+=("${msize[i]}")
+		done
+		for name in "${ops[@]}"; do
+			wname+=("${name##*/}") wfile+=("$name") woff+=(0) wsize+=(0)
+			[ "$verbose" = 1 ] && printf 'a - %s\n' "$name"
+		done
+		_bt_ar_write "$archive" || return 1 ;;
+	r)	for (( i = 0; i < ${#mname[@]}; i++ )); do
+			wname+=("${mname[i]}") wfile+=('') woff+=("${moff[i]}") wsize+=("${msize[i]}")
+		done
+		for name in "${ops[@]}"; do
+			found=-1
+			for (( i = 0; i < ${#wname[@]}; i++ )); do
+				[ "${wname[i]}" = "${name##*/}" ] && { found=$i; break; }
+			done
+			if [ "$found" -ge 0 ] && [ -z "$pos" ]; then
+				wfile[found]=$name
+				woff[found]=0
+				wsize[found]=0
+				[ "$verbose" = 1 ] && printf 'r - %s\n' "$name"
+			elif [ "$found" -ge 0 ]; then
+				# asked to place it somewhere, a member that is
+				# already there moves rather than staying put
+				wname=( ${wname[@]+"${wname[@]:0:found}"} ${wname[@]+"${wname[@]:found+1}"} )
+				wfile=( ${wfile[@]+"${wfile[@]:0:found}"} ${wfile[@]+"${wfile[@]:found+1}"} )
+				woff=( ${woff[@]+"${woff[@]:0:found}"} ${woff[@]+"${woff[@]:found+1}"} )
+				wsize=( ${wsize[@]+"${wsize[@]:0:found}"} ${wsize[@]+"${wsize[@]:found+1}"} )
+				_bt_ar_insert "${name##*/}" "$name"
+				[ "$verbose" = 1 ] && printf 'r - %s\n' "$name"
+			else
+				_bt_ar_insert "${name##*/}" "$name"
+				[ "$verbose" = 1 ] && printf 'a - %s\n' "$name"
+			fi
+		done
+		_bt_ar_write "$archive" || return 1 ;;
+	m)	for (( i = 0; i < ${#mname[@]}; i++ )); do
+			found=0
+			for name in "${ops[@]}"; do
+				[ "${name##*/}" = "${mname[i]}" ] && found=1
+			done
+			[ "$found" = 1 ] && continue
+			wname+=("${mname[i]}") wfile+=('') woff+=("${moff[i]}") wsize+=("${msize[i]}")
+		done
+		for name in "${ops[@]}"; do
+			for (( i = 0; i < ${#mname[@]}; i++ )); do
+				[ "${mname[i]}" = "${name##*/}" ] || continue
+				_bt_ar_insert "${mname[i]}" '' "${moff[i]}" "${msize[i]}"
+				[ "$verbose" = 1 ] && printf 'm - %s\n' "${mname[i]}"
+			done
+		done
+		_bt_ar_write "$archive" || return 1 ;;
+	esac
+	return "$status"
+}
+
+# Put a member in the working list where -a, -b or -i says it goes, or at the
+# end when nothing says otherwise.  Relies on its caller's locals.
+_bt_ar_insert() {
+	local nm=$1 file=$2 off=${3:-0} size=${4:-0} at=${#wname[@]} i
+	if [ -n "$pos" ] && [ -n "$posname" ]; then
+		for (( i = 0; i < ${#wname[@]}; i++ )); do
+			if [ "${wname[i]}" = "${posname##*/}" ]; then
+				if [ "$pos" = a ]; then at=$(( i + 1 )); else at=$i; fi
+				break
+			fi
+		done
+	fi
+	wname=( ${wname[@]+"${wname[@]:0:at}"} "$nm" ${wname[@]+"${wname[@]:at}"} )
+	wfile=( ${wfile[@]+"${wfile[@]:0:at}"} "$file" ${wfile[@]+"${wfile[@]:at}"} )
+	woff=( ${woff[@]+"${woff[@]:0:at}"} "$off" ${woff[@]+"${woff[@]:at}"} )
+	wsize=( ${wsize[@]+"${wsize[@]:0:at}"} "$size" ${wsize[@]+"${wsize[@]:at}"} )
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# locale -- POSIX.1-2017:
+#	locale [-a|-m]
+#	locale [-ck] name...
+#
+# What the environment asks for is answered exactly.  The keyword values are
+# the ones the standard fixes for the POSIX locale; the data for any other
+# locale lives in a compiled archive that nothing here can read, so those are
+# the values that come out whatever LANG says.
+# ---------------------------------------------------------------------------
+
+# category:keyword:kind:value, kind s for a string and n for a number
+_BT_LOCALE_KEYS='
+LC_CTYPE:charmap:s:ANSI_X3.4-1968
+LC_NUMERIC:decimal_point:s:.
+LC_NUMERIC:thousands_sep:s:
+LC_NUMERIC:grouping:n:-1
+LC_MONETARY:int_curr_symbol:s:
+LC_MONETARY:currency_symbol:s:
+LC_MONETARY:mon_decimal_point:s:
+LC_MONETARY:mon_thousands_sep:s:
+LC_MONETARY:mon_grouping:n:-1
+LC_MONETARY:positive_sign:s:
+LC_MONETARY:negative_sign:s:
+LC_MONETARY:int_frac_digits:n:-1
+LC_MONETARY:frac_digits:n:-1
+LC_MONETARY:p_cs_precedes:n:-1
+LC_MONETARY:p_sep_by_space:n:-1
+LC_MONETARY:n_cs_precedes:n:-1
+LC_MONETARY:n_sep_by_space:n:-1
+LC_MONETARY:p_sign_posn:n:-1
+LC_MONETARY:n_sign_posn:n:-1
+LC_TIME:abday:s:Sun;Mon;Tue;Wed;Thu;Fri;Sat
+LC_TIME:day:s:Sunday;Monday;Tuesday;Wednesday;Thursday;Friday;Saturday
+LC_TIME:abmon:s:Jan;Feb;Mar;Apr;May;Jun;Jul;Aug;Sep;Oct;Nov;Dec
+LC_TIME:mon:s:January;February;March;April;May;June;July;August;September;October;November;December
+LC_TIME:d_t_fmt:s:%a %b %e %H:%M:%S %Y
+LC_TIME:d_fmt:s:%m/%d/%y
+LC_TIME:t_fmt:s:%H:%M:%S
+LC_TIME:am_pm:s:AM;PM
+LC_TIME:t_fmt_ampm:s:%I:%M:%S %p
+LC_TIME:era:s:
+LC_TIME:era_d_fmt:s:
+LC_TIME:era_d_t_fmt:s:
+LC_TIME:era_t_fmt:s:
+LC_TIME:alt_digits:s:
+LC_MESSAGES:yesexpr:s:^[yY]
+LC_MESSAGES:noexpr:s:^[nN]
+LC_MESSAGES:yesstr:s:
+LC_MESSAGES:nostr:s:'
+
+_BT_LOCALE_CATS='LC_CTYPE LC_NUMERIC LC_TIME LC_COLLATE LC_MONETARY LC_MESSAGES
+	LC_PAPER LC_NAME LC_ADDRESS LC_TELEPHONE LC_MEASUREMENT LC_IDENTIFICATION'
+
+locale () {
+	local LC_ALL_SAVE=${LC_ALL-}
+	local arg opt all=0 maps=0 showcat=0 keyword=0 status=0
+	local name cat kind val line def set IFS_SAVE
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-*)	[ "$1" = - ] && break
+			arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				a)	all=1 ;;
+				m)	maps=1 ;;
+				c)	showcat=1 ;;
+				k)	keyword=1 ;;
+				*)	_bt_err "locale: illegal option -- $opt"
+					_bt_err "usage: locale [-a|-m]"
+					_bt_err "       locale [-ck] name..."
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	if [ "$all" = 1 ]; then
+		_bt_locale_list
+		return 0
+	fi
+	if [ "$maps" = 1 ]; then
+		_bt_locale_charmaps
+		return 0
+	fi
+
+	if [ "$#" = 0 ]; then
+		# The value of a category is what its own variable says, or what
+		# LC_ALL or LANG says instead -- and the quotes mark which.
+		printf 'LANG=%s\n' "${LANG-}"
+		printf 'LANGUAGE=%s\n' "${LANGUAGE-}"
+		def=${LC_ALL_SAVE:-${LANG:-POSIX}}
+		for cat in $_BT_LOCALE_CATS; do
+			eval "set=\${$cat-}"
+			if [ -n "$set" ] && [ -z "$LC_ALL_SAVE" ]; then
+				printf '%s=%s\n' "$cat" "$set"
+			else
+				printf '%s="%s"\n' "$cat" "$def"
+			fi
+		done
+		printf 'LC_ALL=%s\n' "$LC_ALL_SAVE"
+		return 0
+	fi
+
+	for name in "$@"; do
+		case " $_BT_LOCALE_CATS " in
+		*" $name "*)
+			[ "$showcat" = 1 ] && printf '%s\n' "$name"
+			IFS_SAVE=$IFS
+			IFS=$'\n'
+			for line in $_BT_LOCALE_KEYS; do
+				IFS=$IFS_SAVE
+				[ -n "$line" ] || continue
+				[ "${line%%:*}" = "$name" ] || continue
+				_bt_locale_show "$line"
+				IFS=$'\n'
+			done
+			IFS=$IFS_SAVE
+			continue ;;
+		esac
+		found=
+		IFS_SAVE=$IFS
+		IFS=$'\n'
+		for line in $_BT_LOCALE_KEYS; do
+			IFS=$IFS_SAVE
+			[ -n "$line" ] || continue
+			val=${line#*:}
+			if [ "${val%%:*}" = "$name" ]; then
+				found=$line
+				break
+			fi
+			IFS=$'\n'
+		done
+		IFS=$IFS_SAVE
+		if [ -z "$found" ]; then
+			_bt_err "locale: unknown name \"$name\""
+			status=1
+			continue
+		fi
+		[ "$showcat" = 1 ] && printf '%s\n' "${found%%:*}"
+		_bt_locale_show "$found"
+	done
+	return "$status"
+}
+
+# Print one keyword line of the table $1, the way -k asks for it or not.
+_bt_locale_show() {
+	local line=$1 cat key kind val
+	cat=${line%%:*}
+	line=${line#*:}
+	key=${line%%:*}
+	line=${line#*:}
+	kind=${line%%:*}
+	val=${line#*:}
+	if [ "$keyword" = 1 ]; then
+		if [ "$kind" = n ]; then printf '%s=%s\n' "$key" "$val"
+		else printf '%s="%s"\n' "$key" "$val"; fi
+	else
+		printf '%s\n' "$val"
+	fi
+	return 0
+}
+
+# The locales this machine has, which are the compiled ones plus the two that
+# are always there.
+_bt_locale_list() {
+	local d f
+	local -a names=(C POSIX)
+	for d in /usr/lib/locale /usr/share/locale; do
+		[ -d "$d" ] || continue
+		for f in "$d"/*; do
+			[ -d "$f" ] || continue
+			f=${f##*/}
+			case $f in
+			locale-archive|*.alias)	continue ;;
+			esac
+			names+=("$f")
+		done
+		break
+	done
+	printf '%s\n' "${names[@]}" | { local l; while IFS= read -r l; do printf '%s\n' "$l"; done; } |
+		_bt_locale_sort
+	return 0
+}
+
+# Sort what comes in, without leaving the shell.
+_bt_locale_sort() {
+	local line
+	local -a lines=()
+	local i j n tmp
+	while IFS= read -r line; do lines+=("$line"); done
+	n=${#lines[@]}
+	for (( i = 1; i < n; i++ )); do
+		tmp=${lines[i]}
+		j=$(( i - 1 ))
+		while [ "$j" -ge 0 ] && [ "${lines[j]}" \> "$tmp" ]; do
+			lines[j+1]=${lines[j]}
+			j=$(( j - 1 ))
+		done
+		lines[j+1]=$tmp
+	done
+	[ "$n" -gt 0 ] && printf '%s\n' "${lines[@]}"
+	return 0
+}
+
+# The character maps this machine has a description of.
+_bt_locale_charmaps() {
+	local f
+	local -a names=()
+	[ -d /usr/share/i18n/charmaps ] || return 0
+	for f in /usr/share/i18n/charmaps/*; do
+		[ -f "$f" ] || continue
+		f=${f##*/}
+		f=${f%.gz}
+		names+=("$f")
+	done
+	[ "${#names[@]}" -gt 0 ] && printf '%s\n' "${names[@]}" | _bt_locale_sort
+	return 0
+}
