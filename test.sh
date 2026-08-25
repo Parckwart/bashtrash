@@ -21,7 +21,9 @@ cd "$work" || exit 1
 
 pass=0 fail=0 failed=()
 
-real_of() { case $1 in cat) printf '%s' "$R_CAT" ;; tail) printf '%s' "$R_TAIL" ;; esac; }
+# The system utility to compare against.  Resolved by name, since the
+# bashtrash side is invoked by bare name so the function shadows it.
+real_of() { command -v "$1"; }
 
 note_fail() { # MESSAGE
 	fail=$((fail + 1)); failed+=("$1"); echo "FAIL: $1"
@@ -203,6 +205,111 @@ if [ "$("$R_ID" -u)" = 0 ] && command -v setpriv > /dev/null 2>&1; then
 	done
 fi
 
+# --- basename, dirname, head, wc, uniq, uname ------------------------------
+echo "### basename dirname head wc uniq uname"
+printf 'a b c\nd  e\tf\n\n  g  \n'   > words
+printf 'x\nx\ny\nx\nx\nx\nz\n'       > dup
+printf 'aa 1\nbb 1\ncc 2\ndd 2\n'    > flds
+
+for s in "/usr/lib" "/usr/" "usr" "/" "//" "///" "" "a/b/c" "a//b//" "//a//b//" ".." "a.c" "-"; do
+	chk "basename '$s'" basename "$s"
+	chk "dirname '$s'"  dirname "$s"
+done
+chk "basename a.c .c"   basename a.c .c
+chk "basename .c .c"    basename .c .c
+chk "basename /x/a.c c" basename /x/a.c c
+chk "basename -- /a/b"  basename -- /a/b
+chk "dirname -- /a/b"   dirname -- /a/b
+
+for f in lines12 nonl empty binary big; do
+	for o in "" "-n 1" "-n 3" "-n 0" "-n 12" "-n 100" "-1" "-c 5" "-c 0" "-c 1000"; do
+		# shellcheck disable=SC2086
+		if [ -z "$o" ]; then chk "head $f" head "$f"; else chk "head $o $f" head $o "$f"; fi
+	done
+done
+chk "head two files"    head lines12 nonl
+chk "head -n 2 three"   head -n 2 lines12 nonl binary
+chk "head missing"      head no-such-file
+chk "head bad option"   head -Z lines12
+chks "head" lines12 head
+chks "head -n 3" binary head -n 3
+
+for f in lines12 nonl empty binary words big; do
+	for o in "" -l -w -c -m -lw -lc -wc -lwc -cl; do
+		# shellcheck disable=SC2086
+		if [ -z "$o" ]; then chk "wc $f" wc "$f"; else chk "wc $o $f" wc $o "$f"; fi
+	done
+done
+chk "wc two files"      wc lines12 nonl
+chk "wc -l two files"   wc -l lines12 nonl
+chk "wc three files"    wc lines12 words big
+chk "wc missing"        wc no-such-file
+for f in lines12 words binary; do chks "wc" "$f" wc; chks "wc -l" "$f" wc -l; done
+
+for o in "" -c -d -u -cd -cu "-f 1" "-s 1" "-f 1 -c" "-s 2 -c"; do
+	# shellcheck disable=SC2086
+	if [ -z "$o" ]; then chk "uniq dup" uniq dup; chk "uniq flds" uniq flds
+	else chk "uniq $o dup" uniq $o dup; chk "uniq $o flds" uniq $o flds; fi
+done
+chk "uniq nonl"  uniq nonl
+chk "uniq empty" uniq empty
+chks "uniq" dup uniq
+
+for o in -s -n -r -v -m; do chk "uname $o" uname $o; done
+chk "uname" uname
+
+# --- tee, sleep, tty -------------------------------------------------------
+echo "### tee sleep tty"
+printf 'A\000B\nC\n' > tin
+( . "$BT"; tee o1 o2 < tin ) > o0
+"$(command -v tee)" r1 r2 < tin > r0
+for p in 0 1 2; do
+	if cmp -s "o$p" "r$p"; then pass=$((pass + 1)); else note_fail "tee output $p"; fi
+done
+( . "$BT"; tee -a o1 < tin ) > /dev/null
+"$(command -v tee)" -a r1 < tin > /dev/null
+if cmp -s o1 r1; then pass=$((pass + 1)); else note_fail "tee -a"; fi
+( . "$BT"; tee /nope/x < tin ) > /dev/null 2>&1; a=$?
+"$(command -v tee)" /nope/x < tin > /dev/null 2>&1; b=$?
+if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "tee unwritable ($a vs $b)"; fi
+
+# sleep has nothing to compare against, so time it instead.
+s=$EPOCHREALTIME
+( . "$BT"; sleep 0.4 )
+e=$EPOCHREALTIME
+if awk -v s="$s" -v e="$e" 'BEGIN { exit !(e - s > 0.3 && e - s < 1.5) }'; then
+	pass=$((pass + 1))
+else
+	note_fail "sleep 0.4 took $(awk -v s="$s" -v e="$e" 'BEGIN{printf "%.2f", e-s}')s"
+fi
+chk "sleep bad arg" sleep xyz
+
+# tty off a terminal, and then on a real one if a pty can be had.
+chks "tty" /dev/null tty
+if command -v script > /dev/null 2>&1; then
+	out=$(script -qec '. '"$BT"'; printf "%s %s\n" "$(tty)" "$(command tty)"' /dev/null 2>/dev/null | tr -d '\r' | head -1)
+	set -- $out
+	if [ -n "$1" ] && [ "$1" = "$2" ]; then pass=$((pass + 1))
+	else note_fail "tty in a pty: [$out]"; fi
+fi
+
+# --- byte semantics in a multibyte locale ----------------------------------
+# ${#s}, ${s:i:n} and read -n all count characters unless the locale is C,
+# which silently made every length wrong.
+echo "### multibyte locale"
+printf 'caf\303\251 na\303\257ve\n' > mb
+for loc in C C.UTF-8 en_US.UTF-8; do
+	for n in 1 2 3 6 7 12; do
+		a=$(LC_ALL=$loc bash -c '. "$1"; tail -c "$2" mb' _ "$BT" "$n" | od -An -c)
+		b=$(LC_ALL=$loc "$R_TAIL" -c "$n" mb | od -An -c)
+		if [ "$a" = "$b" ]; then pass=$((pass + 1))
+		else note_fail "tail -c $n under $loc"; fi
+	done
+	a=$(LC_ALL=$loc bash -c '. "$1"; cat mb' _ "$BT" | od -An -c)
+	b=$(LC_ALL=$loc "$R_CAT" mb | od -An -c)
+	if [ "$a" = "$b" ]; then pass=$((pass + 1)); else note_fail "cat under $loc"; fi
+done
+
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"
 out=$(env -i PATH= "$BASH" --noprofile --norc -c '
@@ -222,5 +329,9 @@ fi
 
 echo
 echo "==== pass=$pass fail=$fail ===="
-if [ "$fail" -gt 0 ]; then printf 'failed: %s\n' "${failed[@]}"; exit 1; fi
+if [ "$fail" -gt 0 ]; then
+	printf 'failed: %s\n' "${failed[@]:0:20}"
+	[ "${#failed[@]}" -gt 20 ] && echo "... and $(( ${#failed[@]} - 20 )) more"
+	exit 1
+fi
 exit 0

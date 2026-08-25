@@ -3,7 +3,7 @@ Bullshit. Please ignore.
 
 ---
 
-POSIX `cat`, `tail` and `id`, implemented with nothing but bash builtins.
+POSIX utilities implemented with nothing but bash builtins.
 No forks, no execs, no coreutils — the functions keep working in a shell with
 an empty `$PATH`.
 
@@ -11,20 +11,33 @@ an empty `$PATH`.
 
     . bashtrash.sh
 
-Sourcing defines `cat`, `tail` and `id` as shell functions, shadowing the
-real utilities for the rest of the session.
+Sourcing defines each of them as a shell function, shadowing the
+real utility for the rest of the session.
 
 ## What is implemented
 
-| tool   | synopsis                                    |
-| ------ | ------------------------------------------- |
-| `cat`  | `cat [-u] [file...]`                        |
-| `tail` | `tail [-f] [-c number \| -n number] [file]` |
-| `id`   | `id [user]`                                 |
-|        | `id -G [-n] [user]`                         |
-|        | `id -g [-nr] [user]`                        |
-|        | `id -u [-nr] [user]`                        |
+| utility    | synopsis                                    |
+| ---------- | ------------------------------------------- |
+| `basename` | `basename string [suffix]`                  |
+| `cat`      | `cat [-u] [file...]`                        |
+| `dirname`  | `dirname string`                            |
+| `head`     | `head [-n number] [file...]`                |
+| `id`       | `id [user]`                                 |
+|            | `id -G [-n] [user]`                         |
+|            | `id -g [-nr] [user]`                        |
+|            | `id -u [-nr] [user]`                        |
+| `sleep`    | `sleep time`                                |
+| `tail`     | `tail [-f] [-c number \| -n number] [file]` |
+| `tee`      | `tee [-ai] [file...]`                       |
+| `tty`      | `tty`                                       |
+| `uname`    | `uname [-amnrsv]`                           |
+| `uniq`     | `uniq [-c|-d|-u] [-f fields] [-s chars] [input [output]]` |
+| `wc`       | `wc [-c|-m] [-lw] [file...]`                |
 
+That is 12 of the 160 utilities in the standard.  Another 22 (`cd`,
+`echo`, `printf`, `read`, `test`, `kill`, `wait` and friends) bash already
+provides as builtins, and 39 are unreachable from a builtin at all -- see
+**Limits** below.
 The conformance target is POSIX.1-2017, including the parts that are easy to
 forget: `--` ends the options and a lone `-` is an operand naming standard
 input; `-n +5` counts from the start of the file while `-n 5` counts from the
@@ -35,6 +48,12 @@ and then exits non-zero; `tail` takes at most one file operand, and ignores
 
 `tail -number`, as in `tail -20`, is accepted as the obsolescent historical
 spelling of `-n number`. `id -a` is accepted and ignored, as elsewhere.
+
+`head` accepts `-c` (the Issue 8 spelling of a long-standing extension)
+and the obsolescent `head -number`.  `wc` aligns its columns the way every
+wc does, rather than the single spaces the format string in the standard
+implies.  `uname -a` is the standard's `-a`, exactly `-mnrsv`; GNU adds
+processor, hardware platform and operating system to its own.
 
 `id` reports the *real* IDs in its default format and the *effective* ones
 for `-u` and `-g`, with `euid=`/`egid=` appearing only when they differ. Its
@@ -74,7 +93,7 @@ is missing. Names come from reading `/etc/passwd` and `/etc/group` directly.
 
 Every case runs twice, once through the bash functions and once through the
 system coreutils, comparing stdout byte for byte and comparing exit status:
-4958 comparisons, taking a couple of minutes.
+5174 comparisons, taking a couple of minutes.
 
 `cat` and `tail` are checked over embedded NULs, unterminated lines, empty
 files, 300 KB of random binary, and every sign and magnitude of `-n`/`-c`,
@@ -94,4 +113,9 @@ single `execve`, bash itself.
   `/etc/passwd` and `/etc/group` is the only lookup available without
   `getent`.
 * `id` takes one operand, as POSIX specifies; GNU accepts several.
-* Everything is byte oriented; multibyte locales are not interpreted.
+* `uname -m` reports the machine type bash was built for, since uname(2)
+  is not reachable; `tty` identifies the terminal by comparing device and
+  inode against `/proc/self/fd/0` rather than calling ttyname().
+* Byte semantics are forced inside every function (`LC_ALL=C`), because
+  `${#s}`, `${s:i:n}` and `read -n` otherwise count characters, not bytes.
+  `wc -m` is the one place the caller's locale is put back.

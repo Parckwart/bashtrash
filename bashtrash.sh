@@ -232,6 +232,10 @@ _bt_snore() {
 # cat -- POSIX.1-2017: cat [-u] [file...]
 # ---------------------------------------------------------------------------
 cat () {
+	# Byte semantics: in a multibyte locale ${#s}, ${s:i:n} and
+	# read -n all count characters, which would make every length
+	# here wrong.  Restored on return.
+	local LC_ALL=C
 	local status=0 unbuffered=0 arg opt file fd _bt_reason
 
 	# Option parsing follows the POSIX Utility Syntax Guidelines: "--"
@@ -293,6 +297,7 @@ cat () {
 # tail -- POSIX.1-2017: tail [-f] [-c number|-n number] [file]
 # ---------------------------------------------------------------------------
 tail () {
+	local LC_ALL=C
 	local mode=lines count=10 from_start=0 follow=0
 	local arg opt val file fd rc started skip len
 	local endsnl total_nl i
@@ -601,6 +606,7 @@ _bt_add_gid() {
 }
 
 id () {
+	local LC_ALL=C
 	local opt arg want= names=0 real=0 user= have_user=0
 	local wid g i sep rc
 	local _bt_name _bt_uid _bt_gid _bt_grname
@@ -766,5 +772,623 @@ id () {
 		done
 	fi
 	printf '\n'
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# basename -- POSIX.1-2017: basename string [suffix]
+# ---------------------------------------------------------------------------
+basename () {
+	local LC_ALL=C s suffix=
+	[ "$#" -gt 0 ] && [ "$1" = -- ] && shift
+	if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then
+		_bt_err "usage: basename string [suffix]"
+		return 1
+	fi
+	s=$1
+	[ "$#" -eq 2 ] && suffix=$2
+	case $s in
+	'')	printf '\n'; return 0 ;;
+	*[!/]*)	;;
+	*)	printf '/\n'; return 0 ;;	# nothing but slashes
+	esac
+	s=${s%"${s##*[!/]}"}		# drop trailing slashes
+	s=${s##*/}			# keep the last component
+	# "If the suffix is identical to the remaining characters, it shall
+	# not be removed."
+	if [ -n "$suffix" ] && [ "$s" != "$suffix" ]; then
+		s=${s%"$suffix"}
+	fi
+	printf '%s\n' "$s"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# dirname -- POSIX.1-2017: dirname string
+# ---------------------------------------------------------------------------
+dirname () {
+	local LC_ALL=C s
+	[ "$#" -gt 0 ] && [ "$1" = -- ] && shift
+	if [ "$#" -ne 1 ]; then
+		_bt_err "usage: dirname string"
+		return 1
+	fi
+	s=$1
+	# The steps below are the ones the standard spells out, in order.
+	case $s in
+	'')	printf '.\n'; return 0 ;;
+	*[!/]*)	;;
+	*)	printf '/\n'; return 0 ;;	# nothing but slashes
+	esac
+	s=${s%"${s##*[!/]}"}		# trailing slashes
+	case $s in
+	*/*)	;;
+	*)	printf '.\n'; return 0 ;;	# no slash left
+	esac
+	s=${s%"${s##*/}"}		# trailing non-slashes
+	s=${s%"${s##*[!/]}"}		# trailing slashes again
+	[ -n "$s" ] || s=/
+	printf '%s\n' "$s"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# head -- POSIX.1-2017: head [-n number] [file...]
+# -c is the Issue 8 spelling of the long-standing extension.
+# ---------------------------------------------------------------------------
+head () {
+	local LC_ALL=C mode=lines count=10 arg opt val file fd status=0
+	local first=1 many=0 left rc len label _bt_reason
+	local _bt_buf _bt_nul _bt_n _bt_off
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-[0-9]*)
+			val=${1#-}
+			_bt_isnum "$val" || { _bt_err "head: invalid number: $val"; return 1; }
+			mode=lines count=$val
+			shift ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				c|n)	if [ -n "$arg" ]; then
+						val=$arg
+						arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1
+						shift
+					else
+						_bt_err "head: option requires an argument -- $opt"
+						return 1
+					fi
+					_bt_isnum "$val" || { _bt_err "head: invalid number: $val"; return 1; }
+					case $val in
+					-*|+*)	val=${val#[-+]} ;;
+					esac
+					if [ "$opt" = c ]; then mode=bytes; else mode=lines; fi
+					count=$val ;;
+				*)	_bt_err "head: illegal option -- $opt"
+					_bt_err "usage: head [-n number] [file...]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	count=$(( 10#$count ))
+
+	[ "$#" -eq 0 ] && set -- -
+	[ "$#" -gt 1 ] && many=1
+
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			fd=0
+			label='standard input'
+		else
+			if [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+				_bt_why "$file"
+				_bt_err "head: $file: $_bt_reason"
+				status=1
+				continue
+			fi
+			label=$file
+		fi
+		if [ "$many" = 1 ]; then
+			[ "$first" = 1 ] || printf '\n'
+			printf '==> %s <==\n' "$label"
+		fi
+		first=0
+
+		left=$count
+		while [ "$left" -gt 0 ]; do
+			if _bt_read "$fd"; then rc=0; else rc=1; fi
+			if [ "$mode" = lines ]; then
+				_bt_count "$_bt_buf"
+				if [ "$_bt_n" -ge "$left" ]; then
+					_bt_after_nl "$_bt_buf" "$left"
+					printf '%s' "${_bt_buf:0:_bt_off}"
+					left=0
+				else
+					printf '%s' "$_bt_buf"
+					[ "$_bt_nul" = 1 ] && printf '\000'
+					left=$(( left - _bt_n ))
+				fi
+			else
+				len=${#_bt_buf}
+				if [ "$left" -le "$len" ]; then
+					printf '%s' "${_bt_buf:0:left}"
+					left=0
+				else
+					printf '%s' "$_bt_buf"
+					left=$(( left - len ))
+					# the separating NUL is a byte of its own
+					if [ "$_bt_nul" = 1 ] && [ "$left" -gt 0 ]; then
+						printf '\000'
+						left=$(( left - 1 ))
+					fi
+				fi
+			fi
+			[ "$rc" = 1 ] && break
+		done
+		[ "$fd" = 0 ] || exec {fd}<&-
+	done
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# tee -- POSIX.1-2017: tee [-ai] [file...]
+# ---------------------------------------------------------------------------
+tee () {
+	local LC_ALL=C append=0 ignore=0 arg opt f fd status=0 saved=
+	local -a fds=()
+	local _bt_buf _bt_nul _bt_reason
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				a)	append=1 ;;
+				i)	ignore=1 ;;
+				*)	_bt_err "tee: illegal option -- $opt"
+					_bt_err "usage: tee [-ai] [file...]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+
+	if [ "$ignore" = 1 ]; then
+		saved=$(trap -p INT)
+		trap '' INT
+	fi
+
+	for f in "$@"; do
+		if [ "$append" = 1 ]; then
+			{ exec {fd}>>"$f"; } 2>/dev/null
+		else
+			{ exec {fd}>"$f"; } 2>/dev/null
+		fi
+		if [ "$?" = 0 ]; then
+			fds+=("$fd")
+		else
+			_bt_why "$f"
+			_bt_err "tee: $f: $_bt_reason"
+			status=1
+		fi
+	done
+
+	while _bt_read 0; do
+		printf '%s' "$_bt_buf"
+		[ "$_bt_nul" = 1 ] && printf '\000'
+		for fd in ${fds[@]+"${fds[@]}"}; do
+			printf '%s' "$_bt_buf" >&"$fd"
+			[ "$_bt_nul" = 1 ] && printf '\000' >&"$fd"
+		done
+	done
+	printf '%s' "$_bt_buf"
+	for fd in ${fds[@]+"${fds[@]}"}; do
+		printf '%s' "$_bt_buf" >&"$fd"
+		exec {fd}>&-
+	done
+
+	if [ "$ignore" = 1 ]; then
+		if [ -n "$saved" ]; then eval "$saved"; else trap - INT; fi
+	fi
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# sleep -- POSIX.1-2017: sleep time
+# ---------------------------------------------------------------------------
+sleep () {
+	local LC_ALL=C t
+	if [ "$#" -ne 1 ]; then
+		_bt_err "usage: sleep time"
+		return 1
+	fi
+	t=$1
+	# POSIX asks for a non-negative decimal integer; a fraction is the
+	# usual extension and read -t takes one directly.
+	case $t in
+	''|*[!0-9.]*)	_bt_err "sleep: invalid time interval: $t"; return 1 ;;
+	*.*.*)		_bt_err "sleep: invalid time interval: $t"; return 1 ;;
+	.)		_bt_err "sleep: invalid time interval: $t"; return 1 ;;
+	esac
+	_bt_snore "$t"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# tty -- POSIX.1-2017: tty
+# ---------------------------------------------------------------------------
+tty () {
+	local LC_ALL=C d
+	if [ "$#" -gt 0 ]; then
+		_bt_err "tty: extra operand: $1"
+		return 1
+	fi
+	if [ ! -t 0 ]; then
+		printf 'not a tty\n'
+		return 1
+	fi
+	# ttyname() is not reachable, but the device can be identified by
+	# comparing device and inode against what fd 0 points at.
+	for d in /dev/pts/[0-9]* /dev/tty[0-9]* /dev/ttyS[0-9]* /dev/console /dev/tty; do
+		[ -c "$d" ] || continue
+		if [ "$d" -ef /proc/self/fd/0 ]; then
+			printf '%s\n' "$d"
+			return 0
+		fi
+	done
+	printf 'not a tty\n'
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+# uname -- POSIX.1-2017: uname [-amnrsv]
+#
+# Note that -a here is the standard's -a, which is exactly -mnrsv; GNU adds
+# processor, hardware platform and operating system to its own -a.
+# ---------------------------------------------------------------------------
+uname () {
+	local LC_ALL=C arg opt sep= out=
+	local want_s=0 want_n=0 want_r=0 want_v=0 want_m=0 any=0
+	local sysname nodename release version machine
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-*)	[ "$1" = - ] && break
+			arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				a)	want_s=1 want_n=1 want_r=1 want_v=1 want_m=1 ;;
+				s)	want_s=1 ;;
+				n)	want_n=1 ;;
+				r)	want_r=1 ;;
+				v)	want_v=1 ;;
+				m)	want_m=1 ;;
+				*)	_bt_err "uname: illegal option -- $opt"
+					_bt_err "usage: uname [-amnrsv]"
+					return 1 ;;
+				esac
+				any=1
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$#" -gt 0 ]; then
+		_bt_err "uname: extra operand: $1"
+		return 1
+	fi
+	[ "$any" = 1 ] || want_s=1
+
+	IFS= read -r sysname  < /proc/sys/kernel/ostype    2>/dev/null || sysname=unknown
+	IFS= read -r nodename < /proc/sys/kernel/hostname  2>/dev/null || nodename=unknown
+	IFS= read -r release  < /proc/sys/kernel/osrelease 2>/dev/null || release=unknown
+	IFS= read -r version  < /proc/sys/kernel/version   2>/dev/null || version=unknown
+	# uname(2) is out of reach; bash records the build machine type.
+	machine=${HOSTTYPE:-unknown}
+
+	[ "$want_s" = 1 ] && { out=$sysname; sep=' '; }
+	[ "$want_n" = 1 ] && { out=$out$sep$nodename; sep=' '; }
+	[ "$want_r" = 1 ] && { out=$out$sep$release; sep=' '; }
+	[ "$want_v" = 1 ] && { out=$out$sep$version; sep=' '; }
+	[ "$want_m" = 1 ] && { out=$out$sep$machine; sep=' '; }
+	printf '%s\n' "$out"
+	return 0
+}
+
+# ---------------------------------------------------------------------------
+# wc -- POSIX.1-2017: wc [-c|-m] [-lw] [file...]
+#
+# The counts are gathered for every input before anything is written, because
+# the column width depends on the total size of the regular-file inputs and
+# stat() is not reachable from a builtin -- the bytes have to be counted to
+# be known.
+# ---------------------------------------------------------------------------
+
+# Count newlines, words and bytes on fd $1 into _bt_lines/_bt_words/_bt_bytes.
+_bt_wc_count() {
+	local fd=$1 len nw prev=0 rc t
+	_bt_lines=0 _bt_words=0 _bt_bytes=0
+	while :; do
+		if _bt_read "$fd"; then rc=0; else rc=1; fi
+		len=${#_bt_buf}
+		if [ "$len" -gt 0 ]; then
+			_bt_bytes=$(( _bt_bytes + len ))
+			_bt_count "$_bt_buf"
+			_bt_lines=$(( _bt_lines + _bt_n ))
+			# IFS splitting treats only space, tab and newline as
+			# collapsing whitespace, so fold the other blanks in
+			# before counting words.
+			case $_bt_buf in
+			*[$'\v\f\r']*)	t=${_bt_buf//[$'\v\f\r']/ } ;;
+			*)		t=$_bt_buf ;;
+			esac
+			set -- $t
+			nw=$#
+			if [ "$nw" -gt 0 ]; then
+				# A word split across a block boundary is one
+				# word, not two.
+				case $_bt_buf in
+				[![:space:]]*)	[ "$prev" = 1 ] && nw=$(( nw - 1 )) ;;
+				esac
+				_bt_words=$(( _bt_words + nw ))
+			fi
+			case $_bt_buf in
+			*[![:space:]])	prev=1 ;;
+			*)		prev=0 ;;
+			esac
+		fi
+		if [ "$rc" = 0 ] && [ "$_bt_nul" = 1 ]; then
+			# the separating NUL is a byte, and not a space
+			_bt_bytes=$(( _bt_bytes + 1 ))
+			[ "$prev" = 0 ] && _bt_words=$(( _bt_words + 1 ))
+			prev=1
+		fi
+		[ "$rc" = 1 ] && break
+	done
+	return 0
+}
+
+wc () {
+	local _bt_lc=${LC_ALL-}
+	local LC_ALL=C IFS=$' \t\n'
+	local arg opt file fd status=0 i n tmp out width=1 ncols
+	local want_l=0 want_w=0 want_c=0 want_m=0 any=0
+	local reg_total=0 nonregular=0 ninputs
+	local tot_l=0 tot_w=0 tot_c=0
+	local -a cl=() cw=() cc=() names=()
+	local _bt_buf _bt_nul _bt_n _bt_lines _bt_words _bt_bytes _bt_reason
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				l)	want_l=1 any=1 ;;
+				w)	want_w=1 any=1 ;;
+				c)	want_c=1 want_m=0 any=1 ;;
+				m)	want_m=1 want_c=0 any=1 ;;
+				*)	_bt_err "wc: illegal option -- $opt"
+					_bt_err "usage: wc [-c|-m] [-lw] [file...]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	if [ "$any" = 0 ]; then
+		want_l=1 want_w=1 want_c=1
+	fi
+	ncols=$(( want_l + want_w + want_c + want_m ))
+	# -m counts characters, so that path needs the caller's locale back.
+	[ "$want_m" = 1 ] && LC_ALL=$_bt_lc
+
+	[ "$#" -eq 0 ] && set -- -
+	ninputs=$#
+
+	for file in "$@"; do
+		if [ "$file" = - ]; then
+			fd=0
+			names+=('')
+			if [ -f /dev/fd/0 ]; then :; else nonregular=1; fi
+		else
+			if [ -d "$file" ] || ! { exec {fd}<"$file"; } 2>/dev/null; then
+				_bt_why "$file"
+				_bt_err "wc: $file: $_bt_reason"
+				status=1
+				continue
+			fi
+			names+=("$file")
+			[ -f "$file" ] || nonregular=1
+		fi
+		_bt_wc_count "$fd"
+		[ "$fd" = 0 ] || exec {fd}<&-
+		cl+=("$_bt_lines"); cw+=("$_bt_words"); cc+=("$_bt_bytes")
+		tot_l=$(( tot_l + _bt_lines ))
+		tot_w=$(( tot_w + _bt_words ))
+		tot_c=$(( tot_c + _bt_bytes ))
+		if [ "$file" = - ]; then
+			[ -f /dev/fd/0 ] && reg_total=$(( reg_total + _bt_bytes ))
+		else
+			[ -f "$file" ] && reg_total=$(( reg_total + _bt_bytes ))
+		fi
+	done
+
+	# One count for one input needs no alignment; otherwise the width comes
+	# from the combined size of the regular files, and anything whose size
+	# cannot be known in advance forces the historical minimum of 7.
+	if [ "$ncols" = 1 ] && [ "$ninputs" = 1 ]; then
+		width=1
+	else
+		width=1
+		n=$reg_total
+		while [ "$n" -ge 10 ]; do
+			n=$(( n / 10 ))
+			width=$(( width + 1 ))
+		done
+		[ "$nonregular" = 1 ] && [ "$width" -lt 7 ] && width=7
+	fi
+
+	for (( i = 0; i < ${#cl[@]}; i++ )); do
+		out=
+		if [ "$want_l" = 1 ]; then printf -v tmp '%*d' "$width" "${cl[i]}"; out=$tmp; fi
+		if [ "$want_w" = 1 ]; then printf -v tmp '%*d' "$width" "${cw[i]}"; out=${out:+$out }$tmp; fi
+		if [ "$want_c" = 1 ] || [ "$want_m" = 1 ]; then
+			printf -v tmp '%*d' "$width" "${cc[i]}"; out=${out:+$out }$tmp
+		fi
+		if [ -n "${names[i]}" ]; then
+			printf '%s %s\n' "$out" "${names[i]}"
+		else
+			printf '%s\n' "$out"
+		fi
+	done
+	if [ "${#cl[@]}" -gt 1 ]; then
+		out=
+		if [ "$want_l" = 1 ]; then printf -v tmp '%*d' "$width" "$tot_l"; out=$tmp; fi
+		if [ "$want_w" = 1 ]; then printf -v tmp '%*d' "$width" "$tot_w"; out=${out:+$out }$tmp; fi
+		if [ "$want_c" = 1 ] || [ "$want_m" = 1 ]; then
+			printf -v tmp '%*d' "$width" "$tot_c"; out=${out:+$out }$tmp
+		fi
+		printf '%s total\n' "$out"
+	fi
+	return "$status"
+}
+
+# ---------------------------------------------------------------------------
+# uniq -- POSIX.1-2017: uniq [-c|-d|-u] [-f fields] [-s chars] [input [output]]
+# ---------------------------------------------------------------------------
+
+# The comparison key: skip $2 fields, then $3 characters, of line $1.
+# A field is leading blanks followed by non-blanks.
+_bt_uniq_key() {
+	local s=$1 f=$2 c=$3 i
+	for (( i = 0; i < f; i++ )); do
+		s=${s#"${s%%[![:blank:]]*}"}	# leading blanks
+		s=${s#"${s%%[[:blank:]]*}"}	# the field itself
+	done
+	[ "$c" -gt 0 ] && s=${s:c}
+	_bt_key=$s
+}
+
+uniq () {
+	local LC_ALL=C
+	local arg opt val fields=0 chars=0 show_c=0 only_d=0 only_u=0
+	local infd=0 outfd=1 opened_in=0 opened_out=0
+	local line key prevline prevkey n=0 have=0 rc _bt_key _bt_reason
+
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+		--)	shift; break ;;
+		-)	break ;;
+		-[0-9]*)	# obsolescent "-n" meaning -f n
+			val=${1#-}
+			_bt_isnum "$val" || { _bt_err "uniq: invalid number: $val"; return 1; }
+			fields=$val
+			shift ;;
+		-*)	arg=${1#-}
+			shift
+			while [ -n "$arg" ]; do
+				opt=${arg:0:1}
+				arg=${arg:1}
+				case $opt in
+				c)	show_c=1 ;;
+				d)	only_d=1 ;;
+				u)	only_u=1 ;;
+				f|s)	if [ -n "$arg" ]; then
+						val=$arg
+						arg=
+					elif [ "$#" -gt 0 ]; then
+						val=$1
+						shift
+					else
+						_bt_err "uniq: option requires an argument -- $opt"
+						return 1
+					fi
+					_bt_isnum "$val" || { _bt_err "uniq: invalid number: $val"; return 1; }
+					if [ "$opt" = f ]; then fields=$val; else chars=$val; fi ;;
+				*)	_bt_err "uniq: illegal option -- $opt"
+					_bt_err "usage: uniq [-c|-d|-u] [-f fields] [-s chars] [input [output]]"
+					return 1 ;;
+				esac
+			done ;;
+		*)	break ;;
+		esac
+	done
+	fields=$(( 10#$fields )); chars=$(( 10#$chars ))
+
+	if [ "$#" -gt 2 ]; then
+		_bt_err "uniq: extra operand: $3"
+		return 1
+	fi
+	if [ "$#" -ge 1 ] && [ "$1" != - ]; then
+		if [ -d "$1" ] || ! { exec {infd}<"$1"; } 2>/dev/null; then
+			_bt_why "$1"
+			_bt_err "uniq: $1: $_bt_reason"
+			return 1
+		fi
+		opened_in=1
+	fi
+	if [ "$#" -eq 2 ] && [ "$2" != - ]; then
+		if ! { exec {outfd}>"$2"; } 2>/dev/null; then
+			_bt_why "$2"
+			_bt_err "uniq: $2: $_bt_reason"
+			[ "$opened_in" = 1 ] && exec {infd}<&-
+			return 1
+		fi
+		opened_out=1
+	fi
+
+	# Emit the group that just ended.
+	_bt_uniq_flush() {
+		[ "$have" = 1 ] || return 0
+		if [ "$only_d" = 1 ] && [ "$n" -le 1 ]; then return 0; fi
+		if [ "$only_u" = 1 ] && [ "$n" -gt 1 ]; then return 0; fi
+		if [ "$show_c" = 1 ]; then
+			printf '%7d %s\n' "$n" "$prevline" >&"$outfd"
+		else
+			printf '%s\n' "$prevline" >&"$outfd"
+		fi
+		return 0
+	}
+
+	while IFS= read -r line <&"$infd" || [ -n "$line" ]; do
+		_bt_uniq_key "$line" "$fields" "$chars"
+		key=$_bt_key
+		if [ "$have" = 1 ] && [ "$key" = "$prevkey" ]; then
+			n=$(( n + 1 ))
+		else
+			_bt_uniq_flush
+			prevline=$line prevkey=$key n=1 have=1
+		fi
+		line=
+	done
+	_bt_uniq_flush
+	unset -f _bt_uniq_flush
+
+	[ "$opened_in" = 1 ] && exec {infd}<&-
+	[ "$opened_out" = 1 ] && exec {outfd}>&-
 	return 0
 }
