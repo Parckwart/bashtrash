@@ -11,6 +11,11 @@
 #
 # Sourcing defines each one as a shell function, which is what shadows the
 # binary; nothing is installed and `unset -f cat' gives the real one back.
+# An alias outranks a function, so an alias by one of these names would win
+# over the function and never reach it -- `grep' is aliased to `grep
+# --color=auto' by default on most distributions.  Sourcing therefore drops
+# an alias by any of the names in $_BT_UTILS at the foot of this file, and
+# that is the only thing it changes besides defining the functions.
 # Anything private is prefixed with _bt_, or with a short tag of its own
 # where a utility needs a family of helpers (_bc_, _mk_, _ld_, _sh_ and so
 # on), so that sourcing adds no other names to the caller's namespace.
@@ -43,6 +48,17 @@
 # the two are compared byte for byte on standard output and on exit status.
 # Where there is nothing to compare against, the utility is held to a
 # property instead -- see ./test.sh.
+
+# An alias is expanded while a command is being parsed, and a function
+# definition is a command.  So in a shell where `grep' is an alias -- which
+# is the default on Fedora, RHEL, Arch and Debian alike -- the line
+# `grep () {' below is read as `grep --color=auto () {' and the file dies of
+# a syntax error before the function ever exists.  Turn expansion off for
+# the rest of this file; bash reads a sourced file a command at a time, so
+# this is in force for everything that follows it.  The caller's setting
+# goes back at the end.
+if shopt -q expand_aliases; then _BT_ALIASES=1; else _BT_ALIASES=0; fi
+shopt -u expand_aliases
 
 _BT_BLOCK=65536
 
@@ -25620,3 +25636,37 @@ sh () {
 	)
 	return $?
 }
+
+# The names this file defines.  Kept beside the functions rather than
+# derived from them, so that what the file claims to define is checkable;
+# test.sh compares this list against the functions that actually exist.
+_BT_UTILS='admin ar asa awk basename bc cal cat cflow cksum cmp comm compress
+csplit ctags cut cxref date dd delta diff dirname ed env expand
+expr file fold fuser gencat get grep head iconv id ipcs join lex
+locale localedef logname m4 mailx make man nl nm nohup od paste
+patch pathchk pr prs ps rmdel sact sccs sed sh sleep sort split
+strings tabs tail tee tput tr tsort tty uname uncompress unexpand
+unget uniq uudecode uuencode val wc what who write xargs yacc zcat'
+
+# An alias outranks a function, so an alias by one of these names would go
+# on shadowing the real binary and the utility defined above would never be
+# reached -- `grep' is aliased to `grep --color=auto' by default on most
+# distributions, and that arrives at the function here as an illegal
+# option.  Sourcing therefore drops an alias by any of these names.  It is
+# the only thing sourcing changes besides defining the functions, it is
+# confined to the names in the list, and a new shell has the aliases back.
+_bt_unalias() {
+	local IFS=$' \t\n' n
+	local -
+	set -f
+	for n in $_BT_UTILS; do
+		unalias "$n" 2>/dev/null
+	done
+	return 0
+}
+_bt_unalias
+unset -f _bt_unalias
+
+# Put the caller's alias expansion back the way it was found.
+if [ "$_BT_ALIASES" = 1 ]; then shopt -s expand_aliases; fi
+unset -v _BT_ALIASES

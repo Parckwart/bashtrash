@@ -4432,6 +4432,64 @@ if [ "$got" = c ]; then pass=$((pass + 1))
 else note_fail "sh does not see the library: [$got]"; fi
 
 cd .. || exit 1
+# --- what sourcing does to the shell it is sourced into ---------------------
+# An alias is expanded while a function definition is being parsed, so an
+# alias by one of these names used to make the whole file a syntax error.
+echo "### sourcing"
+
+# the list the file publishes has to be the set of functions it defines
+a=$( env -i "$BASH" --noprofile --norc -c '. "$1" || exit 1
+     printf "%s\n" $_BT_UTILS | sort' _ "$BT" )
+b=$( env -i "$BASH" --noprofile --norc -c '. "$1" || exit 1
+     declare -F | sed "s/^declare -f //" | sort' _ "$BT" | grep -v '^_' )
+if [ "$a" = "$b" ] && [ -n "$a" ]; then pass=$((pass + 1))
+else note_fail "_BT_UTILS does not match the functions defined"; fi
+
+# sourcing survives a shell where the utilities' names are aliased
+out=$( "$BASH" --noprofile --norc -O expand_aliases -c '
+	alias grep="grep --color=auto" diff="diff --color=auto" sed="sed -E"
+	. "$1" 2>&1 || exit 1
+	echo ok' _ "$BT" 2>&1 )
+if [ "$out" = ok ]; then pass=$((pass + 1))
+else note_fail "sourcing under aliases: [$out]"; fi
+
+# and the utilities are reachable afterwards rather than shadowed
+out=$( "$BASH" --noprofile --norc -O expand_aliases -c '
+	alias grep="grep --color=auto"
+	. "$1" || exit 1
+	printf "a\nb\n" | grep b' _ "$BT" 2>&1 )
+if [ "$out" = b ]; then pass=$((pass + 1))
+else note_fail "aliased grep still shadows the function: [$out]"; fi
+
+# an alias by a name this file does not define is left alone
+out=$( "$BASH" --noprofile --norc -O expand_aliases -c '
+	alias ll="ls -l" grep="grep --color=auto"
+	. "$1" || exit 1
+	alias ll 2>/dev/null; alias grep 2>/dev/null; echo end' _ "$BT" 2>&1 )
+if [ "$out" = "alias ll='ls -l'
+end" ]; then pass=$((pass + 1))
+else note_fail "alias handling reached too far: [$out]"; fi
+
+# alias expansion is left the way it was found, on or off
+for want in on off; do
+	if [ "$want" = on ]; then opt=-O; else opt=+O; fi
+	out=$( "$BASH" --noprofile --norc $opt expand_aliases -c '
+		. "$1" || exit 1
+		shopt -q expand_aliases && echo on || echo off' _ "$BT" 2>&1 )
+	if [ "$out" = "$want" ]; then pass=$((pass + 1))
+	else note_fail "expand_aliases came back $out, wanted $want"; fi
+done
+
+# sourcing leaves nothing of its own behind
+out=$( env -i "$BASH" --noprofile --norc -c '. "$1" || exit 1
+	for v in _BT_ALIASES _bt_n; do
+		[ -z "${!v+set}" ] || echo "left $v behind"
+	done
+	type -t _bt_unalias >/dev/null && echo "left _bt_unalias behind"
+	echo clean' _ "$BT" 2>&1 )
+if [ "$out" = clean ]; then pass=$((pass + 1))
+else note_fail "sourcing left something behind: [$out]"; fi
+
 # --- the pure-bash claim itself -------------------------------------------
 echo "### no external programs"
 mkdir -p pure

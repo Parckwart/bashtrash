@@ -40,6 +40,14 @@ Sourcing defines each utility as a shell function, which shadows the real
 binary for the rest of the session. Nothing is installed, nothing is
 overwritten, and `unset -f cat` gives you the real one back.
 
+One thing sourcing does change: an alias outranks a function, so an alias by
+one of these 86 names would win over the function and the utility would never
+be reached — and `grep` is aliased to `grep --color=auto` by default on
+Fedora, RHEL, Arch and Debian alike, which arrives at the function here as an
+illegal option. Sourcing therefore drops an alias by any of the names it
+defines. It touches nothing outside that list, and a new shell has your
+aliases back.
+
 Run the test suite with:
 
 ```sh
