@@ -1,29 +1,53 @@
 #!/usr/bin/env bash
 #
-# bashtrash -- POSIX cat(1), tail(1) and id(1) written entirely in bash.
+# bashtrash -- 86 of the POSIX.1-2017 utilities, written entirely in bash.
 #
-# Nothing in here forks or execs an external program: every operation is a
-# shell builtin, so these keep working in a shell with an empty $PATH.
-# Source the file to shadow the real utilities:
+# Everything from cat and tail through awk, sed, m4, bc, make, diff, patch,
+# lex, yacc and sh.  Nothing in here forks or execs an external program:
+# every operation is a shell builtin, so the whole set keeps working in a
+# shell with an empty $PATH.  Source the file to shadow the real utilities:
 #
 #	. bashtrash.sh
 #
-# Conformance target: POSIX.1-2017 (IEEE Std 1003.1-2017).  Identifiers
-# that bash does not expose (the effective group, the supplementary list)
-# come from /proc/self/status, and names from /etc/passwd and /etc/group,
-# all of them read with the read builtin.
+# Sourcing defines each one as a shell function, which is what shadows the
+# binary; nothing is installed and `unset -f cat' gives the real one back.
+# Anything private is prefixed with _bt_, or with a short tag of its own
+# where a utility needs a family of helpers (_bc_, _mk_, _ld_, _sh_ and so
+# on), so that sourcing adds no other names to the caller's namespace.
 #
-# A bash variable cannot hold a NUL byte, so input is read as NUL delimited
-# blocks: every block is NUL free and therefore storable, and the NULs that
-# separated them are written back out explicitly.  That keeps arbitrary
-# binary input byte for byte, and reading a block at a time rather than a
-# byte at a time keeps the cost sane.
+# Conformance target: POSIX.1-2017 (IEEE Std 1003.1-2017).  Where the
+# standard leaves something implementation-defined, or where bash cannot
+# reach what the standard assumes, the README says so and says why; those
+# are the only departures.
+#
+# Two constraints shape most of what follows.
+#
+# The first is that bash has no builtin that makes a system call outside the
+# shell's own business.  There is no mkdir, no chmod, no stat, no readdir:
+# what cannot be done with a redirection, a glob, a file test or a read of
+# /proc simply cannot be done here.  So identifiers that bash does not
+# expose (the effective group, the supplementary list) come from
+# /proc/self/status, names from /etc/passwd and /etc/group, process tables
+# from /proc/*/stat, and terminal descriptions from the terminfo files
+# themselves -- all of them read with the read builtin.  It is also why 52
+# of the standard's 160 utilities are missing rather than merely unwritten.
+#
+# The second is that a bash variable cannot hold a NUL byte.  Input is
+# therefore read as NUL delimited blocks: every block is NUL free and so
+# storable, and the NULs that separated them are written back out
+# explicitly.  That keeps arbitrary binary input byte for byte, and reading
+# a block at a time rather than a byte at a time keeps the cost sane.
+#
+# The test suite is differential: every case runs twice, once through the
+# function here and once through the program the machine already has, and
+# the two are compared byte for byte on standard output and on exit status.
+# Where there is nothing to compare against, the utility is held to a
+# property instead -- see ./test.sh.
 
 _BT_BLOCK=65536
 
 # ---------------------------------------------------------------------------
-# Helpers.  Everything private is prefixed with _bt_ so that sourcing this
-# file adds no other names to the caller's namespace.
+# Helpers, shared by everything below.
 # ---------------------------------------------------------------------------
 
 # Write a diagnostic to standard error, where POSIX wants it.
