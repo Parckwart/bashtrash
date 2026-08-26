@@ -350,7 +350,7 @@ $ ./test.sh
 ### fuzz
 ### id
 ...
-==== pass=7778 fail=0 ====
+==== pass=7785 fail=0 ====
 ```
 
 Every case runs twice — once through the bash function, once through the
